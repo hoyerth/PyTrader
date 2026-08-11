@@ -98,6 +98,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -520,7 +521,11 @@ class HeatmapWidget(QWidget):
         # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
         # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
         self._combo_field.setMinimumWidth(320)
-        self._combo_field.setMaximumWidth(460)
+        # Runde 16 (Bugfix 3, 11.08.2026): Kein MaximumWidth mehr - das
+        # Feld-Dropdown darf in der Zoom-Y-Zeile bis zum Canvas-Ende
+        # wachsen (Expanding-Policy + Layout-Stretch).
+        self._combo_field.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
         # Popup-Dropdown an den laengsten Eintrag anpassen (vollstaendige
         # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
         self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
@@ -530,10 +535,6 @@ class HeatmapWidget(QWidget):
         ctrl.addWidget(self._combo_x)
         ctrl.addWidget(QLabel("Y-Achse:"))
         ctrl.addWidget(self._combo_y)
-        ctrl.addWidget(QLabel("Aggregation:"))
-        ctrl.addWidget(self._combo_agg)
-        ctrl.addWidget(QLabel("Feld:"))
-        ctrl.addWidget(self._combo_field)
         ctrl.addStretch(1)
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
@@ -558,8 +559,16 @@ class HeatmapWidget(QWidget):
         ctrl2.addWidget(self._slider_zoom_x)
         ctrl2.addWidget(QLabel("Zoom Y:"))
         ctrl2.addWidget(self._slider_zoom_y)
+        # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
+        # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
+        # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
+        ctrl2.addSpacing(15)
+        ctrl2.addWidget(QLabel("Aggregation:"))
+        ctrl2.addWidget(self._combo_agg)
+        ctrl2.addSpacing(10)
+        ctrl2.addWidget(QLabel("Feld:"))
+        ctrl2.addWidget(self._combo_field, 1)
         ctrl2.addWidget(self._label_info)
-        ctrl2.addStretch(1)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -1363,7 +1372,30 @@ class HeatmapWidget(QWidget):
             name = self._view_model.resolve_service_display_name(
                 str(service_ids[0]))
             if name:
-                return f"{name} / {str(key)}"
+                label = f"{name} / {str(key)}"
+                # Runde 16 (Bugfix 1, 11.08.2026): Gecheckte Variante +
+                # Datum der letzten Ausfuehrung an den Eintrag anhaengen
+                # ('{Name} / {Key} / {Preset} / DD.MM.JJ HH:MM' - der
+                # Service-Name ohne `srv_`-Praefix, Preset 'Default' wird
+                # uebersprungen, Datum ohne Eintraege wird ausgelassen).
+                # Defensiv via getattr: Fake-/Alt-ViewModels (z. B. in
+                # Tests) ohne `checked_variant` ergeben keinen Anhang.
+                variant = None
+                _cv = getattr(self._view_model, "checked_variant", None)
+                if callable(_cv):
+                    try:
+                        variant = _cv(str(service_ids[0]))
+                    except Exception:
+                        variant = None
+                if variant:
+                    preset = str(variant.get("preset_name") or "").strip()
+                    if preset and preset.lower() != "default":
+                        label = f"{label} / {preset}"
+                    exec_date = str(
+                        variant.get("exec_datetime") or "").strip()
+                    if exec_date and not exec_date.startswith("--."):
+                        label = f"{label} / {exec_date}"
+                return label
         return str(key)
 
     def _rebuild_field_dropdown(
@@ -1540,9 +1572,16 @@ class HeatmapWidget(QWidget):
             filtered = [v for v in filtered
                         if str(v.get("plugin_id") or "").strip().lower()
                         in active_ids]
+        # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+        # Hash-lose Varianten (Standalone-Services wie srv_trend_breakout
+        # und NULL-Hash-Alt-Bestand) werden UEBER `feature_ids` gecheckt -
+        # eine aktive Hash-Auswahl darf sie nicht aus dem '(No Data)'-
+        # Abschnitt werfen (sonst verschwinden Services im Mischbetrieb
+        # aus dem Feld-Dropdown, obwohl sie gecheckt sind).
         if active_hashes:
             filtered = [v for v in filtered
-                        if str(v.get("instance_hash") or "").strip().lower()
+                        if not str(v.get("instance_hash") or "").strip()
+                        or str(v.get("instance_hash") or "").strip().lower()
                         in active_hashes]
         if not filtered and self._selected_no_data_variant(variants) is None:
             return

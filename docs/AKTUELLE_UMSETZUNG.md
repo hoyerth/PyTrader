@@ -186,3 +186,53 @@ Prämissen:
 * Regression: `check_round15b.py` (10/10), `check_round15_perf.py` (27/27), `check_round12.py` (23/23), `check_round11.py` (35/35), `check_round13c.py` (20/20), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` der geänderten Dateien OK.
 * **Offen (manuell):** App-Test – `srv_trend_breakout` im ServicePicker checken → '(No Data)'-Hinweis im Feld-Dropdown; nach dem ersten Scan (Daten geschrieben) verschwindet der Hinweis.
 
+---
+
+## 9. Implementierungs-Log – Bugfix Runde 16: Mischbetrieb NoData & Dropdown-Anzeige (11.08.2026)
+
+**Problem (User-Meldungen 0–6, 11.08.2026):**
+
+1. Dropdown-Anzeige: Checkbox + ' ' + Service-Name (ohne `src_`-Präfix) + '/' + Versions-Name + '/ ' + Ausführungsdatum (z. B. `23.04.26 22:14`).
+2. Position Aggregation: rechts neben Zoom Y mit Abstand.
+3. Position Feld-Dropdown: rechts neben Aggregation in der Zoom-Y-Zeile, Länge bis zum rechten Canvas-Ende.
+4. NoData-Anzeige von Versionen fehlt komplett – auch MEHRERE Versionen müssen möglich sein.
+5. Mischbetrieb: sind NoData-Services UND Versionen gleichzeitig gecheckt, erscheinen die Services nicht (z. B. `srv_trend_breakout`).
+6. Services-Dropdown: nicht alle Services sichtbar, wenn Services und Versionen gemischt gecheckt sind.
+
+**Diagnose (echte DB + ServiceSelectorModel):** 
+* S1 (nur Standalone `srv_trend_breakout` gecheckt): NoData erscheint korrekt.
+* S2 (nur Version `Kopie 99`, Hash `7d636c36`, ohne Rows): NoData erscheint korrekt.
+* S3 (MIX `srv_trend_breakout` + Version `Kopie 99`): **NUR die Version erscheint, `srv_trend_breakout` fehlt.**
+
+**Root Cause (zentrale Routine):** Sobald eine `instance_hashes`-Auswahl aktiv ist, wird jede **hash-lose** Variante (Standalone-Services wie `srv_trend_breakout`/`srv_trend_regime` sowie NULL-Hash-Set-Instanzen) an DREI Stellen gleichzeitig weggefiltert:
+
+1. `analytics_view_model.py` – `_no_data_presets_snapshot()`: `if not active_hashes:` schließt die `standalone`-Snapshot-Sektion komplett aus, sobald irgendein Hash gecheckt ist (Runde-15c-Entscheidung, per User-Meldung 5/6 revidiert).
+2. `feature_store_reader.py` – `resolve_no_data_variants()._add()`: `if active_hashes and h_s.lower() not in active_hashes: return` verwirft hash-lose Varianten (`h_s == ""`).
+3. `heatmap_widget.py` – `_render_no_data_items()`: `if active_hashes:` filtert hash-lose Varianten (`instance_hash == ""`) erneut aus.
+
+**Bug 4** (gar keine NoData-Anzeige) ist derselbe Fall: Sind alle gecheckten Versionen mit Daten belegt UND zusätzlich ein Standalone-Service ohne Daten gecheckt, wird der Standalone-Service an allen 3 Stellen verworfen → Snapshot/Filter leer → `_render_no_data_items()` macht `early return` → **kein NoData-Abschnitt**.
+
+### Lösung (Fixes 1–3, Bugs 4/5/6)
+
+* **Fix 1 (`analytics_view_model.py`, `_no_data_presets_snapshot`):** Den `if not active_hashes:`-Guard um die `standalone`-Sektion entfernt – Standalone-Services werden IMMER (nur nach `active_ids` gefiltert) in den Snapshot aufgenommen. Die Annahme „hash-lose Variante ist nie Teil einer Hash-Auswahl" gilt für Standalone-Services NICHT: Sie werden über `feature_ids` gecheckt, nicht über Hashes.
+* **Fix 2 (`feature_store_reader.py`, `resolve_no_data_variants()._add`):** Der Varianten-Guard greift nur noch bei Varianten MIT Hash: `if active_hashes and h_s and h_s.lower() not in active_hashes: return`. Hash-lose Varianten (Standalone/Alt-Bestand) passieren weiterhin.
+* **Fix 3 (`heatmap_widget.py`, `_render_no_data_items`):** Derselbe Guard im defensiven Widget-Filter – hash-lose Varianten bleiben erhalten, nur hash-behaftete werden gegen `active_hashes` geprüft.
+
+### Lösung (Fix 4, Bugs 2/3 – Layout)
+
+* **Fix 4 (`heatmap_widget.py`, `__init__`):** Aggregation-Combo (+ Label) und Feld-Combo (+ Label) aus Zeile 1 (`ctrl`: X-/Y-Achse) in Zeile 2 (`ctrl2`: Overlay + Zoom) nach `_slider_zoom_y` verschoben: `addSpacing(15)` → Aggregation → `addSpacing(10)` → Feld. Das Feld-Dropdown erhält `QSizePolicy.Expanding` + `stretch=1` (reicht bis zum Canvas-Ende) und verliert sein `MaximumWidth(460)`-Limit. `QSizePolicy`-Import ergänzt.
+
+### Lösung (Fix 5, Bug 1 – Anzeige-Format)
+
+* **Fix 5a (`feature_store_reader.py`):** Neue Methode `fetch_last_execution_datetimes_by_hash()` – liefert je (feature_id, instance_hash) den neuesten Schreib-Zeitpunkt MIT Uhrzeit als `'DD.MM.JJ HH:MM'` (identische SQL-Basis wie `fetch_last_execution_dates_by_hash`).
+* **Fix 5b (`service_selector_model.py`):** Neuer Cache `_last_execution_datetimes_by_hash` (in `refresh()` geladen) + Methode `last_execution_datetime_for_hash(plugin_id, instance_hash)` (Fallback `'--.--.-- --:--'`).
+* **Fix 5c (`analytics_view_model.py`, `resolve_service_display_name`):** Neuer optionaler Parameter `exec_date`; Präfix-Strip um `src_` erweitert; Format umgestellt von `Name (Preset)` auf `Name / Preset / DD.MM.JJ HH:MM` (Preset `Default` und Datum-Fallback werden übersprungen). Neue Hilfsmethode `checked_variant(plugin_id)` liefert `{"preset_name", "instance_hash", "exec_datetime"}` der im Picker gecheckten Variante eines Services.
+* **Fix 5d (`heatmap_widget.py`, `_field_label`):** Feld-Einträge tragen jetzt die gecheckte Variante + Ausführungsdatum: `Swing Volume Profile / key / Kopie 99 / 23.04.26 22:14` (Format `{Name} / {Key} / {Preset} / {Datum}`; Preset `Default` und Datum-Fallback entfallen). Aufruf defensiv via `getattr` (`checked_variant` optional) - Fake-/Alt-ViewModels in Tests ohne die Methode ergeben keinen Anhang.
+* **Fix 5e (`feature_store_reader.py`, `_no_data_fallback_name`):** Fallback-Format auf `Name / Preset` umgestellt (Preset `Default` entfällt) – konsistent zur VM-Logik.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `py_compile` aller geänderten Dateien.
+* Regressionstests nur auf ausdrückliche Anweisung.
+* **Offen (manuell):** App-Test – Mischcheck im ServicePicker, NoData-Abschnitt, Layout (Aggregation/Feld in Zoom-Y-Zeile), Dropdown-Format.
+

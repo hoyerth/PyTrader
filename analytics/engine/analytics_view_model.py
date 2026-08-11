@@ -1212,7 +1212,8 @@ class AnalyticsViewModel(QObject):
             return key
 
     def resolve_service_display_name(self, plugin_id: str,
-                                     preset_name: Optional[str] = None) -> str:
+                                     preset_name: Optional[str] = None,
+                                     exec_date: Optional[str] = None) -> str:
         """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
 
         09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
@@ -1230,6 +1231,12 @@ class AnalyticsViewModel(QObject):
         ' ({Preset_Name})' – Anzeige-Format '{Service} ({Preset}) /
         {Parameter}' fuer Parameter-Varianten (Clones). Ohne preset_name
         bleibt das Label unveraendert (Zero-Regression).
+
+        Runde 16 (Bugfix 1, 11.08.2026): Format-Vereinheitlichung auf
+        '{Name} / {Preset} / {Datum}' (Schraegstrich statt Klammern;
+        'Default' als Platzhalter-Preset wird uebersprungen). Optionaler
+        `exec_date` haengt Datum+Uhrzeit der letzten Ausfuehrung an
+        ('DD.MM.JJ HH:MM') - Grundlage der Feld-Dropdown-Anzeige.
         """
         key = str(plugin_id or "").strip()
         if not key or key.lower() in ("none", "native") \
@@ -1251,25 +1258,100 @@ class AnalyticsViewModel(QObject):
                 # 09.08.2026 (Root Cause 3): Unbekannte/abgewaehlte Keys
                 # (z. B. Native-Rows) -> lesbarer Pretty-Fallback statt
                 # Rohwert/Leerstring ('native' -> 'Native').
-                pretty = (key.replace("srv_", "").replace("ind_", "")
-                          .replace("_", " ").title())
+                pretty = (key.replace("src_", "").replace("srv_", "")
+                          .replace("ind_", "").replace("_", " ").title())
                 return pretty or key
             pid = str(getattr(plugin, "plugin_id", None) or key)
             name = pid
-            for prefix in ("srv_", "ind_"):
+            for prefix in ("src_", "srv_", "ind_"):
                 if name.lower().startswith(prefix):
                     name = name[len(prefix):]
                     break
             pretty = name.replace("_", " ").title()
             if not pretty:
                 pretty = key
-            # 20.04 (Q2): Preset-Name (Variante) in Klammern ergaenzen.
+            # Runde 16 (Bugfix 1): Preset-Name + Ausfuehrungsdatum per
+            # Schraegstrich anhaengen ('{Name} / {Preset} / DD.MM.JJ HH:MM').
+            # 'Default' ist ein Platzhalter-Preset (Standalone-Services) und
+            # wird uebersprungen.
             preset = str(preset_name or "").strip()
-            if preset:
-                pretty = f"{pretty} ({preset})"
+            if preset and preset.lower() != "default":
+                pretty = f"{pretty} / {preset}"
+            exec_d = str(exec_date or "").strip()
+            if exec_d:
+                pretty = f"{pretty} / {exec_d}"
             return pretty
         except Exception:
             return key
+
+    def checked_variant(
+        self, plugin_id: str
+    ) -> Optional[Dict[str, str]]:
+        """Aktuell gecheckte Variante eines Services inkl. Ausfuehrungsdatum.
+
+        Runde 16 (Bugfix 1, 11.08.2026): Grundlage der Feld-Dropdown-
+        Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM' - das Dropdown haengt
+        an Feld-Eintraege die im ServicePicker gecheckte Variante (Preset)
+        und das Datum+Uhrzeit ihrer letzten Ausfuehrung an.
+
+        Auswahl-Semantik (identisch zum Reader/Snapshot):
+          * Ist `instance_hashes` aktiv (Varianten-Einschraenkung), gewinnt
+            die gecheckte Variante (exakter Hash-Match).
+          * Ohne Hash-Auswahl zaehlt die ERSTE aktive (nicht archivierte)
+            Variante des Services - ist der Service ein reiner Standalone
+            (keine Presets), bleibt das Ergebnis None (kein Preset-Anhang).
+          * Datum+Uhrzeit: Varianten mit Hash ueber
+            `last_execution_datetime_for_hash` ('DD.MM.JJ HH:MM'), hash-lose
+            Services ueber `last_execution_date` (nur Datum). Ohne Eintraege
+            liefern beide den '--...'-Fallback (die Anzeige laesst ihn aus).
+
+        Returns:
+            {"preset_name", "instance_hash", "exec_datetime"} oder None
+            (unbekannter Service / keine Presets / Fehler - defensiv).
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return None
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            active_hashes = {str(h).strip().lower()
+                             for h in (self._params.get("instance_hashes")
+                                       or [])}
+            clones = (model.plugin_presets() or {}).get(key.lower()) or []
+            chosen = None
+            if active_hashes:
+                for c in clones:
+                    if not isinstance(c, dict):
+                        continue
+                    h = str(c.get("instance_hash") or "").strip()
+                    if h and h.lower() in active_hashes:
+                        chosen = c
+                        break
+            else:
+                for c in clones:
+                    if isinstance(c, dict) and not c.get("is_archived"):
+                        chosen = c
+                        break
+                if chosen is None and clones:
+                    chosen = clones[0]
+            if chosen is None or not isinstance(chosen, dict):
+                return None
+            h = str(chosen.get("instance_hash") or "").strip()
+            if h:
+                exec_date = model.last_execution_datetime_for_hash(key, h)
+            else:
+                exec_date = model.last_execution_date(key)
+            return {
+                "preset_name": str(chosen.get("preset_name") or "Default"),
+                "instance_hash": h,
+                "exec_datetime": exec_date,
+            }
+        except Exception:
+            return None
 
     def resolve_instance_hashes(self,
                                 hashes: Iterable[str]) -> List[str]:
@@ -1429,47 +1511,48 @@ class AnalyticsViewModel(QObject):
             # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026):
             # Registrierte Plugins, die weder Presets/Clones noch eine
             # Set-Instanz besitzen (z. B. srv_trend_breakout), sind reine
-            # Standalone-Services. Sie wurden bisher nie in den Snapshot
-            # aufgenommen - der Reader konnte sie deshalb nie als
-            # '(No Data)' markieren. Als hash-lose Variante (preset_name
+            # Standalone-Services. Als hash-lose Variante (preset_name
             # 'Default') geprueft, erscheinen sie im Feld-Dropdown, sobald
             # der feature_store noch keine Rows ihrer plugin_id besitzt.
             # Beim Vorhandensein von Daten (pids_with_data) bleibt der
             # NoData-Hinweis aus (Reader-Semantik). Ausgeschlossen sind
             # Plugins mit Presets oder Set-Instanzen (dort laeuft die
-            # bestehende Preset-/Set-Auswertung); ebenso ausgeblendet bei
-            # aktiver Varianten-Einschraenkung (eine hash-lose Variante
-            # kann nie Teil einer Hash-Auswahl sein, konsistent zur
-            # Hash-Los-Logik der Presets in Runde 13b).
-            if not active_hashes:
-                try:
-                    all_presets = model.plugin_presets() or {}
-                    preset_keys = {str(k).strip().lower()
-                                   for k in all_presets}
-                    set_pids: Set[str] = set()
-                    for _s in model.get_sets() or []:
-                        _services = (_s.get("services")
-                                     if isinstance(_s, dict) else None)
-                        if not isinstance(_services, dict):
-                            continue
-                        for _svc in _services.values():
-                            if isinstance(_svc, dict) and str(
-                                    _svc.get("plugin_id") or "").strip():
-                                set_pids.add(
-                                    str(_svc["plugin_id"]).strip().lower())
-                    for _pid in (model.get_plugins() or {}).keys():
-                        _pid_l = str(_pid).strip().lower()
-                        if not _pid_l:
-                            continue
-                        if active_ids and _pid_l not in active_ids:
-                            continue
-                        if _pid_l in preset_keys or _pid_l in set_pids:
-                            continue
-                        standalone.append(_pid)
-                        display_names[f"{_pid}|Default"] = \
-                            self.resolve_service_display_name(_pid)
-                except Exception:
-                    pass
+            # bestehende Preset-/Set-Auswertung).
+            # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+            # Der Runde-15c-Guard `if not active_hashes:` ist ENTFERNT - er
+            # schloss die Standalone-Sektion aus, sobald eine Hash-Auswahl
+            # aktiv war (Mischbetrieb Service + Version). Standalone-
+            # Services werden UEBER `feature_ids` gecheckt, NICHT ueber
+            # Hashes - eine aktive Varianten-Einschraenkung darf sie daher
+            # nicht aus der NoData-Auswertung verwerfen.
+            try:
+                all_presets = model.plugin_presets() or {}
+                preset_keys = {str(k).strip().lower()
+                               for k in all_presets}
+                set_pids: Set[str] = set()
+                for _s in model.get_sets() or []:
+                    _services = (_s.get("services")
+                                 if isinstance(_s, dict) else None)
+                    if not isinstance(_services, dict):
+                        continue
+                    for _svc in _services.values():
+                        if isinstance(_svc, dict) and str(
+                                _svc.get("plugin_id") or "").strip():
+                            set_pids.add(
+                                str(_svc["plugin_id"]).strip().lower())
+                for _pid in (model.get_plugins() or {}).keys():
+                    _pid_l = str(_pid).strip().lower()
+                    if not _pid_l:
+                        continue
+                    if active_ids and _pid_l not in active_ids:
+                        continue
+                    if _pid_l in preset_keys or _pid_l in set_pids:
+                        continue
+                    standalone.append(_pid)
+                    display_names[f"{_pid}|Default"] = \
+                        self.resolve_service_display_name(_pid)
+            except Exception:
+                pass
         except Exception:
             pass
         return {

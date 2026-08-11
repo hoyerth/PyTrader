@@ -1349,6 +1349,53 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_last_execution_datetimes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Neuester Schreib-Zeitpunkt je (feature_id, instance_hash) mit Uhrzeit.
+
+        Bugfix 11.08.2026 (Dropdown-Anzeige, User-Meldung 1): Das
+        Feld-Dropdown haengt an gecheckte Varianten das Datum+Uhrzeit der
+        letzten Ausfuehrung an ('{Name} / {Preset} / DD.MM.JJ HH:MM').
+        `fetch_last_execution_dates_by_hash` liefert nur das Datum - diese
+        Methode ergaenzt die Uhrzeit (Format 'DD.MM.JJ HH:MM', z. B.
+        '23.04.26 22:14'). Quelle/Filter/Semantik identisch zur
+        Datums-Variante (MAX(created_at) GROUP BY feature_id +
+        instance_hash ueber ALLE Symbole/Timeframes; case-insensitiv/
+        whitespace-tolerant; Rows ohne instance_hash/created_at werden
+        uebersprungen).
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: 'DD.MM.JJ HH:MM'} -
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_last_execution_datetimes_by_hash fehlgeschlagen: "
+                  f"{e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            try:
+                out.setdefault(str(r[0]), {})[str(r[1])] = r[2].strftime(
+                    "%d.%m.%y %H:%M")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
@@ -1664,7 +1711,13 @@ class FeatureStoreReader:
             # Instanzen derselben plugin_id erscheinen nicht mehr als
             # '(No Data)' (vorher wurde hier die ERSTE Variante des Services
             # angezeigt bzw. ungecheckte Instanzen mit aufgefuehrt).
-            if active_hashes and h_s.lower() not in active_hashes:
+            # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+            # Der Guard greift nur noch bei Varianten MIT Hash (`h_s and`) -
+            # hash-lose Varianten (Standalone-Services wie srv_trend_breakout
+            # und NULL-Hash-Alt-Bestand) werden UEBER `feature_ids` gecheckt
+            # und duerfen von einer aktiven Hash-Auswahl nicht verworfen
+            # werden (sonst verschwinden Services im Mischbetrieb).
+            if active_hashes and h_s and h_s.lower() not in active_hashes:
                 return
             key = (pid_s.lower(), h_s)
             if key in seen:
@@ -1734,7 +1787,13 @@ class FeatureStoreReader:
                   .replace("_", " ").title())
         if not pretty:
             pretty = pid
-        return f"{pretty} ({pname})"
+        # Runde 16 (Bugfix 1, 11.08.2026): Anzeige-Format auf
+        # '{Name} / {Preset}' umgestellt (identisch zum ViewModel-Format;
+        # vorher '{Name} ({Preset})'). 'Default' wird als Platzhalter-
+        # Preset uebersprungen (Standalone-Services ohne echten Preset).
+        if pname and str(pname).strip().lower() != "default":
+            return f"{pretty} / {str(pname).strip()}"
+        return pretty
 
     def get_available_features(
         self, symbol: str, timeframe: str

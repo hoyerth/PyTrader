@@ -142,6 +142,11 @@ class ServiceSelectorModel(QObject):
         # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Quelle:
         # FeatureStoreReader.fetch_last_execution_dates_by_hash().
         self._last_execution_dates_by_hash: Dict[str, Dict[str, str]] = {}
+        # 11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
+        # Quelle: FeatureStoreReader.fetch_last_execution_datetimes_by_hash().
+        self._last_execution_datetimes_by_hash: Dict[str, Dict[str, str]] = {}
         # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
         # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
         # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
@@ -191,6 +196,11 @@ class ServiceSelectorModel(QObject):
         # Plugin-Ausfuehrungsdaten gelesen, damit _load_plugin_presets() die
         # Hash-Daten je Clone mitgeben kann.
         self._last_execution_dates_by_hash = self._load_last_execution_dates_by_hash()
+        # 11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
+        self._last_execution_datetimes_by_hash = (
+            self._load_last_execution_datetimes_by_hash())
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -374,6 +384,40 @@ class ServiceSelectorModel(QObject):
                   f"nicht lesbar: {e}")
             return {}
         return {str(k).lower(): v for k, v in raw.items()}
+
+    def _load_last_execution_datetimes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest die Varianten-Ausfuehrungsdaten je (feature_id, hash) mit Uhrzeit.
+
+        11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Delegate an den
+        FeatureStoreReader (fetch_last_execution_datetimes_by_hash) - die
+        Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM' braucht
+        Datum+Uhrzeit der letzten Ausfuehrung. Defensiv: Fehler -> leer
+        (Eintraege zeigen dann keinen Datums-Anhang).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_datetimes_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Varianten-Ausfuehrungsdaten "
+                  f"(Datum+Uhrzeit) nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_datetime_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung einer Parameter-Variante.
+
+        11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
+        (z. B. '23.04.26 22:14') - Fallback '--.--.-- --:--' ohne Eintraege
+        (bzw. ohne instance_hash). Rein lesend aus dem Refresh-Zustand.
+        """
+        if not plugin_id or not instance_hash:
+            return "--.--.-- --:--"
+        per_hash = self._last_execution_datetimes_by_hash.get(
+            str(plugin_id).lower(), {}) or {}
+        return per_hash.get(str(instance_hash), "--.--.-- --:--")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
