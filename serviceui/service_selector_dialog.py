@@ -78,6 +78,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QInputDialog,
@@ -92,14 +93,19 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.feature_store_reader import FeatureStoreReader
 from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_selector_model import ServiceSelectorModel
+from analytics.engine.set_evaluator import ServiceSetEvaluator
 from config.event_bus import event_bus
 from serviceui.master_tree import (
     TYPE_CATEGORY, TYPE_CLONE, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
 )
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
+# 21.01b (11.08.2026): Run im Picker (TF-Zeile + Pill-Strip, User-Entscheid).
+from serviceui.common_widgets import TfStatusBadgeBar
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
 
 #: Geometrie-Key fuer Position/Groesse des Datenquellen-Dialogs
 #: (global_settings, Muster IndicatorSettingsDialog).
@@ -364,6 +370,13 @@ class ServiceSelectorDialog(QDialog):
         # `state_manager`-Property; ohne Parent bleiben Save/Restore no-ops.
         self._state_manager = getattr(parent, "state_manager", None)
         self._param_host = _DialogParamHost(state_manager=self._state_manager)
+        # 21.01b (11.08.2026): Run-Infrastruktur fuer die MasterTree-
+        # Kontextmenue-Aktionen (User-Entscheid: Run im Picker voll
+        # funktional, TF-Zeile + Pill-Strip).
+        self.set_evaluator = ServiceSetEvaluator()
+        self._run_worker: Optional[ServiceRunWorker] = None
+        #: Plugin-ID des Services, dessen TF-Pills aktuell angezeigt werden.
+        self._badge_plugin_id: Optional[str] = None
         # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
         # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
         # des Panels (analog service_win). Bleibt nach Modell-Refreshes
@@ -414,6 +427,23 @@ class ServiceSelectorDialog(QDialog):
         panel_layout.setSpacing(4)
         panel_layout.addWidget(
             QLabel("Service-Parameter (Read-Only):"))
+        # 21.01b (11.08.2026): Run-Timeframe-Zeile (combo_run_tf, Sentinel
+        # ALL_TIMEFRAMES wie im ServiceWindow) + TF-Status-Pills des zuletzt
+        # geklickten Services (fetch_service_tf_status).
+        tf_row = QHBoxLayout()
+        tf_row.setSpacing(4)
+        tf_row.addWidget(QLabel("Run Timeframe:"))
+        self.combo_run_tf = QComboBox()
+        self.combo_run_tf.setMinimumWidth(130)
+        self.combo_run_tf.setToolTip(
+            "Zeitrahmen fuer '▶️ Service(s) ausführen' – 'ALLE Timeframes' "
+            "fuehrt alle verfuegbaren Timeframes nacheinander aus.")
+        tf_row.addWidget(self.combo_run_tf)
+        tf_row.addStretch(1)
+        panel_layout.addLayout(tf_row)
+        self.badge_bar = TfStatusBadgeBar()
+        panel_layout.addWidget(self.badge_bar)
+        self._fill_run_tf_combo()
         self.param_panel = panel  # 06.08.2026: feste Breite auf dem PANEL-WIDGET
         self.param_scroll = QScrollArea(panel)
         # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): widgetResizable
@@ -517,6 +547,14 @@ class ServiceSelectorDialog(QDialog):
             # persistiert den Rename in indicator_presets.
             tree.rename_variant_requested.connect(
                 self._on_rename_variant)
+            # 21.01b (11.08.2026): Run-Aktionen im Picker verdrahten (TF-Zeile
+            # + Pill-Strip voll funktional, User-Entscheid). Die Handler
+            # zeigen die Sicherheitsabfrage und starten den ServiceRunWorker
+            # mit dem Timeframe aus combo_run_tf (Muster service_win).
+            tree.run_service_requested.connect(self._on_run_service)
+            tree.run_set_requested.connect(self._on_run_set)
+            tree.run_plugin_requested.connect(self._on_run_plugin)
+            tree.run_category_requested.connect(self._on_run_category)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -1432,6 +1470,10 @@ class ServiceSelectorDialog(QDialog):
         self._rebuild_param_panel(
             self._entries_for_scope(node_type, set_id, service_id, plugin_id),
             editable_plugin=editable)
+        # 21.01b: Pill-Strip dem geklickten Service nachziehen.
+        self._refresh_badge_bar(
+            self._resolve_badge_plugin(node_type, set_id,
+                                       service_id, plugin_id))
 
     def _resolve_selection_ids(self, node_type: str, set_id: str,
                                service_id: str, plugin_id: str) -> List[str]:
@@ -1468,6 +1510,312 @@ class ServiceSelectorDialog(QDialog):
                     ids.append(pid)
             return ids
         return []
+
+    # ------------------------------------------------------------------
+    # 21.01b (11.08.2026): Run im Picker (TF-Zeile + Pill-Strip)
+    # ------------------------------------------------------------------
+    def _run_symbol(self) -> str:
+        """Aktives Symbol aus dem Parent (AnalyticsWindow.combo_symbol)."""
+        parent = self.parent()
+        cb = getattr(parent, "combo_symbol", None)
+        if cb is not None:
+            try:
+                txt = cb.currentText()
+            except Exception:
+                txt = ""
+            if txt:
+                return str(txt)
+        return "SILVER"
+
+    def _run_timeframe(self) -> str:
+        """Gewaehlter Run-Timeframe (Sentinel = Multi-TF im Worker)."""
+        combo = getattr(self, "combo_run_tf", None)
+        if combo is None:
+            return ALL_TIMEFRAMES
+        return str(combo.currentText() or ALL_TIMEFRAMES)
+
+    def _fill_run_tf_combo(self) -> None:
+        """Befuellt combo_run_tf: Sentinel 'ALLE Timeframes' + alle TFs
+        aufsteigend nach Dauer (M1..MN1, wie combo_tf im ServiceWindow)."""
+        combo = getattr(self, "combo_run_tf", None)
+        if combo is None:
+            return
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                tfs = list(get_timeframes().keys())
+            except Exception:
+                tfs = list(TF_SECONDS_MAP.keys())
+            sort_map = TF_SECONDS_MAP
+        except Exception:
+            tfs = ["M1", "M2", "M5", "M10", "M15", "M30",
+                   "H1", "H4", "D1", "W1", "MN1"]
+            sort_map = {}
+        tfs = sorted(tfs, key=lambda tf: sort_map.get(tf, 10 ** 12))
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(ALL_TIMEFRAMES)
+        for tf in tfs:
+            if tf != ALL_TIMEFRAMES:
+                combo.addItem(tf)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """Standalone-Plugin-Config wie im ServiceWindow (17.01.04-Muster).
+        Basis sind die Registry-Defaults; gespeicherte Werte aus
+        global_settings (Key 'plugin_params_<pid>') ueberschreiben."""
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) \
+            if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        try:
+            saved = self._state_manager.get_global_value(
+                f"plugin_params_{plugin_id}", None)
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            lb = saved.get("lookback")
+            if lb is not None:
+                try:
+                    cfg["lookback"] = int(lb)
+                except (TypeError, ValueError):
+                    pass
+            saved_params = saved.get("params")
+            if isinstance(saved_params, dict):
+                merged = dict(cfg["params"])
+                merged.update(saved_params)
+                cfg["params"] = merged
+        return cfg
+
+    def _start_run_worker(self, scope_id: str, set_definition: Dict[str, Any],
+                          instance_id: Optional[str]) -> None:
+        """Startet den gezielten ServiceRunWorker (Single/Set) mit dem
+        Timeframe aus combo_run_tf – Muster service_win._start_run_worker."""
+        if self._run_worker is not None and self._run_worker.isRunning():
+            QMessageBox.information(
+                self, "Service-Ausführung",
+                "Eine Service-Ausführung läuft bereits.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        self._run_worker = ServiceRunWorker(
+            self.set_evaluator, symbol, timeframe, set_definition,
+            instance_id=instance_id, parent=self,
+        )
+        self._run_worker.log_message.connect(self._on_run_log)
+        self._run_worker.run_finished.connect(self._on_run_worker_finished)
+        self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
+        self._run_worker.tf_started.connect(self._on_tf_started)
+        self._run_worker.tf_finished.connect(self._on_tf_finished)
+        self._run_worker.start()
+
+    def _on_run_log(self, message: str) -> None:
+        try:
+            print(f"[ServicePicker] {message}")
+        except Exception:
+            pass
+
+    def _on_run_service(self, set_id: str, service_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (Picker-MasterTree)."""
+        if not set_id or not service_id:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            QMessageBox.warning(
+                self, "Service ausführen",
+                f"Set '{set_id}' nicht gefunden.")
+            return
+        if service_id not in (definition.get("services") or {}):
+            QMessageBox.warning(
+                self, "Service ausführen",
+                f"Service '{service_id}' nicht im Set '{set_id}'.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        set_name = str(definition.get("display_name") or set_id)
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{service_id}' aus dem Set '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._start_run_worker(service_id, definition, instance_id=service_id)
+
+    def _on_run_set(self, set_id: str) -> None:
+        """'▶️ Alle Services ausführen' (Picker-MasterTree)."""
+        if not set_id:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            QMessageBox.warning(
+                self, "Set ausführen", f"Set '{set_id}' nicht gefunden.")
+            return
+        if not definition.get("execution_order"):
+            QMessageBox.information(
+                self, "Set ausführen", f"Set '{set_id}' hat keine Services.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        set_name = str(definition.get("display_name") or set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Set ausführen",
+            f"Alle Services ({count}) des Sets '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._start_run_worker(set_id, definition, instance_id=None)
+
+    def _on_run_plugin(self, plugin_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile)."""
+        if not plugin_id:
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{plugin_id}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        definition = {
+            "set_id": f"plugin_{plugin_id}",
+            "display_name": plugin_id,
+            "execution_order": [plugin_id],
+            "services": {plugin_id: self._plugin_config(plugin_id)},
+        }
+        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+
+    def _on_run_category(self, group: str, category_path: str) -> None:
+        """'▶️ Alle Services ausführen' (Kategorie-Ordner, rekursiv)."""
+        if not category_path:
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+        if not plugin_ids:
+            QMessageBox.information(
+                self, "Alle Services ausführen",
+                f"Kategorie '{category_path}' hat keine Services.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        count = len(plugin_ids)
+        reply = QMessageBox.question(
+            self, "Alle Services ausführen",
+            f"Alle Services ({count}) der Kategorie '{category_path}' "
+            f"ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "execution_order": list(plugin_ids),
+            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
+        }
+        self._start_run_worker(category_path, definition, instance_id=None)
+
+    def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
+        """Run abgeschlossen: Pill-Strip zuruecksetzen + Status neu laden."""
+        self._on_run_log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) "
+                         f"im feature_store gespeichert ({scope_id}).")
+        self.badge_bar.set_running(None)
+        self._refresh_badge_bar()
+
+    def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
+        """Run fehlgeschlagen: Pill-Strip zuruecksetzen + Status neu laden."""
+        self._on_run_log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        self.badge_bar.set_running(None)
+        self._refresh_badge_bar()
+
+    def _on_tf_started(self, tf: str) -> None:
+        """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
+        self.badge_bar.set_running(tf)
+        self.badge_bar.clear_error(tf)
+
+    def _on_tf_finished(self, tf: str, stored: int, had_data: bool) -> None:
+        """TF fertig: ohne OHLCV-Daten/Fehler rot markieren, sonst neutral."""
+        if had_data:
+            self.badge_bar.clear_error(tf)
+        else:
+            self.badge_bar.set_error(tf)
+        self.badge_bar.set_running(None)
+
+    def _resolve_badge_plugin(self, node_type: str, set_id: str,
+                              service_id: str,
+                              plugin_id: str) -> Optional[str]:
+        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+        if plugin_id:
+            return str(plugin_id)
+        if node_type == TYPE_SERVICE:
+            if set_id and service_id:
+                cfg = self.model.find_service(set_id, service_id) or {}
+                return str(cfg.get("plugin_id") or service_id)
+            return str(service_id) if service_id else None
+        if node_type == TYPE_SET and set_id:
+            definition = self.model.find_set(set_id) or {}
+            order = list(definition.get("execution_order") or [])
+            services = dict(definition.get("services") or {})
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                if pid:
+                    return pid
+        return None
+
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+        """Laedt die TF-Status-Pills fuer den angegebenen Service neu
+        (FeatureStoreReader.fetch_service_tf_status)."""
+        if plugin_id:
+            self._badge_plugin_id = plugin_id
+        pid = self._badge_plugin_id
+        if not pid:
+            self.badge_bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        self.badge_bar.update_status(status)
 
     def _on_model_data_changed(self) -> None:
         """Modell-Refresh (EventBus -> data_changed): Panel neu aufbauen.

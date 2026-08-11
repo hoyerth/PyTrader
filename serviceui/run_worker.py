@@ -27,8 +27,9 @@ execution_order des Sets) enthaelt – damit liefern Abhaengigkeiten
 nachgelagerter Service (srv_proximity) kann tatsaechlich Hits erzeugen und in
 den feature_store schreiben.
 
-Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
-den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
+Der Worker emittiert NUR Signale (log_message / run_finished / run_failed /
+tf_started / tf_finished); den Bestaetigungsdialog zeigt der Orchestrator
+(ServiceWindow) VOR dem Start.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,7 +52,8 @@ class ServiceRunWorker(QThread):
     nacheinander durch: pro Timeframe OHLCV laden, Pipeline ausfuehren und
     die Payloads mit dem jeweiligen Timeframe in den feature_store schreiben.
     Der EventBus-Sync (`service_set_changed`) wird NUR EINMAL nach Abschluss
-    aller Timeframes emittiert.
+    aller Timeframes emittiert (E17, 11.08.2026: auch bei Teilerfolg bzw.
+    auf Fehlerpfaden, damit bereits geschriebene Payloads im Baum ankommen).
 
     Signals:
         log_message(str)      – Fortschritts-/Ergebnis-Meldungen.
@@ -59,11 +61,16 @@ class ServiceRunWorker(QThread):
                                 geschriebener Feature-Rows (0 moeglich, wenn
                                 der Service keinen feature_store-Payload hat).
         run_failed(str, str)  – scope_id, Fehlermeldung.
+        tf_started(str)       – Timeframe-Start (21.01b, Pill-Strip-Laufzeit).
+        tf_finished(str, int, bool) – Timeframe fertig: tf, geschriebene
+                                Rows, ob OHLCV-Daten vorhanden waren.
     """
 
     log_message = Signal(str)
     run_finished = Signal(str, int)
     run_failed = Signal(str, str)
+    tf_started = Signal(str)
+    tf_finished = Signal(str, int, bool)
 
     def __init__(self, evaluator, symbol: str, timeframe: str,
                  set_definition: Dict[str, Any],
@@ -138,9 +145,13 @@ class ServiceRunWorker(QThread):
         try:
             from db_service import TF_SECONDS_MAP, get_timeframes
             try:
-                return list(get_timeframes().keys())
+                tfs = list(get_timeframes().keys())
             except Exception:
-                return list(TF_SECONDS_MAP.keys())
+                tfs = list(TF_SECONDS_MAP.keys())
+            # 21.01b (E18c, 11.08.2026): stabil AUFSTEIGEND nach Dauer
+            # (M1..MN1) – gleiche Reihenfolge wie combo_tf/Pill-Strip;
+            # schnelle TFs laufen damit zuerst.
+            return sorted(tfs, key=lambda tf: TF_SECONDS_MAP.get(tf, 10 ** 12))
         except Exception:
             return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
@@ -148,6 +159,13 @@ class ServiceRunWorker(QThread):
                            scope_label: str, tf: str) -> Tuple[int, bool]:
         """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
         Feature-Payloads im feature_store.
+
+        E17 (11.08.2026): Die Pipeline laeuft resilient – schlaegt ein
+        EINZELNER Service fehl, wird er geloggt (execute_set_resilient:
+        last_errors/last_skipped) und die restlichen Services laufen weiter
+        statt die Gesamt-Ausfuehrung abzubrechen. execute_set (Fail-Fast)
+        bleibt als Fallback fuer fremde Evaluator-Instanzen ohne die
+        Resilient-Methode.
 
         Returns:
             (stored, had_data) – Anzahl geschriebener Feature-Rows (0, wenn
@@ -176,8 +194,12 @@ class ServiceRunWorker(QThread):
 
         self.log_message.emit(
             f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
-        results = self.evaluator.execute_set(definition, df_plugin,
-                                             context=context)
+        if hasattr(self.evaluator, "execute_set_resilient"):
+            results = self.evaluator.execute_set_resilient(
+                definition, df_plugin, context=context)
+        else:
+            results = self.evaluator.execute_set(definition, df_plugin,
+                                                 context=context)
 
         stored = 0
         # 20.04 (Q9): Instanz-Hashes je iid – Grundlage der feature_store-
@@ -207,17 +229,36 @@ class ServiceRunWorker(QThread):
         return stored, True
 
     # ------------------------------------------------------------------
+    # E17 (11.08.2026): EventBus-Sync (auch auf Fehlerpfaden)
+    # ------------------------------------------------------------------
+    def _emit_service_changed(self) -> None:
+        """Stoesst den UI-Sync einmalig an.
+
+        Nach (Teil-)Abschluss des Workers werden alle lauschenden
+        ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+        automatisch aktualisiert – sie lesen das neue MAX(created_at) und
+        der Baum zeigt das Datum (DD.MM.JJ) live an. E17: Der Sync wird
+        auch bei run_failed/Teilerfolg emittiert, damit bereits geschriebene
+        Payloads (z.B. fruehere Timeframes eines Multi-TF-Runs) sichtbar
+        werden.
+        """
+        try:
+            from config.event_bus import event_bus
+            event_bus.service_set_changed.emit()
+        except Exception as e:  # pragma: no cover
+            print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
+
+    # ------------------------------------------------------------------
     # Worker-Loop
     # ------------------------------------------------------------------
     def run(self) -> None:
         """Laedt OHLCV (ein oder alle Timeframes), fuehrt die Pipeline aus,
         persistiert die Payloads im feature_store und stoesst den EventBus-
-        Sync an (einmalig nach Abschluss)."""
+        Sync an (einmalig nach Abschluss – auch bei Teilerfolg/Fehler)."""
         scope_id = self.instance_id or str(
             self.set_definition.get("set_id") or "")
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            from config.event_bus import event_bus
             from state_manager import StateManager
 
             settings = StateManager().get_app_settings()
@@ -270,6 +311,7 @@ class ServiceRunWorker(QThread):
             no_data_tfs: List[str] = []
             no_payload_tfs: List[str] = []
             for tf in timeframes:
+                self.tf_started.emit(tf)
                 try:
                     stored, had_data = self._execute_timeframe(
                         fb, settings, definition, scope_label, tf)
@@ -277,16 +319,22 @@ class ServiceRunWorker(QThread):
                     # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
                     # die Gesamt-Ausfuehrung NICHT ab – Fehler wird geloggt,
                     # die restlichen Timeframes laufen weiter.
+                    self.tf_finished.emit(tf, 0, False)
                     if self.timeframe == ALL_TIMEFRAMES:
                         self.log_message.emit(
                             f"  {self.symbol} {tf}: FEHLER – {e}")
                         continue
                     raise
+                self.tf_finished.emit(tf, stored, had_data)
                 total_stored += stored
                 if not had_data:
                     no_data_tfs.append(tf)
                 elif stored == 0:
                     no_payload_tfs.append(tf)
+
+            # E17: Sync NACH der (Teil-)Ausfuehrung – auch wenn anschliessend
+            # run_failed folgt, kommen bereits geschriebene Payloads im Baum an.
+            self._emit_service_changed()
 
             # Single-TF-Fehler differenzieren (17.01.02 Bugfix): Die
             # Meldung 'Keine OHLCV-Daten' ist NUR korrekt, wenn die Quelle
@@ -311,15 +359,9 @@ class ServiceRunWorker(QThread):
                 f"Fertig: {total_stored} Feature-Row(s) im feature_store "
                 f"({self.symbol}).")
 
-            # UI-Sync: Nach Abschluss des Workers werden alle lauschenden
-            # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
-            # automatisch aktualisiert – sie lesen das neue MAX(created_at)
-            # und der Baum zeigt das Datum (DD.MM.JJ) live an.
-            try:
-                event_bus.service_set_changed.emit()
-            except Exception as e:  # pragma: no cover
-                print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
-
             self.run_finished.emit(scope_id, total_stored)
         except Exception as e:
+            # E17: Auch bei Abbruch durch Exception wird der Sync angestossen
+            # (falls bereits Payloads geschrieben wurden).
+            self._emit_service_changed()
             self.run_failed.emit(scope_id, str(e))

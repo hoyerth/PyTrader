@@ -63,6 +63,10 @@ from serviceui.new_set_dialog import NewServiceSetDialog
 # den feature_store_payload und emittiert den EventBus (Datum live im Baum).
 # U15-E (05.08.2026): ALL_TIMEFRAMES = Sentinel fuer Multi-TF-Ausfuehrung.
 from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+# 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip) – zeigt je Timeframe die
+# feature_store-Belegung des gewaehlten Services (fetch_service_tf_status).
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from serviceui.common_widgets import TfStatusBadgeBar
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -119,6 +123,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # 05.08.2026: Worker fuer die gezielte Kontextmenue-Ausfuehrung
         # (MasterTree '▶️ Service(s) ausführen') – FeatureStore-Persistenz.
         self._run_worker: Optional[ServiceRunWorker] = None
+        # 21.01b: Plugin-ID des aktuell im Pill-Strip angezeigten Services.
+        self._badge_plugin_id: Optional[str] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
         # 17.01.04 (Bugfix): Standalone-Plugin-Editierung – ist eine
@@ -263,6 +269,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
+            # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip) am Kopf der
+            # Parameter-/Status-Spalte – pro Timeframe die feature_store-
+            # Belegung des aktuell gewaehlten Services. Wird bei der
+            # Service-Auswahl (_on_master_selection_details) und nach jedem
+            # Run neu geladen (fetch_service_tf_status).
+            self.badge_bar = TfStatusBadgeBar()
+            param_layout.insertWidget(0, self.badge_bar)
             # 05.08.2026 (Kleinere Einstellungen, Punkt 2): max. Hoehe der
             # Parameter-Box VERDOPPELT (620 -> 1240), damit Tree UND Box
             # standardmaessig doppelt so hoch sind; die max. BREITE bleibt so
@@ -820,6 +833,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Plugin-Modus zurueckgesetzt.
         """
         if node_type in ("plugin", "clone") and plugin_id:
+            # 21.01b: Pill-Strip fuer den geklickten Service laden.
+            self._refresh_badge_bar(str(plugin_id))
             if node_type == "clone":
                 # 10.08.2026 (Bugfix, Varianten-Params): Eine Variante/Clone
                 # hat EIGENE Parameter in indicator_presets (20.04, Q7) -
@@ -837,6 +852,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self._current_plugin_editing = None
         if self._current_preset_editing:
             self._current_preset_editing = None
+        # 21.01b: Pill-Strip fuer Set-/Service-Zeilen nachziehen (erster
+        # Service des Sets bzw. der Service selbst).
+        self._refresh_badge_bar(
+            self._resolve_badge_plugin(node_type, set_id,
+                                       service_id, plugin_id))
 
     def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
         """ServiceInstanceConfig eines Standalone-Plugins.
@@ -1089,6 +1109,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker.log_message.connect(self.log)
         self._run_worker.run_finished.connect(self._on_run_worker_finished)
         self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
+        self._run_worker.tf_started.connect(self._on_tf_started)
+        self._run_worker.tf_finished.connect(self._on_tf_finished)
         # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
         self._begin_sync_guard()
         self._run_worker.start()
@@ -1427,12 +1450,86 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._end_sync_guard()
         self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
                  f"feature_store gespeichert ({scope_id}).")
+        # 21.01b: Pill-Strip nach dem Run neu laden (neue Counts/last_run).
+        bar = getattr(self, "badge_bar", None)
+        if bar is not None:
+            bar.set_running(None)
+        self._refresh_badge_bar()
 
     @Slot(str, str)
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
         self._end_sync_guard()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        # 21.01b: Pill-Strip nach Fehler zuruecksetzen + Status neu laden.
+        bar = getattr(self, "badge_bar", None)
+        if bar is not None:
+            bar.set_running(None)
+        self._refresh_badge_bar()
+
+    # -------------------------------------------------------------------------
+    # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip)
+    # -------------------------------------------------------------------------
+    def _on_tf_started(self, tf: str) -> None:
+        """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        bar.set_running(tf)
+        bar.clear_error(tf)
+
+    def _on_tf_finished(self, tf: str, stored: int, had_data: bool) -> None:
+        """TF fertig: ohne OHLCV-Daten/Fehler rot markieren, sonst neutral."""
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        if had_data:
+            bar.clear_error(tf)
+        else:
+            bar.set_error(tf)
+        bar.set_running(None)
+
+    def _resolve_badge_plugin(self, node_type: str, set_id: str,
+                              service_id: str,
+                              plugin_id: str) -> Optional[str]:
+        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+        if plugin_id:
+            return str(plugin_id)
+        if set_id:
+            try:
+                definition = self.set_repo.get_set(set_id)
+            except Exception:
+                definition = None
+            if definition:
+                order = list(definition.get("execution_order") or [])
+                services = dict(definition.get("services") or {})
+                for iid in order:
+                    cfg = services.get(iid) or {}
+                    pid = str(cfg.get("plugin_id") or iid)
+                    if pid:
+                        return pid
+        return str(service_id) if service_id else None
+
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+        """Laedt die TF-Status-Pills fuer den angegebenen Service neu.
+
+        Quelle: FeatureStoreReader.fetch_service_tf_status() – je Timeframe
+        die Anzahl der feature_store-Eintraege und der letzte Lauf.
+        """
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        if plugin_id:
+            self._badge_plugin_id = plugin_id
+        pid = self._badge_plugin_id
+        if not pid:
+            bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        bar.update_status(status)
 
     # -------------------------------------------------------------------------
     # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste

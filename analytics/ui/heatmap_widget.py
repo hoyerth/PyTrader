@@ -470,7 +470,14 @@ class _HeatmapAxis(pg.AxisItem):
         # Kategorial (timeframe/service_id/symbol): Labels aus der Liste.
         idx = int(round(v))
         if 0 <= idx < len(self._labels):
-            return str(self._labels[idx])
+            # E16 (11.08.2026, Bugfix 2): Kategoriale Labels an JEDEM '/'
+            # mit '\n' umbrechen (z.B. 'SILVER / M1' -> zwei Zeilen) statt
+            # zu kappen – pyqtgraph rendert mehrzeilige Tick-Labels korrekt.
+            # Betrifft X- und Y-Achse (dieselbe _format-Methode).
+            label = str(self._labels[idx])
+            if "/" in label:
+                label = label.replace("/", "/\n")
+            return label
         # 21.01 (Bugfix 1): Ausserhalb des festen Wertebereichs -> leer
         # (das tickValues-Clamping verhindert sie bereits; defensiv).
         return ""
@@ -2094,7 +2101,17 @@ class HeatmapWidget(QWidget):
         self._update_cell_info(p.x(), p.y())
 
     def _update_cell_info(self, x: float, y: float) -> None:
-        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4)."""
+        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4).
+
+        E15 (11.08.2026, Bugfix 1): Das DATUM ist der TAG DER ZELLE unter
+        dem Fadenkreuz (self._x_axis[col], Mitternacht der Wanduhr). Die
+        Zellen sind mittags-zentriert [Tag-12h, Tag+12h) – die nackte
+        Cursor-Roh-Epoch wuerde sonst bei Vormittags-Zeiten (0:00-11:59)
+        off-by-one-day liefern. Die ZEIT ist die exakte Cursor-HH:MM aus
+        der Roh-Epoch (Wanduhr-UTC, KEIN Berlin-Offset). Das Label wird
+        ausserdem IMMER aktualisiert (auch ausserhalb des Datenbereichs),
+        damit kein veralteter Zellwert stehen bleibt.
+        """
         if self._n_rows <= 0 or self._n_cols <= 0:
             return
         img = getattr(self._image, "image", None)
@@ -2104,25 +2121,29 @@ class HeatmapWidget(QWidget):
         sy = (self._y_max - self._y_min) or 1.0
         col = int((x - self._x_min) / sx * self._n_cols)
         row = int((y - self._y_min) / sy * self._n_rows)
-        if not (0 <= col < self._n_cols and 0 <= row < self._n_rows):
+        in_bounds = (0 <= col < self._n_cols and 0 <= row < self._n_rows)
+        time_txt = ""
+        if str(self._combo_x.currentData() or "date") == "date":
+            try:
+                day_ts = float(self._x_axis[col]) if (
+                    0 <= col < len(self._x_axis)) else float(x)
+                d_day = datetime.fromtimestamp(day_ts, tz=dt_timezone.utc)
+                d_time = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
+                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+                time_txt = (f"{days[d_day.weekday()]} {d_day.day:02d}."
+                            f"{d_day.month:02d}.{d_day.year % 100:02d} "
+                            f"{d_time.hour:02d}:{d_time.minute:02d}  →  ")
+            except (TypeError, ValueError, OverflowError):
+                time_txt = ""
+        if not in_bounds:
+            self._label_info.setText(
+                f"{time_txt}Zelle ausserhalb des Datenbereichs")
             return
         try:
             v = float(img[row, col])
         except (TypeError, ValueError, IndexError):
+            self._label_info.setText(f"{time_txt}Zelle({row},{col}) = n/a")
             return
-        # 21.01 (Bugfix-Runde 3, Bug 4): Genaue Datum/Zeit am Fadenkreuz
-        # (wie chart_win). Bei X=date wird die Cursor-Position als
-        # Wanduhr-Zeit formatiert; der Zellwert folgt danach.
-        time_txt = ""
-        if str(self._combo_x.currentData() or "date") == "date":
-            try:
-                dt = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
-                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
-                time_txt = (f"{days[dt.weekday()]} {dt.day:02d}."
-                            f"{dt.month:02d}.{dt.year % 100:02d} "
-                            f"{dt.hour:02d}:{dt.minute:02d}  ·  ")
-            except (TypeError, ValueError, OverflowError):
-                time_txt = ""
         self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
 
     # ------------------------------------------------------------------

@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 
 from analytics.engine.analytics_view_model import AnalyticsViewModel
 from analytics.engine.analytics_worker import QUERY_TABLE
+from analytics.engine.feature_store_reader import FeatureStoreReader
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -62,6 +63,7 @@ from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
+from serviceui.common_widgets import TfStatusBadgeBar
 from serviceui.service_selector_dialog import ServiceSelectorDialog
 from serviceui.symbols_win import SymbolsWindow
 
@@ -330,6 +332,11 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.combo_tf)
         filt.addWidget(QLabel("Datenquellen:"))
         filt.addWidget(self.btn_data_sources)
+        # 21.01b (11.08.2026): Pill-Strip NEBEN der Datenquellen-Combo –
+        # zeigt je Timeframe die feature_store-Belegung der ERSTEN aktiven
+        # Datenquelle (fetch_service_tf_status); leer ohne Filter.
+        self.badge_bar = TfStatusBadgeBar()
+        filt.addWidget(self.badge_bar)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.edit_limit)
         # 19.01 (Step 1): Status-Message direkt hinter dem Limit-Feld –
@@ -492,11 +499,33 @@ class AnalyticsWindow(PersistentWindow):
         if not ids:
             self.btn_data_sources.setText(
                 "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]")
+            self._refresh_badge_bar()
             return
         names = (self._active_display_names
                  or self._selector_model.resolve_display_names(ids))
         self.btn_data_sources.setText(
             f"[ 🛠️ Datenquellen: {', '.join(names)} ▾ ]")
+        self._refresh_badge_bar()
+
+    def _refresh_badge_bar(self) -> None:
+        """21.01b: Pill-Strip fuer die ERSTE aktive Datenquelle laden.
+
+        Quelle: FeatureStoreReader.fetch_service_tf_status() – je Timeframe
+        die Anzahl der feature_store-Eintraege und der letzte Lauf.
+        """
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        ids = (self._vm.params.get("feature_ids") or [])
+        pid = str(ids[0]) if ids else ""
+        if not pid:
+            bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        bar.update_status(status)
 
     @Slot()
     def _sync_ui_from_restored_params(self) -> None:

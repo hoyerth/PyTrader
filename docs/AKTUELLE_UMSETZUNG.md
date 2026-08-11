@@ -179,6 +179,10 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 | **E12** | Senkrechte Teiler je Dateneinheit (Bug 2, Variante a – User-Entscheidung): `pyqtgraph.GridItem` verworfen (in v0.14 nur `setTickSpacing` = feste Skalen); stattdessen `_grid_lines = pg.PlotCurveItem(connect="pairs")` (zValue 5) + neue Methode `_update_grid_lines()` (Bar-Intervall des Heatmap-TFs via `_bar_interval_seconds()`, Dichte-Cap 2000 Linien, `np.arange` ab `floor(lo/bar_sec)*bar_sec`). Aufruf nach `setRect` in `_render_generic`, Leeren bei „Keine Daten“. |
 | **E13** | Tages-Marken-Format der X-Achse (X=date): `Mo. 12.06.26` (deutscher Kurz-Wochentag + `TT.MM.JJ`, 1:1 Chart-Konvention); days-Tupel `("Mo.", …, "So.")`, `dt.weekday()` (0 = Mo). |
 | **E14** | Zelleninfo am Fadenkreuz (X=date): zusätzliche Zeitzeile `Zeit: Mo. 12.06.26 14:00 · Zelle(row,col) = Wert` – Datum aus der echten Tag-Epoch des Tracks, HH:MM aus dem Sub-Tag-Wert. |
+| **E15** | Fadenkreuz-Zelleninfo (X=date, b1→a): Datum = Tag der Zelle unter dem Fadenkreuz (`self._x_axis[col]`, E14-konform „echte Tag-Epoch des Tracks"), Zeit = exakte Cursor-HH:MM aus der Roh-Epoch (Wanduhr-UTC, Invariante 7). Behebt den off-by-one-day-Bug (Zellen sind mittags-zentriert `[Tag−12 h, Tag+12 h)` → Cursor 12:00–24:00 zeigte den Wert der Folgetag-Zelle). Zusätzlich: Label wird auch außerhalb des Datenbereichs aktualisiert (leeres Zeit-Segment statt stehengebliebenem Alt-Label). |
+| **E16** | Mehrzeilige Achsen-Beschriftung (b2): Kategoriale Labels (service_id/timeframe/symbol) werden in `_HeatmapAxis._format` an JEDEM `/` umgebrochen (`\n` je Segment) – das letzte Segment (Service-Name) bleibt am besten lesbar („größte Aussagekraft“). KEINE Zeilenzahl-Kappung (beliebig viele Segmente). Gilt für X- und Y-Achse (User-Kontext: Y). pyqtgraph 0.14 vermisst/rendert `\n`-Tick-Labels korrekt (headless verifiziert). |
+| **E17** | Service-Run Refresh-/Fehlerverhalten (b3 = AI-Empfehlungen): (a) `event_bus.service_set_changed` wird AUCH bei `run_failed`/Teilerfolg emittiert (mindestens wenn Feature-Rows geschrieben wurden) → Baum-Datum aktualisiert sich auch auf neuen TFs zuverlässig. (b) Einzel-Service-Fehler im Set-Run (0 Records trotz Daten / Exception) werden geloggt und die übrigen Services laufen WEITER (analog Multi-TF-Pfad) statt Gesamt-Abbruch – insbesondere auf neuen TFs. |
+| **E18** | TF-Umfang & Einbettung (b4): (b) Pill-Strip zeigt ALLE TFs mit feature_store-Daten (nicht nur die 6 Spez-TFs M1..D1), sortiert aufsteigend nach Dauer (`TF_SECONDS_MAP`). (c) „Alle Timeframes“-Run nutzt ALLE TFs, die als Kerzen verfügbar sind (OHLCV-Daten des aktiven Symbols in market_data). (d) Einbettung an BEIDEN Orten: ServiceWindow (`combo_tf` existiert bereits, U15-E) UND ServicePicker/`ServiceSelectorDialog` (+ Datenquellen-Combo des AnalyticsWindow). |
 
 ---
 
@@ -194,4 +198,97 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 * **11.08.2026 – Bugfix-Runde 2 Heatmap-Darstellung (Coding, 5 Bugs, nur `analytics/ui/heatmap_widget.py`, +231/−57):** (1) Kategoriales Achsen-Clamping – Ticks außerhalb `0..n−1` entfallen (`_clamped_scale_bounds`, `_format` → leere Strings). (2) Schwellwert-Legende (`pg.LegendItem` oben rechts) + `0`-Confluence-Farbe Grau `#d9d9d9`. (3) Fadenkreuz (`_cross_x`/`_cross_y` als `pg.InfiniteLine`, zValue 20) + `_on_mouse_moved` + `_update_cell_info`. (4) Datumsformate 1:1 JS-Konvention (`TT.MM.JJ` / `HH:MM`). (5) Adaptives Overlay: `QUERY_OHLCV` statt Daily-Query, `_TF_SECONDS`-Map, `_bar_interval_seconds()`. Verifikation: `test/check_heatmap_2101.py` 20/20 + Smoke-Test 7/7 (headless, venv). **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
 * **11.08.2026 – Bugfix-Runde 3 Heatmap-Darstellung (Coding, 4 Punkte, User „doku alles und setze deine Vorschläge um“):** E11 (Overlay batched: 3 `pg.BarGraphItem`, numpy), E12 (senkrechte Teiler je Dateneinheit, Variante a: `_grid_lines` als `PlotCurveItem(connect="pairs")` + `_update_grid_lines()`), E13 (Tages-Marken `Mo. 12.06.26`), E14 (Zelleninfo-Zeitzeile `Zeit: Mo. 12.06.26 14:00 · Zelle(row,col) = Wert`). Nachgereicht: `bar_sec = self._bar_interval_seconds()` im batched-Overlay-Block (der Runde-2-Patch hatte die Zeile zusammen mit dem alten Loop ersetzt). Verifikation: `test/check_heatmap_2101.py` 22/22 OK (headless, venv), `py_compile` von `heatmap_widget.py` + `test.py` OK. **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
 
+* **11.08.2026 – Bugfix-/Spez-Analyse 21.01 + 21.01b (Analyse, KEIN Coding, Anweisung „bugfix mode – prüfe, Ergebnisse als Textblock, kein Coding“):** Vier User-Meldungen geprüft und headless verifiziert (Wegwerf-DB in `test/`, danach wieder entfernt): **(1) Fadenkreuz-Zelleninfo** funktioniert mechanisch (row/col-Mapping ohne Flip, Wanduhr-Konvertierung), hat aber einen echten off-by-one-day-Bug: Tageszellen sind mittags-zentriert (`_axis_bounds`: `lo−12 h … hi+12 h`) → Cursor 12:00–24:00 zeigt den Wert der Folgetag-Zelle; außerhalb des Datenbereichs bleibt das alte Label stehen. **(2) Mehrzeilen-Umbruch** am `/` ist machbar – pyqtgraph 0.14 misst/rendert `\n`-Tick-Labels korrekt. **(3) „Datum im Baum bleibt stehen“ auf neuem TF:** DB-Schicht korrekt (PK `(symbol, timeframe, bar_time, feature_id)` trennt TFs; `fetch_last_execution_dates` liefert sofort das neue Datum) – Root Cause in `run_worker.py`: `event_bus.service_set_changed` wird NUR bei vollem Erfolg emittiert; alle Fehlerpfade (`no_data_tfs`, `no_payload_tfs`, Exception im Single-TF-Zweig) überspringen den Refresh, obwohl Rows geschrieben wurden. **(4) Service-Picker** hat keinen TF-Selektor (nur `ServiceWindow.combo_tf`, U15-E); Heatmap-Preset „Service-Timeframe“ sortiert die TFs alphabetisch statt nach Dauer. Spez-Bausteine `fetch_service_tf_status`, `TfStatusBadgeBar`, `serviceui/common_widgets.py`, per-TF-Worker-Signale existieren nicht. Entscheidungen E15–E18 (§5) dokumentiert – **Umsetzung erst nach explizitem Befehl**.
 
+# 21.01b Analytics – Multi-TF Execution & Status Pill-Strip
+
+## 🎯 1. Ziel & UX-Anforderungen
+
+1. **Multi-TF Execution im Service Picker / Window:**
+* Dropdown/Action-Button in der Filterleiste: `[ Aktueller TF (H1) ]` vs. `[ 🌐 Alle Timeframes ]`.
+* Klick stößt die Batch-Berechnung im `ServiceRunWorker` schrittweise über alle TFs an (bestehende `ALL_TIMEFRAMES`-Mechanik, U15-E).
+* **E18c:** „Alle Timeframes“ = ALLE TFs, die als Kerzen verfügbar sind (OHLCV-Daten des aktiven Symbols in market_data).
+
+2. **Kompaktes Status-Widget (`TfStatusBadgeBar` / Pill-Strip):**
+* Bemaßung: ca. 170 × 16 px (extrem platzsparend).
+* Feste Platzierung: Parameter/Status-Spalte des `ServiceWindow` / `MasterTree` sowie neben der Datenquellen-Combo des `AnalyticsWindow` – **E18d: BEIDE Orte** (ServiceWindow UND ServicePicker).
+* Badges: ein Label je TF – Umfang = **E18b: ALLE TFs mit feature_store-Daten**, sortiert aufsteigend nach Dauer (`TF_SECONDS_MAP`, deckungsgleich mit `_refresh_timeframe_combo` des ServiceWindow).
+
+3. **Farb-Codierung:**
+* Dunkelgrau (⚪): Noch nie berechnet (0 Rows).
+* Grün (✅): Berechnet & aktuell (>0 Rows im `feature_store`).
+* Rot (❌): Fehler / Abbruch.
+* Blau blinkend (🔄): Berechnet gerade im Hintergrund (per-TF-Signal des Workers, Schritt 3.2).
+
+4. **Detail-Tooltip (Mouse-Over):**
+* Hover über ein Badge zeigt exakte Zeilenzahl & Zeitstempel der letzten Ausführung (`DD.MM.JJ HH:MM`).
+
+---
+
+## 🛠️ 2. Schritt-für-Schritt Umsetzungsanleitung für die IDE
+
+### Schritt 1: DB-Status-Methode (`analytics/engine/feature_store_reader.py`)
+
+* **1.1 Aggregierten Status abfragen (`fetch_service_tf_status`):** Liefere in EINER leichten SQL-Abfrage Zeilenzahl und `created_at` aller TFs für ein `plugin_id`:
+
+```python
+def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
+    con = self._get_connection()
+    try:
+        rows = con.execute("""
+            SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
+            FROM feature_store
+            WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+            GROUP BY LOWER(timeframe)
+        """, [plugin_id]).fetchall()
+        return {r[0].upper(): {"count": r[1], "last_run": r[2].strftime("%d.%m.%y %H:%M") if r[2] else ""} for r in rows}
+    except Exception:
+        return {}
+```
+
+* **1.2 Verfügbare TFs (E18b/E18c):** Pill-Strip-Umfang (TFs mit feature_store-Daten) und Run-Umfang (TFs mit OHLCV-Kerzen) werden über die bestehenden Reader-/DbPool-Lesepfade ermittelt (kein neuer Schreibpfad).
+
+### Schritt 2: Mini-Pill-Strip Widget (`serviceui/common_widgets.py` – NEUE Datei)
+
+* **2.1 `TfStatusBadgeBar`-Klasse erstellen:**
+* `QWidget` mit `QHBoxLayout` (Spacing 2, Margins 0).
+* Ein `QLabel` je TF (feste Größe ~28 × 16 px, Font 9 pt bold, `border-radius: 3px`).
+* `update_status(tf_status_map: Dict[str, Dict[str, Any]])`: färbt Badges grün/grau (E18b: dynamische TF-Liste aus dem Status-Map, sortiert nach `TF_SECONDS_MAP`) und setzt den `setToolTip()` (z. B. `M1: 10.000 Einträge\nZuletzt: 11.08.26 20:15`).
+* `set_running(tf)`/`set_error(tf)`: Blau-Blinken (QTimer) bzw. Rot (Schritt 3.2).
+
+### Schritt 3: Multi-TF-Ausführung Toolbar (`serviceui/service_win.py` / `service_selector_dialog.py`)
+
+* **3.1 ComboBox `combo_run_tf`:** `[ Aktueller TF ]` + `[ 🌐 Alle Timeframes ]`. Im `ServiceWindow` ist das bestehende `combo_tf` (U15-E, Index 0 = `ALL_TIMEFRAMES`) die Grundlage; der `ServiceSelectorDialog` erhält zusätzlich eine TF-Zeile (E18d).
+* **3.2 Per-TF-Fortschrittssignale im `ServiceRunWorker`:** neue Signale `tf_started(str)` / `tf_finished(str, int, bool)` – der Orchestrator setzt das jeweilige Badge auf „berechnet gerade“ (blau blinkend) bzw. grün (Rows geschrieben) / rot (Fehler).
+
+### Schritt 4: UI-Integration & Event-Update
+
+* **4.1 Einbettung:** `TfStatusBadgeBar` als Spalten-Widget in `MasterTree`/`ServiceWindow` sowie in den `ServiceSelectorDialog` (E18d).
+* **4.2 Signal-Kopplung:** Badges nach jedem `run_finished`/`run_failed` aktualisieren. **Voraussetzung ist E17** (EventBus-Refresh auch bei Teilerfolg/Fehler), damit der Status nach jedem Run korrekt neu gelesen wird.
+
+---
+
+## 📊 3. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
+
+1. **DB-Status-Query-Test:** `fetch_service_tf_status("srv_proximity")` liefert korrektes Dict für alle TFs mit `count` und `last_run`.
+2. **Badge-Mapping-Test:** `TfStatusBadgeBar.update_status()` setzt für vorhandene TFs korrekte Tooltip-Texte und Stylesheet-Farben.
+3. **Multi-TF-Loop-Test:** Bei Auswahl „Alle Timeframes“ startet der Run-Worker alle als Kerzen verfügbaren TFs nacheinander (E18c).
+4. **EventBus-Teilerfolg-Test (E17):** Nach einem Run mit ≥1 geschriebener Feature-Row wird `service_set_changed` auch bei späterem Fehler eines Einzel-Services emittiert (Baum-Datum aktualisiert sich).
+
+---
+
+## 📝 4. Implementierungs-Log
+
+* **11.08.2026 – Doku-Update 21.01b (Entscheidungen & Aktualisierungen):** Neues Kapitel für Multi-TF-Execution & Status-Pill-Strip angelegt (ultrakompakte Spezifikation des Anwenders). User-Entscheidungen b1–b4 in 21.01 §5 (E15–E18) dokumentiert; Umsetzungsanleitung (Schritt 1–4) und Akzeptanzkriterien (4 Checks) auf den entschiedenen Stand aktualisiert: E15 (Fadenkreuz: Datum = Zell-Tag, Zeit = exakte Cursor-HH:MM), E16 (Umbruch an jedem `/` ohne Kappung), E17 (EventBus-Refresh auch bei Teilerfolg/Fehler + Einzel-Service-Fehler loggen statt Gesamt-Abbruch), E18 (Pill-Strip = alle TFs mit Daten, Run = alle als Kerzen verfügbaren TFs, Einbettung in ServiceWindow UND ServicePicker). Reine Doku – **kein Coding**; Umsetzung erst nach explizitem Befehl.
+* **11.08.2026 – UMSETZUNG 21.01b + E15–E18 (Anweisung „umsetzung aller schritte“):**
+  * **E17 (run_worker.py):** EventBus-Sync `service_set_changed` wird jetzt über `_emit_service_changed()` AUCH auf Fehler-/Teilerfolgspfaden emittiert (vor den `run_failed`-Returns im Single-TF-Zweig, nach der Teil-Ausführung und im äußeren `except`). Einzel-Service-Fehler im Set-Run laufen resilient weiter (`execute_set_resilient` statt Fail-Fast-`execute_set`, Fallback für fremde Evaluator-Instanzen) – `last_errors`/`last_skipped` werden geloggt. Neue per-TF-Signale `tf_started(str)`/`tf_finished(str, int, bool)` werden je Timeframe emittiert. `_resolve_timeframes()` sortiert die Multi-TF-Liste jetzt stabil AUFSTEIGEND nach Dauer (M1..MN1, E18c, konsistent zu Combo/Pill-Strip).
+  * **E15 (heatmap_widget.py, `_update_cell_info`):** Datum = Tag der Zelle unter dem Fadenkreuz (`self._x_axis[col]`, Mitternacht der Wanduhr) statt nackter Cursor-Roh-Epoch → behebt den off-by-one-day-Bug (Zellen mittags-zentriert). Zeit = exakte Cursor-HH:MM aus der Roh-Epoch (Wanduhr-UTC, KEIN Berlin-Offset). Label wird IMMER aktualisiert – außerhalb des Datenbereichs „Zelle ausserhalb des Datenbereichs“, bei ungültigem Wert „n/a“.
+  * **E16 (heatmap_widget.py, `_HeatmapAxis._format`):** Kategoriale Labels (service_id/timeframe/symbol) werden an JEDEM `/` mit `
+` umgebrochen (keine Kappung), gilt für X- und Y-Achse.
+  * **21.01b Schritt 1 (`feature_store_reader.py`):** Neue Methode `fetch_service_tf_status(plugin_id)` – SQL `SELECT LOWER(TRIM(timeframe)), COUNT(*), MAX(created_at) … GROUP BY LOWER(TRIM(timeframe))`, case-insensitiv/whitespace-tolerant, Rückgabe `Dict TF(upper) -> {'count': int, 'last_run': 'DD.MM.JJ HH:MM'}`.
+  * **21.01b Schritt 2 (NEUE Datei `serviceui/common_widgets.py`):** Widget `TfStatusBadgeBar` (QHBoxLayout, Spacing 2, QLabel je TF 28×16 px, 9 pt bold, Radius 3 px; `update_status(map)`, `set_running(tf|None)`, `set_error(tf)`, `clear_error`, `clear`; Tooltip `M1: 99.063 Eintraege\nZuletzt: 11.08.26 20:15`; Farben: idle/running/error/hint).
+  * **21.01b Schritt 3+4 (Einbettung + Kopplung):**
+    * `service_win.py`: `TfStatusBadgeBar` am Kopf der Parameter-/Status-Spalte; Worker-Signale `tf_started`/`tf_finished` gekoppelt (`_on_tf_started`/`_on_tf_finished`), nach `run_finished`/`run_failed` Refresh via `_refresh_badge_bar()`; `_on_master_selection_details` lädt die Pills für die geklickte Zeile (`_resolve_badge_plugin`). Run nutzt weiterhin das bestehende `combo_tf` (Index 0 = `ALL_TIMEFRAMES`).
+    * `service_selector_dialog.py`: NEUE TF-Zeile `combo_run_tf` (Sentinel `ALL_TIMEFRAMES` + TFs aufsteigend) + `TfStatusBadgeBar` im Parameter-Panel; MasterTree-Run-Aktionen (`run_service/set/plugin/category_requested`) verdrahtet (User-Entscheid: Run im Picker voll funktional) – Bestätigungsdialog, `_plugin_config` (17.01.04-Muster), `ServiceRunWorker` mit `_run_symbol()` (Parent `combo_symbol`) und `_run_timeframe()`; Pill-Strip-Kopplung identisch zum ServiceWindow.
+    * `analytics_win.py`: `TfStatusBadgeBar` NEBEN der Datenquellen-Combo (Filter-Zeile); `_refresh_badge_bar()` zeigt die TFs der ERSTEN aktiven Datenquelle (`feature_ids[0]`), Sync über `_sync_service_filter_button`.
+  * **Verifikation (headless, KEIN UI-/Regressionstest):** `py_compile` auf allen 7 geänderten Dateien (OK); `test/check_2101b.py` 18/18 PASS (DB-Status-Query, Badge-Mapping inkl. Tooltip/running/error/laufender TF ohne DB-Eintrag, Multi-TF-Loop sortiert nach `TF_SECONDS_MAP`, Sentinel, Worker-Signale, E17-Code-Inspection, Modul-Import-Smoke).

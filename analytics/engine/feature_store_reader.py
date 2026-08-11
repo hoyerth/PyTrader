@@ -1324,6 +1324,64 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_service_tf_status(
+        self, plugin_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Timeframe-Verfuegbarkeit eines Services (21.01b, Schritt 1).
+
+        Liest fuer die Pill-Badges (TfStatusBadgeBar) je Timeframe des
+        Services die Anzahl der Feature-Store-Eintraege und den letzten
+        Schreib-Zeitpunkt direkt aus der feature_store-Tabelle.
+
+        SQL: SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
+             FROM feature_store
+             WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+             GROUP BY LOWER(timeframe)
+
+        Robustheit wie `fetch_last_execution_dates`: Case-insensitiv
+        (LOWER/TRIM auf feature_id UND timeframe) und defensiv gegen
+        NULL/leere Rows (feature_id, timeframe, created_at).
+
+        Args:
+            plugin_id: Plugin-ID des Services (z.B. 'srv_proximity').
+
+        Returns:
+            Dict Timeframe (upper, z.B. 'M1') -> {'count': int, 'last_run': str}
+            mit 'last_run' als 'DD.MM.JJ HH:MM' (Wanduhr, UTC-Darstellung);
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        if not plugin_id or not str(plugin_id).strip():
+            return {}
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(timeframe)) AS tf, COUNT(*) AS cnt,
+                       MAX(created_at) AS last_run
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+                GROUP BY LOWER(TRIM(timeframe))
+            """, [str(plugin_id)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_service_tf_status "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            tf_raw = r[0]
+            cnt = r[1]
+            created = r[2]
+            if tf_raw is None or cnt is None:
+                continue
+            last_run = ""
+            if created is not None:
+                try:
+                    last_run = created.strftime("%d.%m.%y %H:%M")
+                except (AttributeError, ValueError):
+                    last_run = ""
+            out[str(tf_raw).upper()] = {"count": int(cnt), "last_run": last_run}
+        return out
+
     def fetch_last_execution_dates_by_hash(
         self,
     ) -> Dict[str, Dict[str, str]]:
