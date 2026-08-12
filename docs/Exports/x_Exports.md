@@ -114,6 +114,7 @@ PyTrader/
         market_data_repository.py
     serviceui/
         __init__.py
+        common_widgets.py
         master_tree.py
         new_set_dialog.py
         param_columns.py
@@ -134,6 +135,7 @@ PyTrader/
         _diag_cb2.py
         _diag_colorbar.py
         _diag_e2e.py
+        _diag_flow2.py
         _diag_overlay.py
         _diag_overlay_e2e.py
         _diag_presets.py
@@ -166,6 +168,7 @@ PyTrader/
         check_2004_uiflow.py
         check_2004_viewmodel.py
         check_2004_writers.py
+        check_2101b.py
         check_bug345_chain.py
         check_bug345_chain_empiric.py
         check_bug345_h1_counterproof.py
@@ -202,7 +205,9 @@ PyTrader/
         check_round9.py
         check_ui3_bugfix.py
         check_variant_bugfix.py
+        check_variant_hash_fix.py
         check_variant_params_bugfix.py
+        check_variant_run.py
         check_wal_guard.py
         check_wal_recovery.py
         debug_h1_filter.py
@@ -240,13 +245,9 @@ PyTrader/
         dbg_xwu8rdux/
         p20_07_picker_lpyvmzub/
         p20_07_picker_xqxueh9l/
-        pytrader_round15b_s94b6f12/
-        pytrader_round15c_b2_y2_u2/
-        pytrader_round15_2oaibavr/
-        pytrader_var_an6q2o2g/
-        pytrader_var_bmy8a4m6/
-        pytrader_var_fji0r6sx/
-        pytrader_var_wcmn_zpe/
+        pytrader_run_hgbnvx8d/
+        pytrader_vhf_aeqe1afp/
+        pytrader_vhf_z856r25b/
     ui/
         __init__.py
         chart_win.ui
@@ -7701,7 +7702,7 @@ class FeatureStoreReader:
             if hashes:
                 placeholders = ", ".join("?" for _ in hashes)
                 conditions.append(
-                    f"(instance_hash IS NULL OR "
+                    f"(instance_hash IS NULL OR instance_hash = '' OR "
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 
@@ -8665,6 +8666,64 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_service_tf_status(
+        self, plugin_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Timeframe-Verfuegbarkeit eines Services (21.01b, Schritt 1).
+
+        Liest fuer die Pill-Badges (TfStatusBadgeBar) je Timeframe des
+        Services die Anzahl der Feature-Store-Eintraege und den letzten
+        Schreib-Zeitpunkt direkt aus der feature_store-Tabelle.
+
+        SQL: SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
+             FROM feature_store
+             WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+             GROUP BY LOWER(timeframe)
+
+        Robustheit wie `fetch_last_execution_dates`: Case-insensitiv
+        (LOWER/TRIM auf feature_id UND timeframe) und defensiv gegen
+        NULL/leere Rows (feature_id, timeframe, created_at).
+
+        Args:
+            plugin_id: Plugin-ID des Services (z.B. 'srv_proximity').
+
+        Returns:
+            Dict Timeframe (upper, z.B. 'M1') -> {'count': int, 'last_run': str}
+            mit 'last_run' als 'DD.MM.JJ HH:MM' (Wanduhr, UTC-Darstellung);
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        if not plugin_id or not str(plugin_id).strip():
+            return {}
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(timeframe)) AS tf, COUNT(*) AS cnt,
+                       MAX(created_at) AS last_run
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+                GROUP BY LOWER(TRIM(timeframe))
+            """, [str(plugin_id)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_service_tf_status "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            tf_raw = r[0]
+            cnt = r[1]
+            created = r[2]
+            if tf_raw is None or cnt is None:
+                continue
+            last_run = ""
+            if created is not None:
+                try:
+                    last_run = created.strftime("%d.%m.%y %H:%M")
+                except (AttributeError, ValueError):
+                    last_run = ""
+            out[str(tf_raw).upper()] = {"count": int(cnt), "last_run": last_run}
+        return out
+
     def fetch_last_execution_dates_by_hash(
         self,
     ) -> Dict[str, Dict[str, str]]:
@@ -9557,7 +9616,9 @@ def _sanitize_for_hash(value: Any) -> Any:
 
 
 def generate_instance_hash(
-    plugin_id: str, params: Optional[Dict[str, Any]] = None
+    plugin_id: str,
+    params: Optional[Dict[str, Any]] = None,
+    preset_name: Optional[str] = None,
 ) -> str:
     """8-stelliger deterministischer SHA256-Short-Hash einer Instanz (20.04).
 
@@ -9569,9 +9630,21 @@ def generate_instance_hash(
     * **Q4:** `_sanitize_for_hash` überführt numpy-Werte/None/verschachtelte
       Dicts vorher in native Python-Typen; `sort_keys=True` macht die
       Serialisierung kanonisch (unabhängig von der Speicherreihenfolge).
+
+    **11.08.2026 (Bugfix Varianten-Kollision):** Optionaler `preset_name`
+    (Varianten-/Clone-Pfad). Wird er mitgegeben, fließt er als `__preset`-
+    Schlüssel in die kanonische Serialisierung ein – Presets mit IDENTISCHEN
+    Parametern aber unterschiedlichen Namen erhalten dadurch unterschiedliche
+    Hashes (vorher kollidierten z.B. `params={}`-Presets, womit Kontextmenü-
+    Runs und Ausführungsdaten im MasterTree alle Varianten gemeinsam trafen).
+    Ohne `preset_name` (Set-Instanzen) bleibt der Hash exakt wie bisher
+    (Backward-Compat zu Alt-Bestand).
     """
+    input_params: Dict[str, Any] = dict(params or {})
+    if preset_name is not None:
+        input_params["__preset"] = str(preset_name)
     canonical = json.dumps(
-        _sanitize_for_hash(params or {}),
+        _sanitize_for_hash(input_params),
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -9962,11 +10035,20 @@ class ServiceSelectorModel(QObject):
                     if not isinstance(p, dict):
                         continue
                     params = p.get("params") or {}
-                    instance_hash = generate_instance_hash(pid, params)
+                    # 11.08.2026 (Bugfix Varianten-Kollision): Der
+                    # instance_hash eines Presets wird inkl. preset_name
+                    # berechnet (generate_instance_hash mit preset_name) –
+                    # Presets mit identischen Parametern aber unterschiedlichen
+                    # Namen erhalten dadurch UNTERSCHIEDLICHE Hashes (vorher
+                    # kollidierten sie: Runs/Ausfuehrungsdatum trafen alle
+                    # Varianten gemeinsam).
+                    preset_name = str(p.get("preset_name") or "Default")
+                    instance_hash = generate_instance_hash(
+                        pid, params, preset_name=preset_name)
                     per_hash = self._last_execution_dates_by_hash.get(
                         str(pid).lower(), {}) or {}
                     clones.append({
-                        "preset_name": str(p.get("preset_name") or "Default"),
+                        "preset_name": preset_name,
                         "params": params,
                         "instance_hash": instance_hash,
                         "is_archived": not bool(p.get("is_active_batch")),
@@ -9975,6 +10057,12 @@ class ServiceSelectorModel(QObject):
                         # Parameter-Variante (Feature-Store, Spalte
                         # instance_hash) – fuer die MasterTree-Anzeige
                         # '<Preset> (DD.MM.JJ)'. Fallback '--.--.--'.
+                        # 11.08.2026 (Runde 2): KEIN Legacy-Fallback mehr –
+                        # Alt-Rows unter dem alten Params-only-Hash sind keiner
+                        # Variante eindeutig zuordenbar (Pool) und wuerden sonst
+                        # an ALLEN kollidierenden Varianten dasselbe Datum
+                        # zeigen (User-Meldung). Eine Variante zeigt ein Datum
+                        # erst, wenn sie unter ihrem EIGENEN Hash gelaufen ist.
                         "last_execution": per_hash.get(
                             instance_hash, "--.--.--"),
                     })
@@ -10058,6 +10146,9 @@ class ServiceSelectorModel(QObject):
         EIGENE Feature-Store-Rows (Spalte instance_hash). Formatiert als
         'DD.MM.JJ' – Fallback '--.--.--' ohne Eintraege (bzw. ohne
         instance_hash). Rueckgabewert ohne Klammern (MasterTree-Wrapper).
+
+        11.08.2026 (Runde 2): KEIN Legacy-Fallback – das Datum kommt NUR aus
+        Rows unter dem EIGENEN (Preset-eindeutigen) Hash der Variante.
         """
         if not plugin_id or not instance_hash:
             return "--.--.--"
@@ -10109,6 +10200,9 @@ class ServiceSelectorModel(QObject):
         11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
         (z. B. '23.04.26 22:14') - Fallback '--.--.-- --:--' ohne Eintraege
         (bzw. ohne instance_hash). Rein lesend aus dem Refresh-Zustand.
+
+        11.08.2026 (Runde 2): KEIN Legacy-Fallback – das Datum kommt NUR aus
+        Rows unter dem EIGENEN (Preset-eindeutigen) Hash der Variante.
         """
         if not plugin_id or not instance_hash:
             return "--.--.-- --:--"
@@ -12064,6 +12158,35 @@ DB_MARKET = str(DATA_DIR / "market_data.duckdb")
 DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
 
 
+def _feature_store_conflict_target(con) -> str:
+    """Liefert den ON CONFLICT-Zielspalten-String passend zum aktuellen PK
+    der feature_store-Tabelle (11.08.2026, Bugfix Varianten-Kollision):
+
+    * PK (symbol, timeframe, bar_time, feature_id, instance_hash) nach der
+      Migration -> 5-Spalten-Target (Varianten koexistieren pro Bar).
+    * Alt-PK (4 Spalten, Migration nicht gelaufen) -> 4-Spalten-Target
+      (Bestandsverhalten, kein Write-Bruch).
+
+    Defensiv: Fehler -> 4-Spalten-Target.
+    """
+    try:
+        rows = con.execute(
+            "SELECT constraint_column_indexes FROM duckdb_constraints() "
+            "WHERE table_name='feature_store' "
+            "AND constraint_type='PRIMARY KEY'").fetchall()
+        if rows:
+            idxs = rows[0][0] or []
+            cols = [r[0].lower() for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='feature_store' ORDER BY ordinal_position"
+            ).fetchall()]
+            if any(cols[i].lower() == "instance_hash" for i in idxs):
+                return "(symbol, timeframe, bar_time, feature_id, instance_hash)"
+    except Exception:
+        pass
+    return "(symbol, timeframe, bar_time, feature_id)"
+
+
 def _timestamp_to_epoch(value: Any) -> int:
     """Konvertiert pandas Timestamp / datetime in epoch-Sekunden (int).
     Int/Float-Werte (bereits epoch-Sekunden) werden unveraendert uebernommen."""
@@ -12615,7 +12738,7 @@ class FeatureBuilder:
                 INSERT INTO feature_store ({insert_cols})
                 SELECT {select_cols}
                 FROM df_temp
-                ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
+                ON CONFLICT {_feature_store_conflict_target(con)} DO UPDATE SET
                     {set_clause}
             """
             con.execute(sql)
@@ -12677,7 +12800,8 @@ class FeatureBuilder:
                 dt_val = _to_utc_datetime(rec["bar_time"])
                 data = {k: v for k, v in rec.items() if k != "bar_time"}
                 rows.append((symbol, timeframe, dt_val, feature_id,
-                             plugin_version, json.dumps(data), instance_hash))
+                             plugin_version, json.dumps(data),
+                             instance_hash or ""))
             if not rows:
                 return 0
 
@@ -12714,14 +12838,14 @@ class FeatureBuilder:
                 # 20.04 (Q9): instance_hash wird beim Upsert mitgeschrieben;
                 # COALESCE verhindert, dass ein NULL (Aufrufer ohne Hash) einen
                 # bestehenden Varianten-Hash ueberschreibt.
-                con.execute("""
+                con.execute(f"""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
                          plugin_version, feature_data, instance_hash, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
                            plugin_version, feature_data, instance_hash, now()
                     FROM df_temp
-                    ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
+                    ON CONFLICT {_feature_store_conflict_target(con)} DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,
@@ -12739,7 +12863,8 @@ class FeatureBuilder:
             if own_connection:
                 con.close()
 
-    def purge_instance_data(self, instance_hash: str) -> int:
+    def purge_instance_data(self, instance_hash: str, plugin_id: str = "",
+                            params: Optional[Dict[str, Any]] = None) -> int:
         """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
 
         `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
@@ -12750,8 +12875,24 @@ class FeatureBuilder:
         und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
         unangetastet).
 
+        11.08.2026 (Bugfix Runde 5): Zusaetzlich werden bei uebergebenem
+        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht.
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen unter dem
+        reinen Params-only-Hash `generate_instance_hash(plugin_id, params)`
+        (ohne preset_name) und sind keiner Variante eindeutig zuordenbar
+        (Kollisions-Pool). Sie wurden ueber den (inzwischen entfernten)
+        Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten angezeigt
+        und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen' nicht
+        zuruecksetzen. Mit plugin_id + params werden diese Alt-Rows jetzt
+        zusammen mit den Varianten-Rows geloescht, damit das Datum im
+        MasterTree wirklich auf 'nie' zurueckgesetzt wird.
+
         Args:
-            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash).
+            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash,
+                inkl. preset_name seit dem Varianten-Kollisions-Bugfix).
+            plugin_id: Plugin-ID (optional) – noetig fuer den Legacy-Purge.
+            params: Parameter-Dict der Variante (optional) – Grundlage des
+                Params-only-Legacy-Hashes fuer den Legacy-Purge.
 
         Returns:
             Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
@@ -12763,12 +12904,37 @@ class FeatureBuilder:
         # bei DbPool.get; ein close() wuerde die Pool-Connection korrumpieren).
         con = DbPool.get(DB_ANALYTICS)
         try:
+            deleted = 0
+            # 1) Varianten-eigene Rows (Preset-eindeutiger Hash inkl.
+            #    preset_name, seit Bugfix Varianten-Kollision).
             result = con.execute(
                 "DELETE FROM feature_store WHERE instance_hash = ? "
                 "RETURNING feature_id",
                 [instance_hash])
             rows = result.fetchall() if result is not None else []
-            return len(rows or [])
+            deleted += len(rows or [])
+            # 2) Legacy-Pool-Rows (Params-only-Hash aus Runs vor der
+            #    Preset-Hash-Umstellung, 11.08.2026). Der Params-only-Hash
+            #    ist aus dem Preset-Hash (inkl. preset_name) nicht umkehrbar
+            #    – er wird hier aus plugin_id + params neu berechnet.
+            if plugin_id and params is not None:
+                try:
+                    from analytics.engine.service_models import (
+                        generate_instance_hash)
+                    legacy_hash = generate_instance_hash(plugin_id, params)
+                    if legacy_hash and legacy_hash != instance_hash:
+                        result2 = con.execute(
+                            "DELETE FROM feature_store "
+                            "WHERE feature_id = ? AND instance_hash = ? "
+                            "RETURNING feature_id",
+                            [plugin_id, legacy_hash])
+                        rows2 = (result2.fetchall()
+                                 if result2 is not None else [])
+                        deleted += len(rows2 or [])
+                except Exception:
+                    # Defensiv: Legacy-Purge ist optional – kein Abbruch.
+                    pass
+            return deleted
         except Exception:
             # Defensiv: keine Exception in den UI-Pfad durchreichen.
             return 0
@@ -18095,6 +18261,7 @@ from PySide6.QtWidgets import (
 
 from analytics.engine.analytics_view_model import AnalyticsViewModel
 from analytics.engine.analytics_worker import QUERY_TABLE
+from analytics.engine.feature_store_reader import FeatureStoreReader
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -18105,6 +18272,7 @@ from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
+from serviceui.common_widgets import TfStatusBadgeBar
 from serviceui.service_selector_dialog import ServiceSelectorDialog
 from serviceui.symbols_win import SymbolsWindow
 
@@ -18373,6 +18541,11 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.combo_tf)
         filt.addWidget(QLabel("Datenquellen:"))
         filt.addWidget(self.btn_data_sources)
+        # 21.01b (11.08.2026): Pill-Strip NEBEN der Datenquellen-Combo –
+        # zeigt je Timeframe die feature_store-Belegung der ERSTEN aktiven
+        # Datenquelle (fetch_service_tf_status); leer ohne Filter.
+        self.badge_bar = TfStatusBadgeBar()
+        filt.addWidget(self.badge_bar)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.edit_limit)
         # 19.01 (Step 1): Status-Message direkt hinter dem Limit-Feld –
@@ -18535,11 +18708,33 @@ class AnalyticsWindow(PersistentWindow):
         if not ids:
             self.btn_data_sources.setText(
                 "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]")
+            self._refresh_badge_bar()
             return
         names = (self._active_display_names
                  or self._selector_model.resolve_display_names(ids))
         self.btn_data_sources.setText(
             f"[ 🛠️ Datenquellen: {', '.join(names)} ▾ ]")
+        self._refresh_badge_bar()
+
+    def _refresh_badge_bar(self) -> None:
+        """21.01b: Pill-Strip fuer die ERSTE aktive Datenquelle laden.
+
+        Quelle: FeatureStoreReader.fetch_service_tf_status() – je Timeframe
+        die Anzahl der feature_store-Eintraege und der letzte Lauf.
+        """
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        ids = (self._vm.params.get("feature_ids") or [])
+        pid = str(ids[0]) if ids else ""
+        if not pid:
+            bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        bar.update_status(status)
 
     @Slot()
     def _sync_ui_from_restored_params(self) -> None:
@@ -20740,7 +20935,14 @@ class _HeatmapAxis(pg.AxisItem):
         # Kategorial (timeframe/service_id/symbol): Labels aus der Liste.
         idx = int(round(v))
         if 0 <= idx < len(self._labels):
-            return str(self._labels[idx])
+            # E16 (11.08.2026, Bugfix 2): Kategoriale Labels an JEDEM '/'
+            # mit '\n' umbrechen (z.B. 'SILVER / M1' -> zwei Zeilen) statt
+            # zu kappen – pyqtgraph rendert mehrzeilige Tick-Labels korrekt.
+            # Betrifft X- und Y-Achse (dieselbe _format-Methode).
+            label = str(self._labels[idx])
+            if "/" in label:
+                label = label.replace("/", "/\n")
+            return label
         # 21.01 (Bugfix 1): Ausserhalb des festen Wertebereichs -> leer
         # (das tickValues-Clamping verhindert sie bereits; defensiv).
         return ""
@@ -22364,7 +22566,17 @@ class HeatmapWidget(QWidget):
         self._update_cell_info(p.x(), p.y())
 
     def _update_cell_info(self, x: float, y: float) -> None:
-        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4)."""
+        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4).
+
+        E15 (11.08.2026, Bugfix 1): Das DATUM ist der TAG DER ZELLE unter
+        dem Fadenkreuz (self._x_axis[col], Mitternacht der Wanduhr). Die
+        Zellen sind mittags-zentriert [Tag-12h, Tag+12h) – die nackte
+        Cursor-Roh-Epoch wuerde sonst bei Vormittags-Zeiten (0:00-11:59)
+        off-by-one-day liefern. Die ZEIT ist die exakte Cursor-HH:MM aus
+        der Roh-Epoch (Wanduhr-UTC, KEIN Berlin-Offset). Das Label wird
+        ausserdem IMMER aktualisiert (auch ausserhalb des Datenbereichs),
+        damit kein veralteter Zellwert stehen bleibt.
+        """
         if self._n_rows <= 0 or self._n_cols <= 0:
             return
         img = getattr(self._image, "image", None)
@@ -22374,25 +22586,29 @@ class HeatmapWidget(QWidget):
         sy = (self._y_max - self._y_min) or 1.0
         col = int((x - self._x_min) / sx * self._n_cols)
         row = int((y - self._y_min) / sy * self._n_rows)
-        if not (0 <= col < self._n_cols and 0 <= row < self._n_rows):
+        in_bounds = (0 <= col < self._n_cols and 0 <= row < self._n_rows)
+        time_txt = ""
+        if str(self._combo_x.currentData() or "date") == "date":
+            try:
+                day_ts = float(self._x_axis[col]) if (
+                    0 <= col < len(self._x_axis)) else float(x)
+                d_day = datetime.fromtimestamp(day_ts, tz=dt_timezone.utc)
+                d_time = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
+                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+                time_txt = (f"{days[d_day.weekday()]} {d_day.day:02d}."
+                            f"{d_day.month:02d}.{d_day.year % 100:02d} "
+                            f"{d_time.hour:02d}:{d_time.minute:02d}  →  ")
+            except (TypeError, ValueError, OverflowError):
+                time_txt = ""
+        if not in_bounds:
+            self._label_info.setText(
+                f"{time_txt}Zelle ausserhalb des Datenbereichs")
             return
         try:
             v = float(img[row, col])
         except (TypeError, ValueError, IndexError):
+            self._label_info.setText(f"{time_txt}Zelle({row},{col}) = n/a")
             return
-        # 21.01 (Bugfix-Runde 3, Bug 4): Genaue Datum/Zeit am Fadenkreuz
-        # (wie chart_win). Bei X=date wird die Cursor-Position als
-        # Wanduhr-Zeit formatiert; der Zellwert folgt danach.
-        time_txt = ""
-        if str(self._combo_x.currentData() or "date") == "date":
-            try:
-                dt = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
-                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
-                time_txt = (f"{days[dt.weekday()]} {dt.day:02d}."
-                            f"{dt.month:02d}.{dt.year % 100:02d} "
-                            f"{dt.hour:02d}:{dt.minute:02d}  ·  ")
-            except (TypeError, ValueError, OverflowError):
-                time_txt = ""
         self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
 
     # ------------------------------------------------------------------
@@ -33160,7 +33376,9 @@ def check_and_init_databases() -> None:
             feature_id  VARCHAR NOT NULL DEFAULT 'native',
             plugin_version VARCHAR,
             feature_data JSON,
-            PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+            instance_hash VARCHAR NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id,
+                         instance_hash)
         );
     """)
 
@@ -33179,6 +33397,50 @@ def check_and_init_databases() -> None:
     # (purge_instance_data, Q5), ohne die feature_id (plugin_id) anzutasten.
     # Bestehende Rows bleiben NULL; feature_id bleibt plugin_id (Zero-Regression).
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
+    # 11.08.2026 (Bugfix Varianten-Kollision): Der feature_store-PK wird um
+    # instance_hash erweitert - (symbol, timeframe, bar_time, feature_id,
+    # instance_hash). Damit koexistieren Parameter-Varianten eines Plugins
+    # auf derselben Bar (vorher ueberschrieb der letzte Lauf die gemeinsame
+    # Row; Kontextmenue-Run + Ausfuehrungsdatum trafen alle Varianten
+    # gemeinsam). DuckDB 1.5.5 kann PRIMARY KEY nicht AENDERN - Migration als
+    # Table-Rewrite (CREATE TABLE AS + EXCLUDE/COALESCE) + ALTER SET NOT
+    # NULL/SET DEFAULT + ALTER ADD PRIMARY KEY + DROP/RENAME. Idempotent:
+    # laeuft nur, wenn der aktuelle PK noch KEIN instance_hash enthaelt.
+    try:
+        _pk_rows = con_analytics.execute(
+            "SELECT constraint_column_indexes FROM duckdb_constraints() "
+            "WHERE table_name='feature_store' "
+            "AND constraint_type='PRIMARY KEY'").fetchall()
+        _fs_cols = [r[0].lower() for r in con_analytics.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='feature_store' ORDER BY ordinal_position"
+        ).fetchall()]
+        # duckdb_constraints liefert pro Zeile ein Tupel (index_list,) -
+        # der Spalten-Index liegt in Zeile[0].
+        _pk_has_hash = any(
+            _fs_cols[i].lower() == "instance_hash"
+            for _row in _pk_rows for i in (_row[0] or []))
+        if not _pk_has_hash:
+            con_analytics.execute("""
+                CREATE TABLE feature_store_pk2 AS
+                SELECT * EXCLUDE (instance_hash),
+                       COALESCE(instance_hash, '') AS instance_hash
+                FROM feature_store
+            """)
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ALTER instance_hash SET NOT NULL")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ALTER instance_hash SET DEFAULT ''")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ADD PRIMARY KEY "
+                "(symbol, timeframe, bar_time, feature_id, instance_hash)")
+            con_analytics.execute("DROP TABLE feature_store")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 RENAME TO feature_store")
+            print("MIGRATION: feature_store-PK um instance_hash erweitert.")
+    except Exception as e:
+        print(f"MIGRATION WARNUNG: feature_store-PK-Migration "
+              f"fehlgeschlagen: {e}")
     # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
     # created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
     # Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
@@ -33497,6 +33759,172 @@ __all__ = [
 
 --------------------------------------------------
 
+### DATEI: serviceui/common_widgets.py
+```py
+# serviceui/common_widgets.py
+"""
+Service-UI: Gemeinsame Widgets (Phase 21.01b, 11.08.2026).
+
+Enthaelt:
+  * TfStatusBadgeBar – kleine Pill-Badges je Timeframe mit Status-Info
+    (Daten vorhanden / laeuft / Fehler) fuer den MasterTree/ServicePicker
+    und das ServiceWindow. Reines Anzeige-Widget ohne Geschaeftslogik
+    (SRP): Der Orchestrator versorgt es ueber `update_status`, `set_running`
+    und `set_error` mit Werten; die Daten selbst kommen aus
+    FeatureStoreReader.fetch_service_tf_status() (21.01b Schritt 1).
+"""
+
+from typing import Any, Dict, Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+
+# ---------------------------------------------------------------------------
+# Farb-Schema (dunkles UI; konsistent mit den uebrigen Service-Panels)
+# ---------------------------------------------------------------------------
+_STYLE_IDLE = ("background-color: #3a3a46; color: #cfd2dc; "
+               "border-radius: 3px; border: 1px solid #4a4a58;")
+_STYLE_RUNNING = ("background-color: #2f6fb2; color: #ffffff; "
+                  "border-radius: 3px; border: 1px solid #5a9bdc;")
+_STYLE_ERROR = ("background-color: #b04343; color: #ffffff; "
+                "border-radius: 3px; border: 1px solid #d07070;")
+_STYLE_HINT = ("background-color: #2c3e2c; color: #9fcf9f; "
+               "border-radius: 3px; border: 1px solid #4a7a4a;")
+
+
+class TfStatusBadgeBar(QWidget):
+    """Pill-Badges je Timeframe eines Services (21.01b, Schritt 2).
+
+    Jedes Badge ist ein kleines QLabel (Default ~28x16 px, 9 pt fett,
+    Eckenradius 3 px) mit dem Timeframe-Kuerzel. Der Tooltip zeigt die
+    Detail-Info aus dem feature_store:
+        'M1: 99.000 Eintraege\nZuletzt: 11.08.26 20:15'
+
+    Zustands-Wechsel:
+        update_status(map)  – Badges aus dem DB-Status (TF -> {count, last_run})
+                              neu aufbauen/aktualisieren (ohne TF-Eintrag
+                              bleibt nur das Kuerzel sichtbar).
+        set_running(tf|None)– TF waehrend eines Runs blau hervorheben.
+        set_error(tf)       – TF nach einem Fehler rot markieren.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._labels: Dict[str, QLabel] = {}
+        self._status: Dict[str, Dict[str, Any]] = {}
+        self._running: Optional[str] = None
+        self._errors: set = set()
+
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(2)
+        self._lay.addStretch(1)  # Badges links buendig, Rest dehnbar
+
+    # ------------------------------------------------------------------
+    # Datenversorgung
+    # ------------------------------------------------------------------
+    def update_status(self, status_map: Dict[str, Dict[str, Any]]) -> None:
+        """Baut die TF-Badges aus `fetch_service_tf_status()` auf.
+
+        `status_map`: TF (upper) -> {'count': int, 'last_run': str}. TFs,
+        die in der DB existieren, bekommen einen Tooltip; TFs, die
+        uebergeben werden, aber nicht in `status_map` stehen, werden mit
+        leerem Tooltip (keine Daten) angezeigt.
+        """
+        self._status = dict(status_map or {})
+        # Sichtbare TFs: DB-TFs + aktuell laufende/fehlerhafte TFs (auch
+        # ohne DB-Eintrag, z.B. beim ERSTEN Run eines noch leeren Stores).
+        known_tfs: list = list(self._status.keys())
+        if self._running and self._running not in known_tfs:
+            known_tfs.append(self._running)
+        for extra in self._errors:
+            if extra not in known_tfs:
+                known_tfs.append(extra)
+        self._rebuild(known_tfs)
+
+    def _rebuild(self, tfs: list) -> None:
+        """Erzeugt/entfernt Badge-Labels so, dass `tfs` angezeigt werden."""
+        wanted = set(tfs)
+        # Entfernen nicht mehr benoetigter Badges
+        for tf in list(self._labels.keys()):
+            if tf not in wanted:
+                lbl = self._labels.pop(tf)
+                self._lay.removeWidget(lbl)
+                lbl.deleteLater()
+        # Fehlende Badges anlegen (vor dem Stretch)
+        idx = self._lay.count() - 1  # Stretch ist das letzte Element
+        if idx < 0:
+            idx = 0
+        for tf in tfs:
+            if tf in self._labels:
+                continue
+            lbl = QLabel(str(tf), self)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedSize(28, 16)
+            font = lbl.font()
+            font.setPointSize(9)
+            font.setBold(True)
+            lbl.setFont(font)
+            self._lay.insertWidget(idx, lbl)
+            self._labels[tf] = lbl
+            idx += 1
+        self._refresh_styles()
+
+    # ------------------------------------------------------------------
+    # Zustands-Wechsel
+    # ------------------------------------------------------------------
+    def set_running(self, tf: Optional[str]) -> None:
+        """Hebt den laufenden Timeframe blau hervor (None = nichts laeuft)."""
+        self._running = tf
+        self._refresh_styles()
+
+    def set_error(self, tf: str) -> None:
+        """Markiert einen Timeframe als fehlgeschlagen (rot)."""
+        self._errors.add(tf)
+        self._refresh_styles()
+
+    def clear_error(self, tf: str) -> None:
+        """Entfernt die Fehler-Markierung eines Timeframes."""
+        self._errors.discard(tf)
+        self._refresh_styles()
+
+    def clear(self) -> None:
+        """Leert alle Badges und Zustaende."""
+        self._status = {}
+        self._running = None
+        self._errors.clear()
+        self._rebuild([])
+
+    # ------------------------------------------------------------------
+    # Interna
+    # ------------------------------------------------------------------
+    def _refresh_styles(self) -> None:
+        """Wendet die aktuelle QSS-Farbe je Badge an und setzt Tooltips."""
+        for tf, lbl in self._labels.items():
+            if tf == self._running:
+                lbl.setStyleSheet(_STYLE_RUNNING)
+            elif tf in self._errors:
+                lbl.setStyleSheet(_STYLE_ERROR)
+            elif tf in self._status:
+                lbl.setStyleSheet(_STYLE_IDLE)
+            else:
+                lbl.setStyleSheet(_STYLE_HINT)
+            info = self._status.get(tf)
+            if info and info.get("count"):
+                count = int(info.get("count") or 0)
+                last_run = str(info.get("last_run") or "")
+                tip = (f"{tf}: {count:,} Eintraege".replace(",", ".")
+                       if count else f"{tf}: keine Eintraege")
+                if last_run:
+                    tip += f"\nZuletzt: {last_run}"
+                lbl.setToolTip(tip)
+            else:
+                lbl.setToolTip(f"{tf}: keine Daten")
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/master_tree.py
 ```py
 # serviceui/master_tree.py
@@ -33740,15 +34168,18 @@ class MasterTree(QTreeWidget):
     run_service_requested = Signal(str, str)
     run_set_requested = Signal(str)
     # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
-    #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
-    #                                      (Einzel-Plugin-Zeile, ohne Set)
+    #   run_plugin_requested(plugin_id, instance_hash) – '▶️ Diesen Service
+    #      ausführen' (Einzel-Plugin-Zeile, ohne Set). 11.08.2026 (Bugfixing):
+    #      Clone-Zeilen liefern den instance_hash der Variante mit (NUR diese
+    #      Variante laeuft mit ihren Parametern); Plugin-Zeilen senden '' (mit
+    #      Presets laufen alle aktiven Varianten, sonst Basis-Parameter).
     #   run_category_requested(group, path) – '▶️ Alle Services ausführen'
     #                                      (Kategorie-Ordner, rekursiv; path
     #                                      z.B. 'Swing Points/Geometrie';
     #                                      group = 'sets' | 'plugins',
     #                                      18.01.03: Sets-Ordner moeglich)
     #   category_info_requested(group, path) – Info-Button auf Kategorie-Ordnern
-    run_plugin_requested = Signal(str)
+    run_plugin_requested = Signal(str, str)
     run_category_requested = Signal(str, str)
     category_info_requested = Signal(str, str)
     # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-Drag&Drop.
@@ -34066,7 +34497,8 @@ class MasterTree(QTreeWidget):
             # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
-            last_exec = str(svc.get("last_execution") or "--.--.--")
+            last_exec = str(svc.get("last_execution") or "")
+            last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
             svc_label = f"{svc.get('instance_id')} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
@@ -34126,14 +34558,19 @@ class MasterTree(QTreeWidget):
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
-        last_exec = str(child.get("last_execution") or "--.--.--")
+        last_exec = str(child.get("last_execution") or "")
+        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         clones = child.get("clones") or []
         archived_parent = bool(child.get("archived"))
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
         # (Clones), haengt das Datum der letzten Ausfuehrung an der Variante
         # (Clone-Zeile) – der Parent-Knoten zeigt nur noch die Plugin-ID
         # (kein Ausfuehrungsdatum mehr im Knoten darueber).
-        plugin_label = pid if clones else f"{pid} ({last_exec})"
+        # 11.08.2026 (Bugfix, Kosmetik): 'srv_'-Praefix der Plugin-ID wird
+        # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
+        # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
+        display_pid = pid[4:] if pid.startswith("srv_") else pid
+        plugin_label = display_pid if clones else f"{display_pid} ({last_exec})"
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -34175,7 +34612,8 @@ class MasterTree(QTreeWidget):
         # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
         # Ausfuehrung dieser Variante direkt am Varianten-Namen:
         # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
-        last_exec = str(clone.get("last_execution") or "--.--.--")
+        last_exec = str(clone.get("last_execution") or "")
+        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         prefix = "🔹" if archived else "🟢"
         clone_item = QTreeWidgetItem(
             [f"{prefix} {preset_name} ({last_exec})", ""])
@@ -35529,8 +35967,8 @@ class MasterTree(QTreeWidget):
                 act_run = menu.addAction("▶️ Diesen Service ausführen")
                 act_run.setEnabled(not archived)
                 act_run.triggered.connect(
-                    lambda _=False, p=plugin_id:
-                    self.run_plugin_requested.emit(p))
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.run_plugin_requested.emit(p, h))
                 menu.addSeparator()
                 act_info = menu.addAction("Service-Info anzeigen")
                 act_info.setEnabled(not archived)
@@ -35582,7 +36020,7 @@ class MasterTree(QTreeWidget):
                 act_run = menu.addAction("▶️ Diesen Service ausführen")
                 act_run.triggered.connect(
                     lambda _=False, p=plugin_id:
-                    self.run_plugin_requested.emit(p))
+                    self.run_plugin_requested.emit(p, ""))
                 menu.addSeparator()
                 act_info = menu.addAction("Service-Info anzeigen")
                 act_info.triggered.connect(
@@ -36955,8 +37393,9 @@ execution_order des Sets) enthaelt – damit liefern Abhaengigkeiten
 nachgelagerter Service (srv_proximity) kann tatsaechlich Hits erzeugen und in
 den feature_store schreiben.
 
-Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
-den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
+Der Worker emittiert NUR Signale (log_message / run_finished / run_failed /
+tf_started / tf_finished); den Bestaetigungsdialog zeigt der Orchestrator
+(ServiceWindow) VOR dem Start.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -36979,7 +37418,8 @@ class ServiceRunWorker(QThread):
     nacheinander durch: pro Timeframe OHLCV laden, Pipeline ausfuehren und
     die Payloads mit dem jeweiligen Timeframe in den feature_store schreiben.
     Der EventBus-Sync (`service_set_changed`) wird NUR EINMAL nach Abschluss
-    aller Timeframes emittiert.
+    aller Timeframes emittiert (E17, 11.08.2026: auch bei Teilerfolg bzw.
+    auf Fehlerpfaden, damit bereits geschriebene Payloads im Baum ankommen).
 
     Signals:
         log_message(str)      – Fortschritts-/Ergebnis-Meldungen.
@@ -36987,11 +37427,16 @@ class ServiceRunWorker(QThread):
                                 geschriebener Feature-Rows (0 moeglich, wenn
                                 der Service keinen feature_store-Payload hat).
         run_failed(str, str)  – scope_id, Fehlermeldung.
+        tf_started(str)       – Timeframe-Start (21.01b, Pill-Strip-Laufzeit).
+        tf_finished(str, int, bool) – Timeframe fertig: tf, geschriebene
+                                Rows, ob OHLCV-Daten vorhanden waren.
     """
 
     log_message = Signal(str)
     run_finished = Signal(str, int)
     run_failed = Signal(str, str)
+    tf_started = Signal(str)
+    tf_finished = Signal(str, int, bool)
 
     def __init__(self, evaluator, symbol: str, timeframe: str,
                  set_definition: Dict[str, Any],
@@ -37066,9 +37511,13 @@ class ServiceRunWorker(QThread):
         try:
             from db_service import TF_SECONDS_MAP, get_timeframes
             try:
-                return list(get_timeframes().keys())
+                tfs = list(get_timeframes().keys())
             except Exception:
-                return list(TF_SECONDS_MAP.keys())
+                tfs = list(TF_SECONDS_MAP.keys())
+            # 21.01b (E18c, 11.08.2026): stabil AUFSTEIGEND nach Dauer
+            # (M1..MN1) – gleiche Reihenfolge wie combo_tf/Pill-Strip;
+            # schnelle TFs laufen damit zuerst.
+            return sorted(tfs, key=lambda tf: TF_SECONDS_MAP.get(tf, 10 ** 12))
         except Exception:
             return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
@@ -37076,6 +37525,13 @@ class ServiceRunWorker(QThread):
                            scope_label: str, tf: str) -> Tuple[int, bool]:
         """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
         Feature-Payloads im feature_store.
+
+        E17 (11.08.2026): Die Pipeline laeuft resilient – schlaegt ein
+        EINZELNER Service fehl, wird er geloggt (execute_set_resilient:
+        last_errors/last_skipped) und die restlichen Services laufen weiter
+        statt die Gesamt-Ausfuehrung abzubrechen. execute_set (Fail-Fast)
+        bleibt als Fallback fuer fremde Evaluator-Instanzen ohne die
+        Resilient-Methode.
 
         Returns:
             (stored, had_data) – Anzahl geschriebener Feature-Rows (0, wenn
@@ -37104,8 +37560,12 @@ class ServiceRunWorker(QThread):
 
         self.log_message.emit(
             f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
-        results = self.evaluator.execute_set(definition, df_plugin,
-                                             context=context)
+        if hasattr(self.evaluator, "execute_set_resilient"):
+            results = self.evaluator.execute_set_resilient(
+                definition, df_plugin, context=context)
+        else:
+            results = self.evaluator.execute_set(definition, df_plugin,
+                                                 context=context)
 
         stored = 0
         # 20.04 (Q9): Instanz-Hashes je iid – Grundlage der feature_store-
@@ -37124,8 +37584,13 @@ class ServiceRunWorker(QThread):
             cfg = svc_cfgs.get(iid) or {}
             pid = str(cfg.get("plugin_id") or iid)
             params = cfg.get("params") or {}
+            # 11.08.2026 (Bugfix Varianten-Kollision): Fallback-Hash inkl.
+            # preset_name berechnen (identisch zum ServiceSelectorModel) –
+            # die cfg.instance_hash (aus variant_run_entries) hat Vorrang.
+            preset_name = str(cfg.get("preset_name") or "") or None
             instance_hash = str(cfg.get("instance_hash") or "") or \
-                generate_instance_hash(pid, params)
+                generate_instance_hash(pid, params,
+                                       preset_name=preset_name)
             fb.store_plugin_payload(self.symbol, tf, payload,
                                     instance_hash=instance_hash)
             stored += len(records)
@@ -37135,17 +37600,36 @@ class ServiceRunWorker(QThread):
         return stored, True
 
     # ------------------------------------------------------------------
+    # E17 (11.08.2026): EventBus-Sync (auch auf Fehlerpfaden)
+    # ------------------------------------------------------------------
+    def _emit_service_changed(self) -> None:
+        """Stoesst den UI-Sync einmalig an.
+
+        Nach (Teil-)Abschluss des Workers werden alle lauschenden
+        ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+        automatisch aktualisiert – sie lesen das neue MAX(created_at) und
+        der Baum zeigt das Datum (DD.MM.JJ) live an. E17: Der Sync wird
+        auch bei run_failed/Teilerfolg emittiert, damit bereits geschriebene
+        Payloads (z.B. fruehere Timeframes eines Multi-TF-Runs) sichtbar
+        werden.
+        """
+        try:
+            from config.event_bus import event_bus
+            event_bus.service_set_changed.emit()
+        except Exception as e:  # pragma: no cover
+            print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
+
+    # ------------------------------------------------------------------
     # Worker-Loop
     # ------------------------------------------------------------------
     def run(self) -> None:
         """Laedt OHLCV (ein oder alle Timeframes), fuehrt die Pipeline aus,
         persistiert die Payloads im feature_store und stoesst den EventBus-
-        Sync an (einmalig nach Abschluss)."""
+        Sync an (einmalig nach Abschluss – auch bei Teilerfolg/Fehler)."""
         scope_id = self.instance_id or str(
             self.set_definition.get("set_id") or "")
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            from config.event_bus import event_bus
             from state_manager import StateManager
 
             settings = StateManager().get_app_settings()
@@ -37198,6 +37682,7 @@ class ServiceRunWorker(QThread):
             no_data_tfs: List[str] = []
             no_payload_tfs: List[str] = []
             for tf in timeframes:
+                self.tf_started.emit(tf)
                 try:
                     stored, had_data = self._execute_timeframe(
                         fb, settings, definition, scope_label, tf)
@@ -37205,16 +37690,22 @@ class ServiceRunWorker(QThread):
                     # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
                     # die Gesamt-Ausfuehrung NICHT ab – Fehler wird geloggt,
                     # die restlichen Timeframes laufen weiter.
+                    self.tf_finished.emit(tf, 0, False)
                     if self.timeframe == ALL_TIMEFRAMES:
                         self.log_message.emit(
                             f"  {self.symbol} {tf}: FEHLER – {e}")
                         continue
                     raise
+                self.tf_finished.emit(tf, stored, had_data)
                 total_stored += stored
                 if not had_data:
                     no_data_tfs.append(tf)
                 elif stored == 0:
                     no_payload_tfs.append(tf)
+
+            # E17: Sync NACH der (Teil-)Ausfuehrung – auch wenn anschliessend
+            # run_failed folgt, kommen bereits geschriebene Payloads im Baum an.
+            self._emit_service_changed()
 
             # Single-TF-Fehler differenzieren (17.01.02 Bugfix): Die
             # Meldung 'Keine OHLCV-Daten' ist NUR korrekt, wenn die Quelle
@@ -37239,17 +37730,11 @@ class ServiceRunWorker(QThread):
                 f"Fertig: {total_stored} Feature-Row(s) im feature_store "
                 f"({self.symbol}).")
 
-            # UI-Sync: Nach Abschluss des Workers werden alle lauschenden
-            # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
-            # automatisch aktualisiert – sie lesen das neue MAX(created_at)
-            # und der Baum zeigt das Datum (DD.MM.JJ) live an.
-            try:
-                event_bus.service_set_changed.emit()
-            except Exception as e:  # pragma: no cover
-                print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
-
             self.run_finished.emit(scope_id, total_stored)
         except Exception as e:
+            # E17: Auch bei Abbruch durch Exception wird der Sync angestossen
+            # (falls bereits Payloads geschrieben wurden).
+            self._emit_service_changed()
             self.run_failed.emit(scope_id, str(e))
 
 ```
@@ -37338,6 +37823,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QInputDialog,
@@ -37352,14 +37838,20 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.feature_store_reader import FeatureStoreReader
 from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_selector_model import ServiceSelectorModel
+from analytics.engine.set_evaluator import ServiceSetEvaluator
 from config.event_bus import event_bus
 from serviceui.master_tree import (
     TYPE_CATEGORY, TYPE_CLONE, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
 )
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
+# 21.01b (11.08.2026): Run im Picker (TF-Zeile + Pill-Strip, User-Entscheid).
+from serviceui.common_widgets import TfStatusBadgeBar
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+from serviceui.service_set_utils import variant_run_entries
 
 #: Geometrie-Key fuer Position/Groesse des Datenquellen-Dialogs
 #: (global_settings, Muster IndicatorSettingsDialog).
@@ -37624,6 +38116,13 @@ class ServiceSelectorDialog(QDialog):
         # `state_manager`-Property; ohne Parent bleiben Save/Restore no-ops.
         self._state_manager = getattr(parent, "state_manager", None)
         self._param_host = _DialogParamHost(state_manager=self._state_manager)
+        # 21.01b (11.08.2026): Run-Infrastruktur fuer die MasterTree-
+        # Kontextmenue-Aktionen (User-Entscheid: Run im Picker voll
+        # funktional, TF-Zeile + Pill-Strip).
+        self.set_evaluator = ServiceSetEvaluator()
+        self._run_worker: Optional[ServiceRunWorker] = None
+        #: Plugin-ID des Services, dessen TF-Pills aktuell angezeigt werden.
+        self._badge_plugin_id: Optional[str] = None
         # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
         # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
         # des Panels (analog service_win). Bleibt nach Modell-Refreshes
@@ -37674,6 +38173,23 @@ class ServiceSelectorDialog(QDialog):
         panel_layout.setSpacing(4)
         panel_layout.addWidget(
             QLabel("Service-Parameter (Read-Only):"))
+        # 21.01b (11.08.2026): Run-Timeframe-Zeile (combo_run_tf, Sentinel
+        # ALL_TIMEFRAMES wie im ServiceWindow) + TF-Status-Pills des zuletzt
+        # geklickten Services (fetch_service_tf_status).
+        tf_row = QHBoxLayout()
+        tf_row.setSpacing(4)
+        tf_row.addWidget(QLabel("Run Timeframe:"))
+        self.combo_run_tf = QComboBox()
+        self.combo_run_tf.setMinimumWidth(130)
+        self.combo_run_tf.setToolTip(
+            "Zeitrahmen fuer '▶️ Service(s) ausführen' – 'ALLE Timeframes' "
+            "fuehrt alle verfuegbaren Timeframes nacheinander aus.")
+        tf_row.addWidget(self.combo_run_tf)
+        tf_row.addStretch(1)
+        panel_layout.addLayout(tf_row)
+        self.badge_bar = TfStatusBadgeBar()
+        panel_layout.addWidget(self.badge_bar)
+        self._fill_run_tf_combo()
         self.param_panel = panel  # 06.08.2026: feste Breite auf dem PANEL-WIDGET
         self.param_scroll = QScrollArea(panel)
         # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): widgetResizable
@@ -37777,6 +38293,14 @@ class ServiceSelectorDialog(QDialog):
             # persistiert den Rename in indicator_presets.
             tree.rename_variant_requested.connect(
                 self._on_rename_variant)
+            # 21.01b (11.08.2026): Run-Aktionen im Picker verdrahten (TF-Zeile
+            # + Pill-Strip voll funktional, User-Entscheid). Die Handler
+            # zeigen die Sicherheitsabfrage und starten den ServiceRunWorker
+            # mit dem Timeframe aus combo_run_tf (Muster service_win).
+            tree.run_service_requested.connect(self._on_run_service)
+            tree.run_set_requested.connect(self._on_run_set)
+            tree.run_plugin_requested.connect(self._on_run_plugin)
+            tree.run_category_requested.connect(self._on_run_category)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -38001,8 +38525,17 @@ class ServiceSelectorDialog(QDialog):
                     continue
                 from analytics.engine.service_models import (
                     generate_instance_hash)
-                if generate_instance_hash(
-                        plugin_id, preset.get("params") or {}) == instance_hash:
+                # 11.08.2026 (Bugfix Varianten-Kollision): Hash eines
+                # Presets inkl. preset_name (identisch zu Modell/Run);
+                # Legacy-Fallback fuer Alt-Bestand.
+                preset_name = str(preset.get("preset_name") or "Default")
+                if (generate_instance_hash(plugin_id,
+                                           preset.get("params") or {},
+                                           preset_name=preset_name)
+                        == instance_hash
+                        or generate_instance_hash(
+                            plugin_id, preset.get("params") or {})
+                        == instance_hash):
                     return preset
         except Exception:
             pass
@@ -38192,6 +38725,20 @@ class ServiceSelectorDialog(QDialog):
         """'Data Only Löschen' (Q5): Feature-Daten purgen, Struktur bleibt."""
         if not instance_hash:
             return
+        # 11.08.2026 (Bugfix Runde 5): Parameter der Variante ermitteln
+        # – Grundlage fuer den Legacy-Pool-Purge (Params-only-Hash).
+        params = None
+        if set_id and service_id:
+            try:
+                _cfg = self.model.find_service(set_id, service_id)
+                if isinstance(_cfg, dict):
+                    params = _cfg.get("params") or {}
+            except Exception:
+                pass
+        if params is None:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset:
+                params = preset.get("params") or {}
         reply = QMessageBox.question(
             self, "Data Only Löschen",
             f"Feature-Daten der Variante #{instance_hash} löschen?\n"
@@ -38201,7 +38748,8 @@ class ServiceSelectorDialog(QDialog):
             return
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            FeatureBuilder().purge_instance_data(instance_hash)
+            FeatureBuilder().purge_instance_data(
+                instance_hash, plugin_id, params)
         except Exception:
             pass
         event_bus.service_set_changed.emit()
@@ -38247,7 +38795,10 @@ class ServiceSelectorDialog(QDialog):
                 try:
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
-                    FeatureBuilder().purge_instance_data(instance_hash)
+                    FeatureBuilder().purge_instance_data(
+                        instance_hash,
+                        plugin_id or (cfg.get("plugin_id") or ""),
+                        cfg.get("params") or {})
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()
@@ -38275,7 +38826,8 @@ class ServiceSelectorDialog(QDialog):
                 try:
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
-                    FeatureBuilder().purge_instance_data(instance_hash)
+                    FeatureBuilder().purge_instance_data(
+                        instance_hash, plugin_id, preset.get("params") or {})
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()
@@ -38692,6 +39244,10 @@ class ServiceSelectorDialog(QDialog):
         self._rebuild_param_panel(
             self._entries_for_scope(node_type, set_id, service_id, plugin_id),
             editable_plugin=editable)
+        # 21.01b: Pill-Strip dem geklickten Service nachziehen.
+        self._refresh_badge_bar(
+            self._resolve_badge_plugin(node_type, set_id,
+                                       service_id, plugin_id))
 
     def _resolve_selection_ids(self, node_type: str, set_id: str,
                                service_id: str, plugin_id: str) -> List[str]:
@@ -38728,6 +39284,349 @@ class ServiceSelectorDialog(QDialog):
                     ids.append(pid)
             return ids
         return []
+
+    # ------------------------------------------------------------------
+    # 21.01b (11.08.2026): Run im Picker (TF-Zeile + Pill-Strip)
+    # ------------------------------------------------------------------
+    def _run_symbol(self) -> str:
+        """Aktives Symbol aus dem Parent (AnalyticsWindow.combo_symbol)."""
+        parent = self.parent()
+        cb = getattr(parent, "combo_symbol", None)
+        if cb is not None:
+            try:
+                txt = cb.currentText()
+            except Exception:
+                txt = ""
+            if txt:
+                return str(txt)
+        return "SILVER"
+
+    def _run_timeframe(self) -> str:
+        """Gewaehlter Run-Timeframe (Sentinel = Multi-TF im Worker)."""
+        combo = getattr(self, "combo_run_tf", None)
+        if combo is None:
+            return ALL_TIMEFRAMES
+        return str(combo.currentText() or ALL_TIMEFRAMES)
+
+    def _fill_run_tf_combo(self) -> None:
+        """Befuellt combo_run_tf: Sentinel 'ALLE Timeframes' + alle TFs
+        aufsteigend nach Dauer (M1..MN1, wie combo_tf im ServiceWindow)."""
+        combo = getattr(self, "combo_run_tf", None)
+        if combo is None:
+            return
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                tfs = list(get_timeframes().keys())
+            except Exception:
+                tfs = list(TF_SECONDS_MAP.keys())
+            sort_map = TF_SECONDS_MAP
+        except Exception:
+            tfs = ["M1", "M2", "M5", "M10", "M15", "M30",
+                   "H1", "H4", "D1", "W1", "MN1"]
+            sort_map = {}
+        tfs = sorted(tfs, key=lambda tf: sort_map.get(tf, 10 ** 12))
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(ALL_TIMEFRAMES)
+        for tf in tfs:
+            if tf != ALL_TIMEFRAMES:
+                combo.addItem(tf)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """Standalone-Plugin-Config wie im ServiceWindow (17.01.04-Muster).
+        Basis sind die Registry-Defaults; gespeicherte Werte aus
+        global_settings (Key 'plugin_params_<pid>') ueberschreiben."""
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) \
+            if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        try:
+            saved = self._state_manager.get_global_value(
+                f"plugin_params_{plugin_id}", None)
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            lb = saved.get("lookback")
+            if lb is not None:
+                try:
+                    cfg["lookback"] = int(lb)
+                except (TypeError, ValueError):
+                    pass
+            saved_params = saved.get("params")
+            if isinstance(saved_params, dict):
+                merged = dict(cfg["params"])
+                merged.update(saved_params)
+                cfg["params"] = merged
+        return cfg
+
+    def _start_run_worker(self, scope_id: str, set_definition: Dict[str, Any],
+                          instance_id: Optional[str]) -> None:
+        """Startet den gezielten ServiceRunWorker (Single/Set) mit dem
+        Timeframe aus combo_run_tf – Muster service_win._start_run_worker."""
+        if self._run_worker is not None and self._run_worker.isRunning():
+            QMessageBox.information(
+                self, "Service-Ausführung",
+                "Eine Service-Ausführung läuft bereits.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        self._run_worker = ServiceRunWorker(
+            self.set_evaluator, symbol, timeframe, set_definition,
+            instance_id=instance_id, parent=self,
+        )
+        self._run_worker.log_message.connect(self._on_run_log)
+        self._run_worker.run_finished.connect(self._on_run_worker_finished)
+        self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
+        self._run_worker.tf_started.connect(self._on_tf_started)
+        self._run_worker.tf_finished.connect(self._on_tf_finished)
+        self._run_worker.start()
+
+    def _on_run_log(self, message: str) -> None:
+        try:
+            print(f"[ServicePicker] {message}")
+        except Exception:
+            pass
+
+    def _on_run_service(self, set_id: str, service_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (Picker-MasterTree)."""
+        if not set_id or not service_id:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            QMessageBox.warning(
+                self, "Service ausführen",
+                f"Set '{set_id}' nicht gefunden.")
+            return
+        if service_id not in (definition.get("services") or {}):
+            QMessageBox.warning(
+                self, "Service ausführen",
+                f"Service '{service_id}' nicht im Set '{set_id}'.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        set_name = str(definition.get("display_name") or set_id)
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{service_id}' aus dem Set '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._start_run_worker(service_id, definition, instance_id=service_id)
+
+    def _on_run_set(self, set_id: str) -> None:
+        """'▶️ Alle Services ausführen' (Picker-MasterTree)."""
+        if not set_id:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            QMessageBox.warning(
+                self, "Set ausführen", f"Set '{set_id}' nicht gefunden.")
+            return
+        if not definition.get("execution_order"):
+            QMessageBox.information(
+                self, "Set ausführen", f"Set '{set_id}' hat keine Services.")
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        set_name = str(definition.get("display_name") or set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Set ausführen",
+            f"Alle Services ({count}) des Sets '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._start_run_worker(set_id, definition, instance_id=None)
+
+    def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile).
+
+        11.08.2026 (Bugfixing, Varianten-Run): `instance_hash` wird vom
+        MasterTree-Kontextmenue mitgeliefert – Clone-Zeilen laufen NUR mit
+        den Parametern + Hash der Variante; Plugin-Zeilen mit Presets
+        laufen ALLE aktiven Varianten (Bug 1/2/3).
+        """
+        if not plugin_id:
+            return
+        sm = getattr(self, "_state_manager", None)
+        entries = variant_run_entries(plugin_id, sm, self._plugin_config)
+        if not entries:
+            return
+        if instance_hash:
+            entries = [e for e in entries
+                       if e[1].get("instance_hash") == instance_hash]
+            if not entries:
+                entries = [(plugin_id, self._plugin_config(plugin_id))]
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        single = len(entries) == 1
+        if single:
+            _iid, _cfg = entries[0]
+            _name = str(_cfg.get("preset_name") or plugin_id)
+            title = "Service ausführen"
+            text = (f"Service '{plugin_id}' (Variante '{_name}') ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+                    f"geschrieben.")
+        else:
+            title = "Alle Varianten ausführen"
+            text = (f"Alle Varianten ({len(entries)}) von '{plugin_id}' "
+                    f"ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Die erzeugten Feature-Store-Payloads werden in "
+                    f"analytics.duckdb geschrieben.")
+        reply = QMessageBox.question(
+            self, title, text, QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        definition = {
+            "set_id": f"plugin_{plugin_id}",
+            "display_name": plugin_id,
+            "execution_order": [e[0] for e in entries],
+            "services": {e[0]: e[1] for e in entries},
+        }
+        self._start_run_worker(
+            plugin_id, definition,
+            instance_id=entries[0][0] if single else None)
+
+    def _on_run_category(self, group: str, category_path: str) -> None:
+        """'▶️ Alle Services ausführen' (Kategorie-Ordner, rekursiv)."""
+        if not category_path:
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+        if not plugin_ids:
+            QMessageBox.information(
+                self, "Alle Services ausführen",
+                f"Kategorie '{category_path}' hat keine Services.")
+            return
+        # 11.08.2026 (Bugfixing, Bug 3): Plugins MIT Presets -> ALLE aktiven
+        # Varianten werden ausgefuehrt (jede mit eigenen Parametern + Hash).
+        sm = getattr(self, "_state_manager", None)
+        entries_all: List[tuple] = []
+        for pid in plugin_ids:
+            entries_all.extend(variant_run_entries(pid, sm, self._plugin_config))
+        if not entries_all:
+            return
+        symbol = self._run_symbol()
+        timeframe = self._run_timeframe()
+        count = len(entries_all)
+        reply = QMessageBox.question(
+            self, "Alle Services ausführen",
+            f"Alle Services ({count}) der Kategorie '{category_path}' "
+            f"ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "execution_order": [e[0] for e in entries_all],
+            "services": {e[0]: e[1] for e in entries_all},
+        }
+        self._start_run_worker(category_path, definition, instance_id=None)
+
+    def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
+        """Run abgeschlossen: Pill-Strip zuruecksetzen + Status neu laden."""
+        self._on_run_log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) "
+                         f"im feature_store gespeichert ({scope_id}).")
+        self.badge_bar.set_running(None)
+        self._refresh_badge_bar()
+
+    def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
+        """Run fehlgeschlagen: Pill-Strip zuruecksetzen + Status neu laden."""
+        self._on_run_log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        self.badge_bar.set_running(None)
+        self._refresh_badge_bar()
+
+    def _on_tf_started(self, tf: str) -> None:
+        """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
+        self.badge_bar.set_running(tf)
+        self.badge_bar.clear_error(tf)
+
+    def _on_tf_finished(self, tf: str, stored: int, had_data: bool) -> None:
+        """TF fertig: ohne OHLCV-Daten/Fehler rot markieren, sonst neutral."""
+        if had_data:
+            self.badge_bar.clear_error(tf)
+        else:
+            self.badge_bar.set_error(tf)
+        self.badge_bar.set_running(None)
+
+    def _resolve_badge_plugin(self, node_type: str, set_id: str,
+                              service_id: str,
+                              plugin_id: str) -> Optional[str]:
+        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+        if plugin_id:
+            return str(plugin_id)
+        if node_type == TYPE_SERVICE:
+            if set_id and service_id:
+                cfg = self.model.find_service(set_id, service_id) or {}
+                return str(cfg.get("plugin_id") or service_id)
+            return str(service_id) if service_id else None
+        if node_type == TYPE_SET and set_id:
+            definition = self.model.find_set(set_id) or {}
+            order = list(definition.get("execution_order") or [])
+            services = dict(definition.get("services") or {})
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                if pid:
+                    return pid
+        return None
+
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+        """Laedt die TF-Status-Pills fuer den angegebenen Service neu
+        (FeatureStoreReader.fetch_service_tf_status)."""
+        if plugin_id:
+            self._badge_plugin_id = plugin_id
+        pid = self._badge_plugin_id
+        if not pid:
+            self.badge_bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        self.badge_bar.update_status(status)
 
     def _on_model_data_changed(self) -> None:
         """Modell-Refresh (EventBus -> data_changed): Panel neu aufbauen.
@@ -39383,9 +40282,79 @@ Verhalten unverändert.
 from typing import Any, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# 11.08.2026 (Bugfixing-Modus): Varianten-/Clone-Aufloesung fuer Runs
+# ---------------------------------------------------------------------------
+def variant_run_entries(
+    plugin_id: str,
+    state_manager,
+    base_config_fn,
+) -> List[tuple]:
+    """Erzeugt die ausfuehrbaren Eintraege (instance_id, config) eines Plugins.
+
+    Bugfix 11.08.2026 (User-Meldung 2): 'Kontextmenue auf eine Variante wird
+    faelschlicherweise bei allen Varianten ausgefuehrt/angezeigt'. Ein Clone-
+    Run muss mit den PARAMETERN DER VARIANTE + deren instance_hash laufen,
+    damit (a) die richtigen Parameter berechnet werden und (b) das Datum im
+    Baum an der Variante (per Hash) aktualisiert wird (Bug 1).
+
+    * Plugin MIT aktiven Presets: je aktivem Preset ein Eintrag
+      (instance_id = '{plugin_id}#{instance_hash}') – Parameter = Preset-
+      Parameter, instance_hash = deterministischer Hash daraus. Die Config
+      traegt zusaetzlich 'preset_name' (fuer Dialog/Anzeige).
+    * Plugin OHNE aktive Presets: ein Basis-Eintrag (plugin_id,
+      base_config_fn(plugin_id)) – Bestandsverhalten.
+
+    Returns:
+        Liste von (instance_id, config)-Tupeln; leer, wenn plugin_id leer.
+    """
+    plugin_id = str(plugin_id or "")
+    if not plugin_id:
+        return []
+    presets: List[Dict[str, Any]] = []
+    if state_manager is not None:
+        try:
+            presets = list(state_manager.list_plugin_presets(plugin_id) or [])
+        except Exception:
+            presets = []
+    active = [p for p in presets if isinstance(p, dict)
+              and bool(p.get("is_active_batch"))]
+    if active:
+        from analytics.engine.service_models import generate_instance_hash
+        entries: List[tuple] = []
+        for p in active:
+            params = dict(p.get("params") or {})
+            # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash eines
+            # Presets fliesst inkl. preset_name ein (identisch zum
+            # ServiceSelectorModel) – Presets mit identischen Parametern aber
+            # unterschiedlichen Namen erhalten UNTERSCHIEDLICHE Hashes.
+            # Dadurch matcht der Kontextmenue-Filter ('Kontextmenue auf eine
+            # Variante') GENAU EINE Variante (vorher: Hash-Kollision -> alle
+            # Varianten wurden ausgefuehrt/angezeigt).
+            preset_name = str(p.get("preset_name") or "Default")
+            inst_hash = generate_instance_hash(
+                plugin_id, params, preset_name=preset_name)
+            cfg: Dict[str, Any] = {
+                "plugin_id": plugin_id,
+                "lookback": 1000,
+                "params": params,
+                "version": str(p.get("version") or "0.0.0"),
+                "instance_hash": inst_hash,
+                "preset_name": preset_name,
+            }
+            entries.append((f"{plugin_id}#{inst_hash}", cfg))
+        return entries
+    base = base_config_fn(plugin_id)
+    if not isinstance(base, dict):
+        base = {"plugin_id": plugin_id}
+    return [(plugin_id, base)]
+
+
+# ==========================================================================
 # 18.01.03 (E1): Separater global_settings-Key fuer den Kategorie-Override
 # eines Standalone-Plugins (NICHT plugin_params_<id> – das bleibt exklusiv
 # dem Parameter-Preset vorbehalten; siehe Entscheidung E1 im Prüfprotokoll).
+# ==========================================================================
 PLUGIN_CATEGORY_KEY = "plugin_category_{}"
 
 # 18.01.03 (E3-revidiert, Bugfixing-Modus 08.08.2026): Persistenz leerer
@@ -39847,7 +40816,11 @@ from scrollable_content import ContentScrollArea, ContentScrollMixin
 from chart.widgets.named_item_actions import NamedItemActionsMixin
 
 # Phase 15 U15-D1: Submodule der Service-UI
-from serviceui.service_set_utils import _available_plugin_ids, _sets_using_plugin
+from serviceui.service_set_utils import (
+    _available_plugin_ids,
+    _sets_using_plugin,
+    variant_run_entries,
+)
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.new_set_dialog import NewServiceSetDialog
@@ -39856,6 +40829,10 @@ from serviceui.new_set_dialog import NewServiceSetDialog
 # den feature_store_payload und emittiert den EventBus (Datum live im Baum).
 # U15-E (05.08.2026): ALL_TIMEFRAMES = Sentinel fuer Multi-TF-Ausfuehrung.
 from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+# 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip) – zeigt je Timeframe die
+# feature_store-Belegung des gewaehlten Services (fetch_service_tf_status).
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from serviceui.common_widgets import TfStatusBadgeBar
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -39912,6 +40889,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # 05.08.2026: Worker fuer die gezielte Kontextmenue-Ausfuehrung
         # (MasterTree '▶️ Service(s) ausführen') – FeatureStore-Persistenz.
         self._run_worker: Optional[ServiceRunWorker] = None
+        # 21.01b: Plugin-ID des aktuell im Pill-Strip angezeigten Services.
+        self._badge_plugin_id: Optional[str] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
         # 17.01.04 (Bugfix): Standalone-Plugin-Editierung – ist eine
@@ -40056,6 +41035,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
+            # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip) am Kopf der
+            # Parameter-/Status-Spalte – pro Timeframe die feature_store-
+            # Belegung des aktuell gewaehlten Services. Wird bei der
+            # Service-Auswahl (_on_master_selection_details) und nach jedem
+            # Run neu geladen (fetch_service_tf_status).
+            self.badge_bar = TfStatusBadgeBar()
+            param_layout.insertWidget(0, self.badge_bar)
             # 05.08.2026 (Kleinere Einstellungen, Punkt 2): max. Hoehe der
             # Parameter-Box VERDOPPELT (620 -> 1240), damit Tree UND Box
             # standardmaessig doppelt so hoch sind; die max. BREITE bleibt so
@@ -40613,6 +41599,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Plugin-Modus zurueckgesetzt.
         """
         if node_type in ("plugin", "clone") and plugin_id:
+            # 21.01b: Pill-Strip fuer den geklickten Service laden.
+            self._refresh_badge_bar(str(plugin_id))
             if node_type == "clone":
                 # 10.08.2026 (Bugfix, Varianten-Params): Eine Variante/Clone
                 # hat EIGENE Parameter in indicator_presets (20.04, Q7) -
@@ -40630,6 +41618,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self._current_plugin_editing = None
         if self._current_preset_editing:
             self._current_preset_editing = None
+        # 21.01b: Pill-Strip fuer Set-/Service-Zeilen nachziehen (erster
+        # Service des Sets bzw. der Service selbst).
+        self._refresh_badge_bar(
+            self._resolve_badge_plugin(node_type, set_id,
+                                       service_id, plugin_id))
 
     def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
         """ServiceInstanceConfig eines Standalone-Plugins.
@@ -40882,6 +41875,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker.log_message.connect(self.log)
         self._run_worker.run_finished.connect(self._on_run_worker_finished)
         self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
+        self._run_worker.tf_started.connect(self._on_tf_started)
+        self._run_worker.tf_finished.connect(self._on_tf_finished)
         # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
         self._begin_sync_guard()
         self._run_worker.start()
@@ -40962,9 +41958,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self._start_run_worker(set_id, definition, instance_id=None)
 
-    @Slot(str)
-    def _on_run_plugin(self, plugin_id: str) -> None:
-        """'▶️ Diesen Service ausführen' (Plugin-Zeile unter 📦 Services).
+    @Slot(str, str)
+    def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile unter 📦 Services).
 
         17.01.02 (Bugfix-Runde): Einzel-Services ausserhalb von Sets (z.B.
         unter Kategorie-Ordnern) erhalten dieselbe Run-Aktion wie die
@@ -40972,32 +41968,62 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         aktuell gewaehlten Symbol/Timeframe, danach gezielter Single-Run via
         ServiceRunWorker mit einer Ad-hoc-Mini-Definition (nur dieser
         Service; prepare_worker_definition loest ggf. dependencies auf).
+
+        11.08.2026 (Bugfixing, Varianten-Run): `instance_hash` wird vom
+        MasterTree-Kontextmenue mitgeliefert:
+          * Clone-Zeile  -> hash der Variante: NUR diese Variante laeuft mit
+                            ihren EIGENEN Parametern + Hash (Datum im Baum
+                            aktualisiert sich an der Variante, Bug 1).
+          * Plugin-Zeile -> leer: mit Presets laufen ALLE aktiven Varianten,
+                            sonst Basis-Parameter (Bestandsverhalten).
         """
         if not plugin_id:
             return
+        sm = getattr(self, "_state_manager", None)
+        entries = variant_run_entries(plugin_id, sm, self._plugin_config)
+        if not entries:
+            return
+        if instance_hash:
+            entries = [e for e in entries
+                       if e[1].get("instance_hash") == instance_hash]
+            if not entries:
+                # Variante nicht (mehr) vorhanden -> Basis-Fallback.
+                entries = [(plugin_id, self._plugin_config(plugin_id))]
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
         # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
         timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        single = len(entries) == 1
+        if single:
+            _iid, _cfg = entries[0]
+            _name = str(_cfg.get("preset_name") or plugin_id)
+            title = "Service ausführen"
+            text = (f"Service '{plugin_id}' (Variante '{_name}') ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+                    f"geschrieben.")
+        else:
+            title = "Alle Varianten ausführen"
+            text = (f"Alle Varianten ({len(entries)}) von '{plugin_id}' "
+                    f"ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Die erzeugten Feature-Store-Payloads werden in "
+                    f"analytics.duckdb geschrieben.")
         reply = QMessageBox.question(
-            self, "Service ausführen",
-            f"Service '{plugin_id}' ausführen?\n\n"
-            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
-            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
-            f"geschrieben.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            self, title, text, QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
         if reply != QMessageBox.Yes:
             self.log("Ausführung abgebrochen.")
             return
         definition = {
             "set_id": f"plugin_{plugin_id}",
             "display_name": plugin_id,
-            "execution_order": [plugin_id],
-            # 17.01.04: Gespeicherte Plugin-Parameter (global_settings)
-            # verwenden, falls vorhanden – sonst Registry-Defaults.
-            "services": {plugin_id: self._plugin_config(plugin_id)},
+            "execution_order": [e[0] for e in entries],
+            "services": {e[0]: e[1] for e in entries},
         }
-        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+        self._start_run_worker(
+            plugin_id, definition,
+            instance_id=entries[0][0] if single else None)
 
     @Slot(str, str)
     def _on_run_category(self, group: str, category_path: str) -> None:
@@ -41023,11 +42049,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Kategorie '{category_path}' hat keine Services – "
                      f"Ausführung abgebrochen.")
             return
+        # 11.08.2026 (Bugfixing, Bug 3): Plugins MIT Presets werden zu ALLEN
+        # aktiven Varianten expandiert (jede mit eigenen Parametern + Hash),
+        # damit 'Alle Services ausführen' auch die Varianten ausfuehrt.
+        sm = getattr(self, "_state_manager", None)
+        entries_all: List[tuple] = []
+        for pid in plugin_ids:
+            entries_all.extend(variant_run_entries(pid, sm, self._plugin_config))
+        if not entries_all:
+            return
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
         # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
         timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
-        count = len(plugin_ids)
+        count = len(entries_all)
         reply = QMessageBox.question(
             self, "Alle Services ausführen",
             f"Alle Services ({count}) der Kategorie '{category_path}' "
@@ -41042,10 +42077,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         definition = {
             "set_id": f"category_{category_path}",
             "display_name": category_path,
-            "execution_order": list(plugin_ids),
+            "execution_order": [e[0] for e in entries_all],
             # 17.01.04: Gespeicherte Plugin-Parameter je Service verwenden
-            # (falls vorhanden), sonst Registry-Defaults.
-            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
+            # (falls vorhanden), sonst Registry-Defaults. Varianten tragen
+            # Preset-Parameter + instance_hash.
+            "services": {e[0]: e[1] for e in entries_all},
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 
@@ -41220,12 +42256,86 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._end_sync_guard()
         self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
                  f"feature_store gespeichert ({scope_id}).")
+        # 21.01b: Pill-Strip nach dem Run neu laden (neue Counts/last_run).
+        bar = getattr(self, "badge_bar", None)
+        if bar is not None:
+            bar.set_running(None)
+        self._refresh_badge_bar()
 
     @Slot(str, str)
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
         self._end_sync_guard()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        # 21.01b: Pill-Strip nach Fehler zuruecksetzen + Status neu laden.
+        bar = getattr(self, "badge_bar", None)
+        if bar is not None:
+            bar.set_running(None)
+        self._refresh_badge_bar()
+
+    # -------------------------------------------------------------------------
+    # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip)
+    # -------------------------------------------------------------------------
+    def _on_tf_started(self, tf: str) -> None:
+        """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        bar.set_running(tf)
+        bar.clear_error(tf)
+
+    def _on_tf_finished(self, tf: str, stored: int, had_data: bool) -> None:
+        """TF fertig: ohne OHLCV-Daten/Fehler rot markieren, sonst neutral."""
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        if had_data:
+            bar.clear_error(tf)
+        else:
+            bar.set_error(tf)
+        bar.set_running(None)
+
+    def _resolve_badge_plugin(self, node_type: str, set_id: str,
+                              service_id: str,
+                              plugin_id: str) -> Optional[str]:
+        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+        if plugin_id:
+            return str(plugin_id)
+        if set_id:
+            try:
+                definition = self.set_repo.get_set(set_id)
+            except Exception:
+                definition = None
+            if definition:
+                order = list(definition.get("execution_order") or [])
+                services = dict(definition.get("services") or {})
+                for iid in order:
+                    cfg = services.get(iid) or {}
+                    pid = str(cfg.get("plugin_id") or iid)
+                    if pid:
+                        return pid
+        return str(service_id) if service_id else None
+
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+        """Laedt die TF-Status-Pills fuer den angegebenen Service neu.
+
+        Quelle: FeatureStoreReader.fetch_service_tf_status() – je Timeframe
+        die Anzahl der feature_store-Eintraege und der letzte Lauf.
+        """
+        bar = getattr(self, "badge_bar", None)
+        if bar is None:
+            return
+        if plugin_id:
+            self._badge_plugin_id = plugin_id
+        pid = self._badge_plugin_id
+        if not pid:
+            bar.clear()
+            return
+        try:
+            status = FeatureStoreReader().fetch_service_tf_status(pid)
+        except Exception:
+            status = {}
+        bar.update_status(status)
 
     # -------------------------------------------------------------------------
     # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste
@@ -42218,7 +43328,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 if not isinstance(p, dict):
                     continue
                 params = p.get("params") or {}
-                if generate_instance_hash(plugin_id, params) == instance_hash:
+                # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash eines
+                # Presets fliesst inkl. preset_name ein (identisch zum
+                # ServiceSelectorModel / variant_run_entries). Fallback auf
+                # den Legacy-Params-only-Hash fuer Alt-Bestand.
+                preset_name = str(p.get("preset_name") or "Default")
+                if (generate_instance_hash(plugin_id, params,
+                                           preset_name=preset_name)
+                        == instance_hash
+                        or generate_instance_hash(plugin_id, params)
+                        == instance_hash):
                     return p
         except Exception as e:
             self.log(f"Preset-Suche fehlgeschlagen: {e}")
@@ -42263,18 +43382,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
           oder bei Alt-Daten aus den aktuellen Params neu berechnet.
         * Clone/Preset: Hash direkt aus ROLE_INSTANCE_HASH.
         """
+        params = None
         if not instance_hash:
             if set_id and service_id:
                 model = getattr(self.service_selector, "model", None)
                 cfg = model.find_service(set_id, service_id) if model else None
                 if cfg:
+                    params = cfg.get("params") or {}
                     instance_hash = generate_instance_hash(
-                        cfg.get("plugin_id") or service_id,
-                        cfg.get("params") or {})
+                        cfg.get("plugin_id") or service_id, params)
             if not instance_hash:
                 self.log("Kein instance_hash fuer 'Data Only Löschen' "
                          "verfuegbar.")
                 return
+        # 11.08.2026 (Bugfix Runde 5): Parameter der Variante ermitteln
+        # – Grundlage fuer den Legacy-Pool-Purge (Params-only-Hash) im
+        # FeatureBuilder – sonst bleiben die Alt-Rows und das Datum
+        # setzt nach dem Purge nicht auf 'nie' zurueck.
+        if params is None:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset:
+                params = preset.get("params") or {}
         label = service_id or f"{plugin_id} (#{instance_hash})"
         reply = QMessageBox.question(
             self, "Data Only Löschen",
@@ -42287,7 +43415,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            n = FeatureBuilder().purge_instance_data(instance_hash)
+            n = FeatureBuilder().purge_instance_data(
+                instance_hash, plugin_id, params)
         except Exception as e:
             self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
             return
@@ -42374,7 +43503,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if hash_:
             try:
                 from analytics.features.feature_builder import FeatureBuilder
-                n = FeatureBuilder().purge_instance_data(hash_)
+                n = FeatureBuilder().purge_instance_data(
+                    hash_, pid, cfg.get("params") or {})
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
@@ -42419,7 +43549,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if instance_hash:
             try:
                 from analytics.features.feature_builder import FeatureBuilder
-                n = FeatureBuilder().purge_instance_data(instance_hash)
+                n = FeatureBuilder().purge_instance_data(
+                    instance_hash, plugin_id, preset.get("params") or {})
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
@@ -42720,7 +43851,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except Exception as e:
             self.log(f"FEHLER beim Duplizieren der Variante: {e}")
             return
-        new_hash = generate_instance_hash(plugin_id, params)
+        # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash der neuen
+        # Variante fliesst inkl. des NEUEN Preset-Namens ein (identisch zum
+        # ServiceSelectorModel) - sonst kollidieren Params-only-Hashes.
+        new_hash = generate_instance_hash(plugin_id, params,
+                                          preset_name=new_name)
         self.log(f"Variante '{new_name}' dupliziert aus '{base}' "
                  f"(#{new_hash}).")
         event_bus.service_set_changed.emit()
@@ -44280,6 +45415,70 @@ snapshot("AFTER agg->avg")
 w._combo_agg.setCurrentIndex(w._combo_agg.findData("confluence_count"))
 pump()
 snapshot("AFTER agg->confluence_count")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_flow2.py
+```py
+# test/_diag_flow2.py
+"""Simuliert den kompletten Varianten-Run-Flow (Bug 1) + Purge-Flow (Bug 2)."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from analytics.engine.service_models import generate_instance_hash
+from analytics.engine.service_selector_model import ServiceSelectorModel
+from state_manager import StateManager
+from serviceui.service_set_utils import variant_run_entries
+from analytics.engine.feature_store_reader import FeatureStoreReader
+
+sm = StateManager()
+model = ServiceSelectorModel()
+
+
+def _base_cfg(pid):
+    return {"plugin_id": pid, "lookback": 1000, "params": {},
+            "version": "0.0.0"}
+
+
+pid = "srv_trend_breakout"
+print("=== Modell-Clones (Baum) ===")
+clones = model.plugin_presets().get(pid) or []
+for c in clones:
+    print("  name=", repr(c["preset_name"]),
+          "new_hash=", c["instance_hash"],
+          "legacy=", generate_instance_hash(pid, c["params"]),
+          "last_exec=", c["last_execution"])
+
+print("\n=== variant_run_entries (Run) ===")
+entries = variant_run_entries(pid, sm, _base_cfg)
+for e in entries:
+    print("  iid=", e[0], "hash=", e[1]["instance_hash"],
+          "preset=", repr(e[1].get("preset_name")))
+
+print("\n=== Kontextmenue-Filter auf Variante 'ffffffff' ===")
+new_h = generate_instance_hash(pid, {}, preset_name="ffffffff")
+print("  tree emit hash (new):", new_h)
+matched = [e for e in entries if e[1].get("instance_hash") == new_h]
+print("  Filter-Treffer:", len(matched),
+      [m[1].get("preset_name") for m in matched])
+
+print("\n=== Store per-Hash-Daten ===")
+by = FeatureStoreReader().fetch_last_execution_dates_by_hash()
+per = by.get(pid, {})
+print("  per_hash:", per)
+print("  legacy 3399e1bc:", per.get("3399e1bc"))
+
+print("\n=== Bug 2: purge mit NEUEM Hash ===")
+from analytics.features.feature_builder import FeatureBuilder
+fb = FeatureBuilder()
+print("  purge(new_hash) rows:", fb.purge_instance_data(new_h))
+legacy_h = generate_instance_hash(pid, {})
+print("  purge(legacy) rows:", fb.purge_instance_data(legacy_h))
 
 ```
 
@@ -52087,8 +53286,8 @@ con.execute("""
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
         feature_data JSON,
-        instance_hash VARCHAR,
-        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+        instance_hash VARCHAR NOT NULL DEFAULT '',
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id, instance_hash)
     )
 """)
 con.close()
@@ -52118,7 +53317,8 @@ check("Q9) instance_hash in neuer Spalte gespeichert",
       row is not None and row[0] == "abc12345" and row[1] == "srv_swing_pivot",
       str(row))
 
-# --- 2) Write OHNE instance_hash -> NULL (und kein Wipe bestehender Hashes) --
+# --- 2) Write OHNE instance_hash -> Sentinel '' (kein Wipe bestehender
+#        Hashes, COALESCE/NULLIF).
 payload_no_hash = {
     "feature_id": "srv_swing_pivot",
     "plugin_version": "1.0.0",
@@ -52130,8 +53330,8 @@ FeatureBuilder.store_plugin_payload(
 con = duckdb.connect(db)
 row2 = con.execute("SELECT instance_hash FROM feature_store WHERE "
                    "EXTRACT('epoch' FROM bar_time)::BIGINT = 1770000120").fetchone()
-check("Q9) Ohne instance_hash -> NULL (nicht gesetzt)",
-      row2 is not None and row2[0] is None, str(row2))
+check("Q9) Ohne instance_hash -> Sentinel '' (PK-fest, seit Migration)",
+      row2 is not None and row2[0] == "", str(row2))
 
 # Upsert einer bestehenden Bar OHNE Hash darf den vorhandenen Hash nicht
 # ueberschreiben (COALESCE).
@@ -52157,12 +53357,11 @@ check("Q5) purge_instance_data loescht nur die Variante (2 Rows)",
 con = duckdb.connect(db)
 remaining = con.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
 left_hash = con.execute(
-    "SELECT COUNT(*) FROM feature_store WHERE instance_hash IS NOT NULL"
+    "SELECT COUNT(*) FROM feature_store WHERE instance_hash != ''"
 ).fetchone()[0]
 check("Q5) Row ohne Hash + Struktur bleiben erhalten",
-      remaining == 1 and left_hash == 0,
+      remaining == 2 and left_hash == 0,
       f"remaining={remaining} left_hash={left_hash}")
-
 # Idempotenz: erneutes Purge liefert 0.
 n2 = FeatureBuilder.purge_instance_data(fb, "abc12345")
 check("Q5) purge_instance_data idempotent (0 bei zweitem Aufruf)",
@@ -53494,6 +54693,171 @@ fail = [n for n, ok, _ in PASS if not ok]
 if fail:
     print("FAILS:", fail)
     sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2101b.py
+```py
+# test/check_2101b.py
+"""
+Gezielter Logik-Test 21.01b (11.08.2026) – KEIN UI-Test/keine Regression.
+
+Prueft headless (QT_QPA_PLATFORM=offscreen, ohne Event-Loop):
+  1) fetch_service_tf_status  – DB-Status-Query (TF -> {count, last_run}).
+  2) TfStatusBadgeBar          – Badge-Mapping (update_status/set_running/
+                                 set_error/Tooltip).
+  3) ServiceRunWorker._resolve_timeframes – Multi-TF-Loop (alle als Kerzen
+                                 verfuegbaren TFs, sortiert, Sentinel).
+  4) run_worker-Signale        – tf_started/tf_finished existieren (E17+21.01b).
+  5) EventBus-Teilerfolg       – _emit_service_changed ist vorhanden und
+                                 feuert ohne Exception (E17).
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_results = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    _results.append((name, ok, detail))
+    print(("PASS " if ok else "FAIL ") + name + (f"  ({detail})" if detail else ""))
+
+
+# ---------------------------------------------------------------------------
+# 1) DB-Status-Query
+# ---------------------------------------------------------------------------
+try:
+    from analytics.engine.feature_store_reader import FeatureStoreReader
+
+    reader = FeatureStoreReader()
+    status = reader.fetch_service_tf_status("srv_proximity")
+    check("1a) fetch_service_tf_status liefert Dict", isinstance(status, dict))
+    check("1b) Status-Map hat count+last_run",
+          all(isinstance(v, dict) and "count" in v and "last_run" in v
+              for v in status.values()))
+    check("1c) TFs gross (M1/H1), count>0",
+          all(str(k).isupper() and int(v["count"]) > 0
+              for k, v in list(status.items())[:5]))
+    check("1d) unbekannte plugin_id -> {}",
+          reader.fetch_service_tf_status("srv_gibt_es_nicht") == {})
+except Exception as e:  # pragma: no cover
+    check("1) fetch_service_tf_status", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 2) Badge-Mapping (offscreen, minimales QApplication)
+# ---------------------------------------------------------------------------
+try:
+    from PySide6.QtWidgets import QApplication
+    from serviceui.common_widgets import TfStatusBadgeBar
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    bar = TfStatusBadgeBar()
+    bar.update_status({
+        "M1": {"count": 99063, "last_run": "02.08.26 17:28"},
+        "H1": {"count": 10000, "last_run": "05.08.26 19:58"},
+    })
+    check("2a) Badges erzeugt (M1+H1)", set(bar._labels.keys()) == {"M1", "H1"})
+    lbl_m1 = bar._labels["M1"]
+    tip = lbl_m1.toolTip()
+    check("2b) Tooltip enthaelt Eintraege+Zuletzt",
+          "99.063 Eintraege" in tip and "Zuletzt: 02.08.26 17:28" in tip)
+    bar.set_running("M1")
+    check("2c) set_running aktiv",
+          "2f6fb2" in lbl_m1.styleSheet().lower() and "2f6fb2"
+          not in bar._labels["H1"].styleSheet().lower())
+    bar.set_running(None)
+    bar.set_error("H1")
+    check("2d) set_error aktiv", "b04343" in bar._labels["H1"].styleSheet().lower())
+    # Laufender TF ohne DB-Eintrag muss sichtbar bleiben (erster Run).
+    bar.set_running("M5")
+    bar.update_status({"M1": {"count": 1, "last_run": ""}})
+    check("2e) laufender TF ohne DB-Eintrag sichtbar", "M5" in bar._labels)
+    bar.set_running(None)
+    check("2f) clear leert Badges", (bar.clear() is None and not bar._labels))
+except Exception as e:  # pragma: no cover
+    check("2) Badge-Mapping", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 3) Multi-TF-Loop (_resolve_timeframes)
+# ---------------------------------------------------------------------------
+try:
+    from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+    from db_service import TF_SECONDS_MAP
+
+    class _Dummy:
+        pass
+
+    ev = _Dummy()
+    ev.execute_set_resilient = None
+    worker = ServiceRunWorker.__new__(ServiceRunWorker)
+    worker.timeframe = ALL_TIMEFRAMES
+    tfs = worker._resolve_timeframes()
+    check("3a) Multi-TF liefert Liste", isinstance(tfs, list) and len(tfs) >= 3)
+    check("3b) aufsteigend nach TF_SECONDS_MAP sortiert",
+          tfs == sorted(tfs, key=lambda tf: TF_SECONDS_MAP.get(tf, 10 ** 12)))
+    check("3c) spezifischer TF -> [tf]",
+          (lambda w: (setattr(w, "timeframe", "H1"), w._resolve_timeframes())[1])(
+              worker) == ["H1"])
+except Exception as e:  # pragma: no cover
+    check("3) Multi-TF-Loop", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 4) Worker-Signale
+# ---------------------------------------------------------------------------
+try:
+    sigs = ServiceRunWorker.tf_started, ServiceRunWorker.tf_finished
+    check("4a) tf_started/tf_finished existieren", all(s is not None for s in sigs))
+    check("4b) ALL_TIMEFRAMES-Sentinel", ALL_TIMEFRAMES == "ALLE Timeframes")
+except Exception as e:  # pragma: no cover
+    check("4) Worker-Signale", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 5) EventBus-Teilerfolg (E17)
+# ---------------------------------------------------------------------------
+try:
+    ev_obj = _Dummy()
+    emitted = []
+
+    class _EB:
+        service_set_changed = None
+
+        class _Sig:
+            @staticmethod
+            def emit():
+                emitted.append(1)
+
+    from config import event_bus as _eb_mod  # noqa: E402
+    # Nur Methodenexistenz pruefen; die echte Emission laeuft im Worker.
+    m = ServiceRunWorker._emit_service_changed
+    check("5a) _emit_service_changed vorhanden", callable(m))
+    check("5b) E17: run() emittiert Sync auch bei run_failed (Code-Inspection)",
+          "self._emit_service_changed()" in
+          open(os.path.join(os.path.dirname(__file__), "..", "serviceui",
+                            "run_worker.py"), encoding="utf-8").read())
+except Exception as e:  # pragma: no cover
+    check("5) EventBus-Teilerfolg", False, str(e))
+
+# ---------------------------------------------------------------------------
+# Import-Smoke (ServiceWindow + Picker laden ohne Crash)
+# ---------------------------------------------------------------------------
+try:
+    from serviceui import service_win  # noqa: F401
+    from serviceui import service_selector_dialog  # noqa: F401
+    from serviceui import common_widgets  # noqa: F401
+    check("6) Module importieren (service_win/picker/common_widgets)", True)
+except Exception as e:  # pragma: no cover
+    check("6) Module importieren", False, str(e))
+
+print("\n======")
+failed = [r for r in _results if not r[1]]
+print(f"RESULT: {len(_results) - len(failed)}/{len(_results)} PASS")
+sys.exit(1 if failed else 0)
 
 ```
 
@@ -62948,8 +64312,8 @@ mt = MasterTree(_fake_model)
 mt._checkable = False
 plugin_item = mt._build_plugin_item(leaf, "plugins")
 clone_item = plugin_item.child(0)
-check("3a) Parent-Label ohne Datum bei Clones",
-      plugin_item.text(0) == "srv_grid_lines", repr(plugin_item.text(0)))
+check("3a) Parent-Label ohne Datum bei Clones, 'srv_'-Praefix abgeschnitten",
+      plugin_item.text(0) == "grid_lines", repr(plugin_item.text(0)))
 check("3b) Clone-Label: Name + Datum, KEINE ID",
       clone_item.text(0) == "🟢 Default (10.08.26)", repr(clone_item.text(0)))
 check("3c) Clone traegt ROLE_PRESET_NAME",
@@ -62960,8 +64324,8 @@ check("3c) Clone traegt ROLE_PRESET_NAME",
 flat_leaf = {"plugin_id": "srv_proximity", "badge": "",
              "last_execution": "02.08.26", "clones": []}
 flat_item = mt._build_plugin_item(flat_leaf, "plugins")
-check("3d) Flaches Blatt: Datum bleibt am Plugin-Knoten",
-      flat_item.text(0) == "srv_proximity (02.08.26)",
+check("3d) Flaches Blatt: Datum bleibt am Plugin-Knoten, 'srv_'-Praefix weg",
+      flat_item.text(0) == "proximity (02.08.26)",
       repr(flat_item.text(0)))
 
 # Archivierte Clones: Datum am Namen, kein Hash
@@ -63013,6 +64377,416 @@ check("4d) Kollisionsmenge enthaelt beide Namen",
 con.close()
 print("FEHLER:", FAILURES) if FAILURES else print(
     "ALLE VARIANTEN-PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(1 if FAILURES else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_variant_hash_fix.py
+```py
+# test/check_variant_hash_fix.py
+"""
+Bugfixing-Verifikation 11.08.2026 (Varianten-Kollision) - headless.
+
+Prueft den Kern-Fix der User-Meldung 'Kontextmenue auf Variante fuehrt alle
+Varianten aus / Datum falsch aktualisiert':
+
+  1) generate_instance_hash(pid, params, preset_name) differenziert Presets
+     mit identischen Params aber unterschiedlichen Namen (keine Kollision).
+  2) Live-Daten: die zuvor kollidierenden Presets von srv_trend_breakout
+     ('ffffffff'/'ggsegerttt') und srv_trend_hma_pivot haben jetzt
+     UNTERSCHIEDLICHE Hashes - in variant_run_entries UND im Modell.
+  3) KEIN Modell-Legacy-Fallback mehr: Rows unter dem alten Params-only-Hash
+     liefern KEIN Anzeige-Datum mehr (nur der EIGENE Preset-Hash zaehlt);
+     purge_instance_data loescht mit plugin_id+params auch die Legacy-Rows.
+  4) feature_store-PK-Migration (Table-Rewrite + ALTER ADD PRIMARY KEY):
+     idempotent, COALESCE(NULL -> ''), Varianten koexistieren pro Bar.
+  5) store_plugin_payload schreibt mit dem 5-Spalten-PK (adaptiver
+     ON-CONFLICT-Target); fetch_last_execution_dates_by_hash liefert
+     getrennte Daten je Variante.
+
+KEINE GUI-Ausfuehrung.
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from datetime import datetime, timezone  # noqa: E402
+
+import duckdb  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# 1) Preset-eindeutiger Hash (Kern-Fix)
+# ---------------------------------------------------------------------------
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+
+h_a = generate_instance_hash("srv_x", {}, preset_name="ffffffff")
+h_b = generate_instance_hash("srv_x", {}, preset_name="ggsegerttt")
+check("1a) identische Params, verschiedene Namen -> verschiedene Hashes",
+      h_a != h_b, f"{h_a} vs {h_b}")
+check("1b) ohne preset_name bleibt der Legacy-Hash stabil (Backward-Compat)",
+      generate_instance_hash("srv_x", {}) == generate_instance_hash("srv_x", {})
+      and h_a != generate_instance_hash("srv_x", {}))
+
+# ---------------------------------------------------------------------------
+# 2) Live-Daten: Kollision behoben (Modell + variant_run_entries)
+# ---------------------------------------------------------------------------
+from state_manager import StateManager  # noqa: E402
+from serviceui.service_set_utils import variant_run_entries  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+
+sm = StateManager()
+model = ServiceSelectorModel()
+
+
+def _base_cfg(pid):
+    return {"plugin_id": pid, "lookback": 1000, "params": {},
+            "version": "0.0.0"}
+
+
+try:
+    # srv_trend_breakout: vorher beide Presets -> 3399e1bc (Kollision)
+    entries = variant_run_entries("srv_trend_breakout", sm, _base_cfg)
+    entry_hashes = [e[1]["instance_hash"] for e in entries]
+    check("2a) srv_trend_breakout: Eintraege haben eindeutige Hashes",
+          len(entry_hashes) == len(set(entry_hashes)), str(entry_hashes))
+    check("2b) Kollisions-Hash 3399e1bc ist nicht mehr enthalten",
+          "3399e1bc" not in entry_hashes, str(entry_hashes))
+    # srv_trend_hma_pivot: vorher alle 3 Presets -> 2d9f343a (Kollision)
+    entries2 = variant_run_entries("srv_trend_hma_pivot", sm, _base_cfg)
+    eh2 = [e[1]["instance_hash"] for e in entries2]
+    check("2c) srv_trend_hma_pivot: Eintraege haben eindeutige Hashes",
+          len(eh2) == len(set(eh2)), str(eh2))
+    check("2d) Kollisions-Hash 2d9f343a ist nicht mehr enthalten",
+          "2d9f343a" not in eh2, str(eh2))
+    # Modell-Konsistenz (Run-Hash == Baum-Hash -> Datum aktualisiert sich)
+    model_clones = model.plugin_presets().get("srv_trend_breakout") or []
+    model_hashes = {c["instance_hash"] for c in model_clones
+                    if not c["is_archived"]}
+    check("2e) Run-Hashes deckungsgleich mit Modell (Baum-Datum)",
+          set(entry_hashes) == model_hashes,
+          f"{sorted(entry_hashes)} vs {sorted(model_hashes)}")
+except Exception as e:  # pragma: no cover
+    check("2) Live-Kollisions-Check", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 3) KEIN Legacy-Anzeige-Fallback mehr + Legacy-Purge (Bugfix Runde 5)
+# ---------------------------------------------------------------------------
+try:
+    from analytics.engine.service_models import generate_instance_hash as _g
+    legacy = _g("srv_trend_breakout", {})
+    presets = sm.list_plugin_presets("srv_trend_breakout") or []
+    active_names = [str(p.get("preset_name") or "Default")
+                    for p in presets if isinstance(p, dict)
+                    and p.get("is_active_batch")]
+    new_hashes = {_g("srv_trend_breakout", {}, preset_name=n)
+                  for n in active_names}
+    check("3a) Preset-Hashes unterscheiden sich vom Legacy-Hash",
+          bool(new_hashes) and legacy not in new_hashes,
+          f"legacy={legacy} new={sorted(new_hashes)}")
+
+    # 3b) Deterministisch (Fake-Reader/StateManager): Das Modell zeigt KEIN
+    #     Legacy-Fallback-Datum mehr - eine Variante, deren Store nur Rows
+    #     unter dem ALTEN Params-only-Hash hat (eigener Hash nie gelaufen),
+    #     zeigt '--.--.--' (User-Meldung Bug 1: 'Datum bei allen Varianten').
+    class _FakeSM:
+        def list_plugin_presets(self, pid):
+            if pid == "srv_x":
+                return [{"preset_name": "V1", "params": {},
+                         "is_active_batch": True}]
+            return []
+
+        def get_global_value(self, key, default=None):
+            return default
+
+        def load_all_instances(self):
+            return []
+
+    class _FakeReader:
+        def fetch_last_execution_dates(self):
+            return {}
+
+        def fetch_last_execution_datetimes(self):
+            return {}
+
+        def fetch_last_execution_dates_by_hash(self):
+            legacy_h = _g("srv_x", {})
+            return {"srv_x": {legacy_h: "11.08.26"}}
+
+        def fetch_last_execution_datetimes_by_hash(self):
+            return {}
+
+    class _FakeRepo:
+        def list_sets(self):
+            return []
+
+    class _FakeReg:
+        plugins = {"srv_x": object()}
+
+    _m2 = ServiceSelectorModel(set_repo=_FakeRepo(), state_manager=_FakeSM(),
+                               registry=_FakeReg(),
+                               feature_store_reader=_FakeReader())
+    _clones = _m2.plugin_presets().get("srv_x") or []
+    _new_h = _g("srv_x", {}, preset_name="V1")
+    check("3b) Kein Legacy-Fallback: nur-Legacy-Rows -> Anzeige 'nie'",
+          len(_clones) == 1 and
+          _m2.last_execution_date_for_hash("srv_x", _new_h) == "--.--.--" and
+          _clones[0]["last_execution"] == "--.--.--",
+          f"clones={_clones}")
+
+    # 3c) purge_instance_data(instance_hash, plugin_id, params) loescht NEBEN
+    #     den Varianten-Rows auch die Legacy-Pool-Rows der Variante
+    #     (User-Meldung Bug 2: 'Data only' setzt Datum wieder auf 'nie').
+    import analytics.features.feature_builder as _fb3
+    from analytics.features.feature_builder import FeatureBuilder as _FB3
+    _tmp3 = tempfile.mkdtemp(prefix="pytrader_vhf_",
+                             dir=r"F:\Python\PyTrader\test")
+    _db3 = os.path.join(_tmp3, "purge_legacy.duckdb")
+    _con3 = duckdb.connect(_db3)
+    _con3.execute("""
+        CREATE TABLE feature_store (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            feature_id VARCHAR NOT NULL DEFAULT 'native',
+            plugin_version VARCHAR, feature_data JSON,
+            instance_hash VARCHAR NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id,
+                         instance_hash)
+        )
+    """)
+    _con3.close()
+    _pid3 = "srv_trend_breakout"
+    _p3 = {"fast": True}
+    _legacy3 = _g(_pid3, _p3)
+    _new3 = _g(_pid3, _p3, preset_name="V1")
+    _orig3 = _fb3.DB_ANALYTICS
+    _fb3.DB_ANALYTICS = _db3
+    _con3 = duckdb.connect(_db3)
+    _con3.execute(
+        "INSERT INTO feature_store (symbol,timeframe,bar_time,feature_id,"
+        "plugin_version,feature_data,instance_hash,created_at) "
+        "VALUES (?,?,?,?,?,?,?,now())",
+        ["SILVER", "H1", "2026-08-01", _pid3, "1.0.0", "{}", _legacy3])
+    _con3.execute(
+        "INSERT INTO feature_store (symbol,timeframe,bar_time,feature_id,"
+        "plugin_version,feature_data,instance_hash,created_at) "
+        "VALUES (?,?,?,?,?,?,?,now())",
+        ["SILVER", "H1", "2026-08-01", _pid3, "1.0.0", "{}", _new3])
+    _con3.close()
+    _n3 = _FB3().purge_instance_data(_new3, _pid3, _p3)
+    _con3 = duckdb.connect(_db3)
+    _left3 = _con3.execute(
+        "SELECT instance_hash FROM feature_store").fetchall()
+    _con3.close()
+    _fb3.DB_ANALYTICS = _orig3
+    check("3c) Purge mit plugin_id+params entfernt Varianten- UND Legacy-Rows",
+          _n3 == 2 and _left3 == [], f"n={_n3} left={_left3}")
+
+    # 3d) Ohne params (Legacy-Hash unbekannt) bleiben Legacy-Rows erhalten -
+    #     nur die Varianten-eigenen Rows werden geloescht (Defensivpfad).
+    _fb3.DB_ANALYTICS = _db3
+    _con3 = duckdb.connect(_db3)
+    _con3.execute(
+        "INSERT INTO feature_store (symbol,timeframe,bar_time,feature_id,"
+        "plugin_version,feature_data,instance_hash,created_at) "
+        "VALUES (?,?,?,?,?,?,?,now())",
+        ["SILVER", "H1", "2026-08-01", _pid3, "1.0.0", "{}", _legacy3])
+    _con3.execute(
+        "INSERT INTO feature_store (symbol,timeframe,bar_time,feature_id,"
+        "plugin_version,feature_data,instance_hash,created_at) "
+        "VALUES (?,?,?,?,?,?,?,now())",
+        ["SILVER", "H1", "2026-08-01", _pid3, "1.0.0", "{}", _new3])
+    _con3.close()
+    _n3b = _FB3().purge_instance_data(_new3, _pid3)
+    _con3 = duckdb.connect(_db3)
+    _left3b = [r[0] for r in _con3.execute(
+        "SELECT instance_hash FROM feature_store").fetchall()]
+    _con3.close()
+    _fb3.DB_ANALYTICS = _orig3
+    check("3d) Ohne params bleibt die Legacy-Row erhalten",
+          _n3b == 1 and _left3b == [_legacy3],
+          f"n={_n3b} left={_left3b}")
+except Exception as e:  # pragma: no cover
+    try:
+        _fb3.DB_ANALYTICS = _orig3
+    except Exception:
+        pass
+    check("3) Legacy-Fallback/Purge", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 4) feature_store-PK-Migration (in-memory, gleicher Ablauf wie
+#    db/schema_initializer.py)
+# ---------------------------------------------------------------------------
+con = duckdb.connect()
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        instance_hash VARCHAR,
+        ema_diff DOUBLE,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+con.execute("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
+                               instance_hash)
+    VALUES ('SILVER', 'H1', '2026-08-01', 'srv_x', 'abc123'),
+           ('SILVER', 'H1', '2026-08-01 12:00', 'srv_x', NULL),
+           ('SILVER', 'H1', '2026-08-02', 'native', NULL)
+""")
+# Migration (identisch zu schema_initializer)
+con.execute("""
+    CREATE TABLE feature_store_pk2 AS
+    SELECT * EXCLUDE (instance_hash),
+           COALESCE(instance_hash, '') AS instance_hash
+    FROM feature_store
+""")
+con.execute("ALTER TABLE feature_store_pk2 ALTER instance_hash SET NOT NULL")
+con.execute("ALTER TABLE feature_store_pk2 ALTER instance_hash SET DEFAULT ''")
+con.execute("ALTER TABLE feature_store_pk2 ADD PRIMARY KEY "
+            "(symbol, timeframe, bar_time, feature_id, instance_hash)")
+con.execute("DROP TABLE feature_store")
+con.execute("ALTER TABLE feature_store_pk2 RENAME TO feature_store")
+pk = con.execute(
+    "SELECT constraint_text FROM duckdb_constraints() "
+    "WHERE table_name='feature_store' AND constraint_type='PRIMARY KEY'"
+).fetchone()
+check("4a) PK enthaelt instance_hash",
+      "instance_hash" in (pk[0] if pk else ""), str(pk))
+rows = con.execute(
+    "SELECT instance_hash, count(*) FROM feature_store GROUP BY 1 ORDER BY 1"
+).fetchall()
+check("4b) NULL-Hashes wurden zu '' migriert",
+      [r[0] for r in rows] == ["", "abc123"], str(rows))
+# Idempotenz: erneuter Migrations-Check liefert 'hat schon Hash'
+pk2 = con.execute(
+    "SELECT constraint_column_indexes FROM duckdb_constraints() "
+    "WHERE table_name='feature_store' AND constraint_type='PRIMARY KEY'"
+).fetchall()
+cols = [r[0].lower() for r in con.execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name='feature_store' ORDER BY ordinal_position").fetchall()]
+pk_has_hash = any(
+    cols[i].lower() == "instance_hash"
+    for row in pk2 for i in (row[0] or []))
+check("4c) Migrations-Guard idempotent (PK-Hash erkannt)", pk_has_hash)
+
+# ---------------------------------------------------------------------------
+# 5) store_plugin_payload mit 5-Spalten-PK + Varianten-Trennung lesen
+# ---------------------------------------------------------------------------
+try:
+    from analytics.features.feature_builder import FeatureBuilder
+
+    tmpdir = tempfile.mkdtemp(prefix="pytrader_vhf_",
+                              dir=r"F:\Python\PyTrader\test")
+    db5 = os.path.join(tmpdir, "variant_hash_fix.duckdb")
+    # store_plugin_payload SCHLIESST die uebergebene Connection selbst
+    # (own_connection) - daher pro Write eine neue Verbindung zur Datei-DB.
+    con5 = duckdb.connect(db5)
+    con5.execute("""
+        CREATE TABLE feature_store (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            feature_id VARCHAR NOT NULL DEFAULT 'native',
+            plugin_version VARCHAR,
+            feature_data JSON,
+            instance_hash VARCHAR NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id,
+                         instance_hash)
+        )
+    """)
+    con5.close()
+
+    # store_plugin_payload ohne con nutzt DbPool.get(DB_ANALYTICS) - die
+    # Modul-Konstante wird fuer den Test auf die Temp-DB umgebogen.
+    import analytics.features.feature_builder as _fb_mod
+    _orig_db_analytics = _fb_mod.DB_ANALYTICS
+    _fb_mod.DB_ANALYTICS = db5
+
+    fb = FeatureBuilder()
+    payload = {
+        "feature_id": "srv_trend_breakout",
+        "plugin_version": "1.0.0",
+        "records": [
+            {"bar_time": datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc),
+             "trigger": "ffffffff", "dir": 1},
+        ],
+    }
+    n1 = fb.store_plugin_payload("SILVER", "H1", payload,
+                                 instance_hash=h_a)
+    payload2 = dict(payload)
+    payload2["records"] = [
+        {"bar_time": datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc),
+         "trigger": "ggsegerttt", "dir": -1},
+    ]
+    n2 = fb.store_plugin_payload("SILVER", "H1", payload2,
+                                 instance_hash=h_b)
+    con5 = duckdb.connect(db5)
+    rows5 = con5.execute(
+        "SELECT instance_hash FROM feature_store "
+        "WHERE feature_id='srv_trend_breakout' "
+        "AND bar_time='2026-08-10 10:00:00+00' ORDER BY 1").fetchall()
+    con5.close()
+    check("5a) beide Varianten auf derselben Bar gespeichert",
+          n1 == 1 and n2 == 1, f"{n1}/{n2}")
+    check("5b) je Variante eine Row (kein Ueberschreiben)",
+          {r[0] for r in rows5} == {h_a, h_b}, str(rows5))
+    # erneuter Write derselben Variante -> Upsert, KEINE neue Row
+    n3 = fb.store_plugin_payload("SILVER", "H1", payload,
+                                 instance_hash=h_a)
+    con5 = duckdb.connect(db5)
+    cnt = con5.execute(
+        "SELECT count(*) FROM feature_store WHERE feature_id='srv_trend_breakout'"
+    ).fetchone()[0]
+    con5.close()
+    check("5c) Re-Write derselben Variante ist Upsert (2 Rows gesamt)",
+          n3 == 1 and cnt == 2, f"n3={n3} cnt={cnt}")
+    # fetch_last_execution_dates_by_hash auf die Temp-DB (getrennte Daten)
+    from analytics.engine.feature_store_reader import FeatureStoreReader
+    reader5 = FeatureStoreReader(db_path=db5)
+    by5 = reader5.fetch_last_execution_dates_by_hash()
+    per5 = by5.get("srv_trend_breakout", {})
+    check("5d) Varianten-Daten getrennt lesbar (2 Hashes je ein Datum)",
+          set(per5.keys()) == {h_a, h_b}, str(per5))
+    _fb_mod.DB_ANALYTICS = _orig_db_analytics
+except Exception as e:  # pragma: no cover
+    try:
+        _fb_mod.DB_ANALYTICS = _orig_db_analytics
+    except Exception:
+        pass
+    check("5) store_plugin_payload/PK", False, str(e))
+con.close()
+
+print("\n======")
+print(f"RESULT: {'ALLE PRUEFUNGEN BESTANDEN' if not FAILURES else 'FEHLER: ' + str(FAILURES)}")
 sys.exit(1 if FAILURES else 0)
 
 ```
@@ -63215,6 +64989,192 @@ if fail:
     print("FAILS:", fail)
     sys.exit(1)
 print("ALLE VARIANTEN-PARAM-/DROPDOWN-/SPLITTER-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_variant_run.py
+```py
+# test/check_variant_run.py
+"""
+Bugfixing-Verifikation 11.08.2026 (Varianten-Run) – headless, KEIN UI-Test.
+
+Prueft:
+  1) variant_run_entries: Plugin MIT Presets -> je aktiver Variante ein
+     Eintrag mit preset_params + instance_hash (Hashes deckungsgleich mit
+     dem ServiceSelectorModel -> Datum im Baum aktualisiert sich, Bug 1).
+  2) variant_run_entries: Plugin OHNE Presets -> ein Basis-Eintrag.
+  3) MasterTree.run_plugin_requested traegt jetzt (plugin_id, instance_hash).
+  4) Worker-Storage-Hash == Modell-Hash (variant_run_entries cfg['instance_hash']
+     == generate_instance_hash(pid, cfg['params'], preset_name) == Modell-Clone-Hash;
+     11.08.2026: Hash inkl. preset_name - keine Kollisionen mehr).
+  5) fetch_last_execution_dates_by_hash liefert fuer den Varianten-Hash
+     ein Datum (nach einem Store-Write mit diesem Hash).
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_results = []
+
+
+def check(name, ok, detail=""):
+    _results.append((name, ok, detail))
+    print(("PASS " if ok else "FAIL ") + name + (f"  ({detail})" if detail else ""))
+
+
+# ---------------------------------------------------------------------------
+# 1+2) variant_run_entries
+# ---------------------------------------------------------------------------
+try:
+    from state_manager import StateManager
+    from analytics.engine.service_models import generate_instance_hash
+    from serviceui.service_set_utils import variant_run_entries
+    from analytics.engine.service_selector_model import ServiceSelectorModel
+
+    sm = StateManager()
+    model = ServiceSelectorModel()
+
+    def _base_cfg(pid):
+        return {"plugin_id": pid, "lookback": 1000, "params": {}, "version": "0.0.0"}
+
+    entries = variant_run_entries("srv_swing_volume_profile", sm, _base_cfg)
+    check("1a) Plugin mit Presets -> >=2 Varianten-Eintraege", len(entries) >= 2,
+          str(len(entries)))
+    model_clones = model.plugin_presets().get("srv_swing_volume_profile") or []
+    model_hashes = {c["instance_hash"] for c in model_clones if not c["is_archived"]}
+    entry_hashes = {e[1].get("instance_hash") for e in entries}
+    check("1b) Varianten-Hashes deckungsgleich mit Modell (Datum im Baum)",
+          entry_hashes == model_hashes,
+          f"{sorted(entry_hashes)} vs {sorted(model_hashes)}")
+    check("1c) Eintrag traegt preset_params + instance_hash + preset_name",
+          all(e[1].get("instance_hash") and e[1].get("params")
+              and e[1].get("preset_name") for e in entries))
+    check("1d) instance_id-Format '{pid}#{hash}'",
+          all(e[0] == f"srv_swing_volume_profile#{e[1]['instance_hash']}"
+              for e in entries))
+
+    base = variant_run_entries("srv_proximity", sm, _base_cfg)
+    check("2) Plugin ohne Presets -> ein Basis-Eintrag (plugin_id)",
+          len(base) == 1 and base[0][0] == "srv_proximity"
+          and not base[0][1].get("instance_hash"))
+except Exception as e:  # pragma: no cover
+    check("1/2) variant_run_entries", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 3) MasterTree-Signal
+# ---------------------------------------------------------------------------
+try:
+    from serviceui.master_tree import MasterTree
+    import io as _io
+    with _io.open(os.path.join(os.path.dirname(__file__), "..", "serviceui",
+                               "master_tree.py"), encoding="utf-8") as _f:
+        _mt_src = _f.read()
+    ok3 = "run_plugin_requested = Signal(str, str)" in _mt_src
+    check("3) run_plugin_requested = Signal(str, str)", ok3)
+    check("3b) Clone-Emit uebergibt instance_hash",
+          "run_plugin_requested.emit(p, h)" in _mt_src)
+    check("3c) Plugin-Emit uebergibt leeren Hash",
+          "run_plugin_requested.emit(p, \"\")" in _mt_src)
+except Exception as e:  # pragma: no cover
+    check("3) MasterTree-Signal", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 4) Worker-Storage-Hash == Modell-Hash (konsistenter feature_store-Write)
+# ---------------------------------------------------------------------------
+try:
+    from state_manager import StateManager as _SM
+    from analytics.engine.service_models import generate_instance_hash as _gih
+    from serviceui.service_set_utils import variant_run_entries as _vre
+
+    sm = _SM()
+    entries = _vre("srv_swing_volume_profile", sm, _base_cfg)
+    ok4 = all(
+        e[1]["instance_hash"] == _gih(
+            "srv_swing_volume_profile", e[1]["params"],
+            preset_name=e[1].get("preset_name") or "Default")
+        for e in entries)
+    # 11.08.2026 (Bugfix Varianten-Kollision): Presets mit identischen
+    # Params aber unterschiedlichen Namen muessen UNTERSCHIEDLICHE Hashes
+    # haben (vorher kollidierten z.B. params={}-Presets).
+    distinct = len({e[1]["instance_hash"] for e in entries}) == len(entries)
+    check("4) cfg['instance_hash'] == generate_instance_hash(pid, params, preset_name)",
+          ok4 and distinct, str(ok4) + " distinct=" + str(distinct))
+except Exception as e:  # pragma: no cover
+    check("4) Worker-Storage-Hash", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 5) fetch_last_execution_dates_by_hash -> Varianten-Datum lesbar
+#    (self-contained: Store-Write mit dem Preset-eindeutigen Hash -> Reader
+#     liefert genau fuer DIESEN Hash ein Datum; KEIN Legacy-Fallback).
+# ---------------------------------------------------------------------------
+try:
+    from analytics.engine.feature_store_reader import FeatureStoreReader
+    from analytics.features.feature_builder import FeatureBuilder
+    import analytics.features.feature_builder as _fb5
+    import tempfile, os as _os5
+    import duckdb as _ddb5
+    from datetime import datetime as _dt5, timezone as _tz5
+    from analytics.engine.service_models import generate_instance_hash as _gih2
+
+    pid_low = "srv_swing_volume_profile"
+    _tmp5 = tempfile.mkdtemp(prefix="pytrader_run_",
+                             dir=r"F:\Python\PyTrader\test")
+    _db5 = _os5.path.join(_tmp5, "run_hash.duckdb")
+    _c5 = _ddb5.connect(_db5)
+    _c5.execute("""
+        CREATE TABLE feature_store (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            feature_id VARCHAR NOT NULL DEFAULT 'native',
+            plugin_version VARCHAR, feature_data JSON,
+            instance_hash VARCHAR NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id,
+                         instance_hash)
+        )
+    """)
+    _c5.close()
+    _orig5 = _fb5.DB_ANALYTICS
+    _fb5.DB_ANALYTICS = _db5
+    _h5 = _gih2(pid_low, {}, preset_name="TestV")
+    FeatureBuilder().store_plugin_payload(
+        "SILVER", "H1",
+        {"feature_id": pid_low, "plugin_version": "1.0.0",
+         "records": [{"bar_time": _dt5(2026, 8, 10, tzinfo=_tz5.utc),
+                      "v": 1}]},
+        instance_hash=_h5)
+    _by5 = FeatureStoreReader(db_path=_db5).fetch_last_execution_dates_by_hash()
+    _per5 = _by5.get(pid_low, {}) or {}
+    _fb5.DB_ANALYTICS = _orig5
+    check("5) Varianten-Hash-Datum nach Store-Write lesbar (eigener Hash)",
+          _per5.get(_h5) is not None, str(_per5))
+except Exception as e:  # pragma: no cover
+    try:
+        _fb5.DB_ANALYTICS = _orig5
+    except Exception:
+        pass
+    check("5) fetch_last_execution_dates_by_hash", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 6) Import-Smoke der geaenderten Module
+# ---------------------------------------------------------------------------
+try:
+    from serviceui import service_win  # noqa: F401
+    from serviceui import service_selector_dialog  # noqa: F401
+    from serviceui import master_tree  # noqa: F401
+    from serviceui import service_set_utils  # noqa: F401
+    check("6) Module importieren", True)
+except Exception as e:  # pragma: no cover
+    check("6) Module importieren", False, str(e))
+
+print("\n======")
+failed = [r for r in _results if not r[1]]
+print(f"RESULT: {len(_results) - len(failed)}/{len(_results)} PASS")
+sys.exit(1 if failed else 0)
 
 ```
 

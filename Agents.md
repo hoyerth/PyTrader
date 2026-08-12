@@ -4,9 +4,9 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 
 ---
 
-### 0. WICHTIG: `docs/x_Exports.md` BITTE NICHT BEACHTEN
-- **`docs/x_Exports.md` ist KEIN Bestandteil des offiziellen Quellcodes.** Es ist ein reiner, vom Benutzer erzeugter Export-/Clone der Projektdateien zu Dokumentationszwecken (mehrfach kopierte/veraltete Codeduplikate).
-- **Niemals** `docs/x_Exports.md` als Quelle für Code, Logik oder Dateistruktur verwenden, durchsuchen oder daraus Änderungen ableiten. Es spiegelt NICHT den aktuellen Stand des Quellcodes wider.
+### 0. WICHTIG: `docs/exports/` BITTE NICHT BEACHTEN
+- **Der gesamte Ordner `docs/exports/` (inkl. `export_Full.md`, `export_core_app.md`, `export_service_engine.md`, `export_analytics.md`, `export_chart_engine.md`, `export_data_layer.md`, `export_analytics_engine.md`, `export_ui_windows.md`, `export_project_docs.md`, `export_rest.md`, ...) ist KEIN Bestandteil des offiziellen Quellcodes.** Es handelt sich um reine, vom Benutzer erzeugte Export-/Clone-Dateien der Projektquellen zu Dokumentationszwecken (mehrfach kopierte/veraltete Codeduplikate).
+- **Niemals** Dateien aus `docs/exports/` (und auch nicht die alte `docs/x_Exports.md`) als Quelle für Code, Logik oder Dateistruktur verwenden, durchsuchen oder daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Quellcodes wider.
 - Verbindlich sind ausschließlich die echten Projektdateien (z. B. `main.py`, `chart/chart_win.py`, `chart/js/*.js`, `chart/chart_basics.py`, `db_service.py`, `state_manager.py`, ...).
 
 ### 0c. WICHTIG: `docs/AKTUELLE_UMSETZUNG.md` = HAUPTANWEISUNG FÜR UMSETZUNGEN
