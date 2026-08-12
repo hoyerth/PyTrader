@@ -110,6 +110,12 @@ class ChartBridge(QObject):
     measurementChanged = Signal(str)
     olderDataRequested = Signal(int, int, int, int)
     jumpToLiveRequested = Signal()
+    # Phase 21.03 (MTF-FC v4): Viewport-Epochs für die Kaskaden-Engine,
+    # interaktive TF-Badges und Geister-Marker (21.03.08/21.03.09).
+    viewportChanged = Signal(int, int)
+    badgeClicked = Signal(str, bool)
+    ghostMarkerClicked = Signal(float, str)
+    guardOverrideReset = Signal()
 
     @Slot(float, float, float)
     def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
@@ -126,6 +132,21 @@ class ChartBridge(QObject):
 
     @Slot()
     def onJumpToLive(self): self.jumpToLiveRequested.emit()
+
+    @Slot(int, int)
+    def onViewportChanged(self, from_epoch, to_epoch):
+        self.viewportChanged.emit(from_epoch, to_epoch)
+
+    @Slot(str, bool)
+    def onBadgeClick(self, tf, ctrl):
+        self.badgeClicked.emit(tf, ctrl)
+
+    @Slot(float, str)
+    def onGhostMarkerClick(self, price, target_tf):
+        self.ghostMarkerClicked.emit(price, target_tf)
+
+    @Slot()
+    def onGuardOverrideReset(self): self.guardOverrideReset.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -309,6 +330,16 @@ class PyTraderChartWindow(QMainWindow):
         self._js_window_first_real: Optional[int] = None
         self._js_window_last_real: Optional[int] = None
 
+        # Phase 21.03 (MTF-FC v4): Data Provider + Boundary + isolierter
+        # Namespace (Schicht 2, 21.03.01/02). Die Engine-Module sind reine
+        # Logik; die UI greift NIE direkt auf shared_state zu, sondern über
+        # den Provider (MVVM, Grundsatz 4). Der Namespace ist fenster-lokal.
+        self.mtf_fc_provider: MtfFcProvider = MtfFcProvider()
+        self.mtf_fc_boundary: MtfFcBoundary = MtfFcBoundary(provider=self.mtf_fc_provider)
+        self._mtf_fc_context = None  # PluginContext wird lazy je Aufruf erzeugt
+        self._mtf_fc_ns: Dict[str, Any] = default_mtf_fc_state()
+        self._mtf_fc_last_viewport: Optional[Tuple[int, int]] = None
+
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
         matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
@@ -449,6 +480,20 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
+        # Phase 21.03 (MTF-FC v4): Filterleiste (21.03.07) in die Toolbar
+        # einsetzen (nach row2). MVVM: Das Widget enthält KEIN SQL und
+        # kommuniziert ausschliesslich über Signale (Grundsatz 4/5).
+        self.mtf_filter_bar: MtfFilterBarWidget = MtfFilterBarWidget(
+            provider=self.mtf_fc_provider)
+        toolbar_layout = self.ui_widget.findChild(QVBoxLayout, "verticalLayout_toolbar")
+        if toolbar_layout is not None:
+            toolbar_layout.addWidget(self.mtf_filter_bar)
+        self.mtf_filter_bar.data_tf_changed.connect(self._on_mtf_fc_data_tf_changed)
+        self.mtf_filter_bar.chart_tf_changed.connect(self._on_mtf_fc_chart_tf_changed)
+        self.mtf_filter_bar.range_changed.connect(self._on_mtf_fc_range_changed)
+        self.mtf_filter_bar.guard_override_requested.connect(self._on_mtf_fc_guard_override_requested)
+        self.mtf_filter_bar.refresh_templates()
+
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
         self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -468,6 +513,11 @@ class PyTraderChartWindow(QMainWindow):
         # Live-Ende („Live"-Button).
         self.bridge.olderDataRequested.connect(self._on_older_data_requested)
         self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
+        # Phase 21.03 (MTF-FC v4): Kaskaden-/Layer-Signale (21.03.08/09).
+        self.bridge.viewportChanged.connect(self._on_mtf_fc_viewport_changed)
+        self.bridge.badgeClicked.connect(self._on_mtf_fc_badge_clicked)
+        self.bridge.ghostMarkerClicked.connect(self._on_mtf_fc_ghost_marker_clicked)
+        self.bridge.guardOverrideReset.connect(self._on_mtf_fc_guard_reset)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -990,6 +1040,9 @@ class PyTraderChartWindow(QMainWindow):
             # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
             # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
             "hasMoreHistory": self.chart_buffer.has_more_history,
+            # Phase 21.03 (MTF-FC v4): Kaskaden-/Boundary-State für die
+            # JS-Hooks (Breadcrumb, Boundary-UI, Layer-Badges).
+            "mtfFcState": self._mtf_fc_js_state(),
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -1568,6 +1621,220 @@ class PyTraderChartWindow(QMainWindow):
         if not self._is_loading_data:
             self.measurement_state = json.loads(m) if m else None
             self.save_state()
+
+    # ======================================================================
+    # Phase 21.03 – MTF-FC v4 (Kaskade, Boundary, Guards, Filterleiste)
+    # ======================================================================
+
+    def _mtf_fc_js_state(self) -> Dict[str, Any]:
+        """Baut den JS-freundlichen MTF-FC-State für das Update-Payload.
+
+        Keys sind camelCase (JS-Hooks in 07/08) und werden aus dem fenster-
+        lokalen Namespace abgeleitet. `m1_available_from` wird über den
+        Boundary-Resolver live ermittelt (21.03.02)."""
+        hb = dict(self._mtf_fc_ns.get("history_boundaries") or {})
+        try:
+            boundary = self.mtf_fc_boundary.evaluate_coverage(
+                self.current_symbol,
+                self._mtf_fc_last_viewport[0] if self._mtf_fc_last_viewport else None,
+            )
+            hb["m1_available_from"] = boundary.get("m1_available_from")
+            hb["coverage_status"] = boundary.get("coverage_status")
+            hb["source_tf"] = boundary.get("source_tf")
+        except Exception as e:
+            print(f"⚠️ [MTF-FC] Boundary-Evaluierung fehlgeschlagen: {e}")
+        cascade = self._mtf_fc_ns.get("cascade_state") or {}
+        override = self._mtf_fc_ns.get("temporary_guard_override") or {}
+        return {
+            "activeChartTf": self.current_tf,
+            "activeDataTf": self._mtf_fc_ns.get("active_data_tf") or "M15",
+            "historyBoundaries": hb,
+            "transitionStartedAt": cascade.get("transition_started_at", 0.0),
+            "rangeDays": cascade.get("range_days", 0.0),
+            "temporaryGuardOverride": {
+                "active": bool(override.get("active")),
+                "previousDataTf": override.get("previous_data_tf"),
+                "targetTf": override.get("target_tf"),
+                "reason": override.get("reason"),
+            },
+        }
+
+    def _on_mtf_fc_viewport_changed(self, from_ts: int, to_ts: int) -> None:
+        """Kaskaden-Trigger: JS meldet die Viewport-Kanten (Wanduhr-Epochs).
+
+        Ruft die Hysterese-Engine (21.03.03) auf. Bei Zoom-Out/-In über die
+        Schwellwerte und bestandener Transition-Guard-Periode wird der
+        Chart-TF gewechselt (`tf_combo`-Sync + Refresh)."""
+        if self._is_loading_data:
+            return
+        try:
+            from_ts, to_ts = int(from_ts), int(to_ts)
+            self._mtf_fc_last_viewport = (from_ts, to_ts)
+            ns = self._mtf_fc_ns
+            cascade = ns.setdefault("cascade_state", {})
+
+            # Boundary (21.03.02) in den Namespace übernehmen (Level 1).
+            boundary = self.mtf_fc_boundary.evaluate_coverage(
+                self.current_symbol, from_ts)
+            ns["history_boundaries"] = {
+                "m1_available_from": boundary.get("m1_available_from"),
+                "coverage_status": boundary.get("coverage_status"),
+                "source_tf": boundary.get("source_tf"),
+            }
+            if boundary.get("coverage_status") == "fallback":
+                # Ebene 1 – Hard Data Availability Guard: Fallback-TF erzwingen.
+                source_tf = boundary.get("source_tf") or "H1"
+                if source_tf != self.current_tf:
+                    print(f"⚠️ [MTF-FC] Fallback-Guard: {self.current_tf} -> {source_tf}")
+                    self._mtf_fc_switch_tf(source_tf)
+                return
+
+            # Auto-Kaskade (21.03.03): Kandidat aus Viewport-Breite.
+            cascade["current_tf"] = self.current_tf
+            result = evaluate_cascade(from_ts, to_ts, self.current_tf, cascade)
+            cascade["candidate_tf"] = result["candidate_tf"]
+            cascade["direction"] = result["direction"]
+            cascade["range_days"] = result["range_days"]
+
+            candidate = result["candidate_tf"]
+            if candidate is None:
+                return
+            # Transition Guard: Umschalten erst nach CROSSFADE-Zeit.
+            if not transition_guard_ok(cascade):
+                return
+            if candidate != self.current_tf:
+                telemetry = apply_transition(
+                    cascade, candidate, result["direction"],
+                    result["range_days"])
+                print(f"[MTF-FC] Kaskade: {telemetry}")
+                self._mtf_fc_switch_tf(candidate)
+        except Exception as e:
+            print(f"⚠️ [MTF-FC] Kaskaden-Trigger fehlgeschlagen: {e}")
+
+    def _mtf_fc_switch_tf(self, new_tf: str) -> None:
+        """Wechselt den Chart-TF konsistent (tf_combo-Sync + Refresh).
+
+        Setzt `current_tf` und synchronisiert die ComboBox, damit die
+        bestehende `on_tf_changed`-Logik (Zustand laden, Refresh) sauber
+        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt."""
+        new_tf = str(new_tf or "").upper()
+        if not new_tf or new_tf == self.current_tf:
+            return
+        if self.tf_combo is not None:
+            idx = self.tf_combo.findText(new_tf)
+            if idx < 0:
+                self.tf_combo.addItem(new_tf)
+                idx = self.tf_combo.findText(new_tf)
+            if idx >= 0:
+                self.tf_combo.blockSignals(True)
+                self.tf_combo.setCurrentIndex(idx)
+                self.tf_combo.blockSignals(False)
+        self.current_tf = new_tf
+        self._update_window_title()
+        self.refresh_chart_data()
+
+    def _on_mtf_fc_data_tf_changed(self, data_tf: str) -> None:
+        """Filterleiste: Source-Data-TF geändert (multi | fixiert)."""
+        self._mtf_fc_ns["active_data_tf"] = data_tf
+        # Ebene 3 (Fixed Data-TF Guard): Fixierter Data-TF begrenzt den
+        # Chart-TF nach oben (nie höher als das Data-TF).
+        if data_tf and str(data_tf).lower() != "multi":
+            if self.current_tf is not None:
+                from analytics.engine.mtf_fc_guards import _tf_rank
+                if _tf_rank(self.current_tf) > _tf_rank(data_tf):
+                    print(f"⚠️ [MTF-FC] Fixed-Guard: Chart-TF {self.current_tf} "
+                          f"-> {data_tf} (Data-TF fixiert)")
+                    self._mtf_fc_switch_tf(data_tf)
+
+    def _on_mtf_fc_chart_tf_changed(self, mode: str) -> None:
+        """Filterleiste: Chart-Overlay-Modus ('auto' | 'fix')."""
+        self._mtf_fc_ns["chart_tf_mode"] = mode
+
+    def _on_mtf_fc_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
+        """Filterleiste: Range-Preset -> Viewport im Namespace + JS-Sync."""
+        self._mtf_fc_ns["viewport_range"] = {"from_ts": from_ts, "to_ts": to_ts}
+        self._mtf_fc_last_viewport = (int(from_ts), int(to_ts))
+        # JS-Viewport auf das Preset-Fenster setzen (sofern Chart geladen).
+        try:
+            self.web_view.page().runJavaScript(
+                "if(window._mtfFcApplyRange) _mtfFcApplyRange("
+                f"{int(from_ts)}, {int(to_ts)});")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _on_mtf_fc_badge_clicked(self, tf: str, ctrl: bool) -> None:
+        """Interaktives TF-Badge (21.03.09): Klick filtert auf diesen TF.
+
+        Strg+Klick = Multi-Select (in dieser Version: zusätzliches Setzen
+        des aktiven TF im Namespace, ohne harten Wechsel)."""
+        tf = str(tf or "").upper()
+        if not tf:
+            return
+        if ctrl:
+            # Multi-Select: TF dem Namespace-Vektor hinzufügen (kein Wechsel).
+            multi = self._mtf_fc_ns.setdefault("multi_select_tfs", [])
+            if tf not in multi:
+                multi.append(tf)
+            return
+        self._mtf_fc_switch_tf(tf)
+
+    def _on_mtf_fc_ghost_marker_clicked(self, price: float, target_tf: str) -> None:
+        """Geister-Marker-Klick (21.03.09): Ebene-2-Guard-Override.
+
+        Startet den Temporary Override (previous_data_tf = aktives Data-TF)
+        und wechselt auf den Ziel-TF (z. B. D1). Der Reset stellt exakt den
+        vorherigen Data-TF wieder her (21.03.05)."""
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            price = 0.0
+        target_tf = str(target_tf or "D1").upper()
+        ns = self._mtf_fc_ns
+        override = ns.setdefault("temporary_guard_override", {})
+        current_data_tf = str(ns.get("active_data_tf") or "M15")
+        start_override(override, current_data_tf, target_tf, "ghost_marker_click")
+        print(f"[MTF-FC] Guard-Override: Data-TF {current_data_tf} "
+              f"-> temporär {target_tf}")
+        # Override-UI (Reset-Badge) an JS schicken.
+        self._push_mtf_fc_override_ui()
+        self._mtf_fc_switch_tf(target_tf)
+
+    def _on_mtf_fc_guard_override_requested(self, target_tf: str, reason: str) -> None:
+        """Filterleiste: Override angefordert (z. B. Geister-Marker)."""
+        self._on_mtf_fc_ghost_marker_clicked(0.0, target_tf)
+
+    def _on_mtf_fc_guard_reset(self) -> None:
+        """Reset-Badge-Klick: Override zurücksetzen, previous_data_tf wiederherstellen."""
+        ns = self._mtf_fc_ns
+        override = ns.setdefault("temporary_guard_override", {})
+        if not override.get("active"):
+            return
+        restored = reset_override(override)
+        print(f"[MTF-FC] Guard-Reset: Data-TF wiederhergestellt -> {restored}")
+        ns["active_data_tf"] = restored
+        # Filterleisten-State synchronisieren (falls vorhanden).
+        fb = getattr(self, "mtf_filter_bar", None)
+        if fb is not None:
+            fb.apply_namespace_state(self)
+        self._push_mtf_fc_override_ui()
+        if restored and str(restored).lower() != "multi":
+            self._mtf_fc_switch_tf(restored)
+
+    def _push_mtf_fc_override_ui(self) -> None:
+        """Sendet den Override-Zustand an die JS-Layer (Reset-Badge)."""
+        ns = self._mtf_fc_ns
+        override = ns.get("temporary_guard_override") or {}
+        try:
+            self.web_view.page().runJavaScript(
+                "if(window.renderMtfLayers) renderMtfLayers("
+                + json.dumps({
+                    "badges": [],
+                    "ghostMarkers": [],
+                    "overrideActive": bool(override.get("active")),
+                    "overrideTargetTf": override.get("target_tf"),
+                }) + ");")
+        except (RuntimeError, AttributeError):
+            pass
 
     def save_state(self):
         if not self.state_manager or self._is_loading_data: return

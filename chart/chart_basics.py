@@ -41,6 +41,11 @@ JS_FILES = [
     # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
     # werden (hängt sich über optionale Hooks in 04 ein).
     "06_two_tier.js",
+    # Phase 21.03 (MTF-FC v4): Zoom-Kaskade, Puls-Breadcrumb, Boundary-UI
+    # (07) und interaktive TF-Badges & Geister-Marker (08). Beide hängen
+    # sich über optionale Hooks in 04 ein (Muster 06_two_tier.js).
+    "07_mtf_fc.js",
+    "08_mtf_layers.js",
 ]
 
 

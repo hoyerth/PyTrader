@@ -359,6 +359,10 @@ function applyFullChartUpdate(data) {
         // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
         // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
         try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
+        // P21.03 (MTF-FC, 08/12): State-Reset für Kaskade/Boundary/Layer.
+        // Muster 06_two_tier.js – optionaler Hook, kein Umbau des Kern-Pfads.
+        try { if (window._onMtfFcFullUpdate) window._onMtfFcFullUpdate(data); } catch(e) {}
+        try { if (window._onMtfLayersFullUpdate) window._onMtfLayersFullUpdate(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -380,6 +384,8 @@ function applyFullChartUpdate(data) {
                     // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
                     // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
                     try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
+                    // P21.03 (MTF-FC): Kaskaden-Trigger (Zoom -> Python).
+                    try { if (window._onMtfFcVisibleRangeChanged) window._onMtfFcVisibleRangeChanged(); } catch(e) {}
                 }
             });
 
