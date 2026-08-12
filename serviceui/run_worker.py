@@ -64,6 +64,8 @@ class ServiceRunWorker(QThread):
         tf_started(str)       – Timeframe-Start (21.01b, Pill-Strip-Laufzeit).
         tf_finished(str, int, bool) – Timeframe fertig: tf, geschriebene
                                 Rows, ob OHLCV-Daten vorhanden waren.
+        service_progress(str, str, int, int) - Per-Service-Fortschritt:
+                                tf, instance_id, erledigte Services, Gesamt.
     """
 
     log_message = Signal(str)
@@ -71,6 +73,8 @@ class ServiceRunWorker(QThread):
     run_failed = Signal(str, str)
     tf_started = Signal(str)
     tf_finished = Signal(str, int, bool)
+    # 12.08.2026 (User-Meldung 2): Per-Service-Fortschritt.
+    service_progress = Signal(str, str, int, int)
 
     def __init__(self, evaluator, symbol: str, timeframe: str,
                  set_definition: Dict[str, Any],
@@ -196,7 +200,9 @@ class ServiceRunWorker(QThread):
             f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
         if hasattr(self.evaluator, "execute_set_resilient"):
             results = self.evaluator.execute_set_resilient(
-                definition, df_plugin, context=context)
+                definition, df_plugin, context=context,
+                progress_callback=lambda iid, pos, total: (
+                    self.service_progress.emit(tf, iid, pos, total)))
         else:
             results = self.evaluator.execute_set(definition, df_plugin,
                                                  context=context)

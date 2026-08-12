@@ -9,7 +9,7 @@ entfernt – es gibt keine Signal-Engine mehr.
 """
 
 from dataclasses import replace
-from typing import Any, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 import threading
 import time
 import traceback
@@ -231,6 +231,7 @@ class ServiceSetEvaluator:
         set_definition: Dict[str, Any],
         df: pd.DataFrame,
         context: Optional[PluginContext] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """Führt die Service-Pipeline elastisch aus (P14-03) – Ablösung des
         strikten Fail-Fast-Prinzips (A.3/A.4 des Kapitels):
@@ -294,12 +295,14 @@ class ServiceSetEvaluator:
         with self._execution_lock:
             self.last_skipped.clear()
             self.last_errors.clear()
-            for iid in execution_order:
+            for idx, iid in enumerate(execution_order):
                 # Quarantäne-Skip (Session-Scope, RAM only)
                 if self._is_quarantined(iid):
                     self.last_skipped[iid] = "quarantined"
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"uebersprungen (quarantined)")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 cfg = services[iid]
@@ -318,6 +321,8 @@ class ServiceSetEvaluator:
                         dep_failed = True
                         break
                 if dep_failed:
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Exakter Zuschnitt auf den Service-lookback
@@ -351,6 +356,8 @@ class ServiceSetEvaluator:
                               f"die Session quarantaenisiert (RAM only)")
                     # State-Fallback: alter shared_state-Eintrag (vorherige
                     # Kerze) bleibt unangetastet erhalten.
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
                 except Exception as e:
                     # Sicherheitsnetz: PluginExecutor kapselt eigentlich alle
@@ -374,6 +381,8 @@ class ServiceSetEvaluator:
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"(plugin '{log2['plugin_id']}') fehlgeschlagen: "
                           f"{log2['exception']}")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.
@@ -386,5 +395,7 @@ class ServiceSetEvaluator:
                 if iid not in context.shared_state:
                     context.shared_state[iid] = result
                 results[iid] = result
+                if progress_callback:
+                    progress_callback(iid, idx + 1, len(execution_order))
 
         return results

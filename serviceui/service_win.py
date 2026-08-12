@@ -28,8 +28,8 @@ from PySide6.QtCore import QFile, QIODevice, QSize, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout,
-    QInputDialog, QMenu,
-    QMessageBox, QPushButton, QSplitter, QTextEdit,
+    QInputDialog, QLabel, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QSplitter, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -246,6 +246,22 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
+            # 12.08.2026 (User-Meldung 2): Fortschrittsbalken fuer
+            # Service-Runs unter dem MasterTree (ueber dem Log) - zeigt
+            # je Service den Fortschritt ueber alle Services des
+            # aktuellen Timeframes (ServiceRunWorker.service_progress).
+            self.progress_label = QLabel("")
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setMaximum(0)   # Busy bis zum 1. Wert
+            self.progress_bar.setFixedHeight(16)
+            self.progress_bar.setTextVisible(False)
+            progress_row = QHBoxLayout()
+            progress_row.setSpacing(6)
+            progress_row.addWidget(self.progress_label, 3)
+            progress_row.addWidget(self.progress_bar, 2)
+            progress_widget = QWidget()
+            progress_widget.setLayout(progress_row)
+            right_layout.addWidget(progress_widget, 0)
             # 05.08.2026 (Kleinere Einstellungen, Punkt 5): Das Log wandert
             # UNTER den MasterTree in dieselbe Spalte – seine Breite entspricht
             # damit exakt der Tree-Breite, und das Fenster endet unten exakt
@@ -1113,9 +1129,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker.log_message.connect(self.log)
         self._run_worker.run_finished.connect(self._on_run_worker_finished)
         self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 12.08.2026 (User-Meldung 2): Per-Service-Fortschrittsbalken.
+        self._run_worker.service_progress.connect(self._on_service_progress)
         # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
         self._run_worker.tf_started.connect(self._on_tf_started)
         self._run_worker.tf_finished.connect(self._on_tf_finished)
+        # 12.08.2026: Progress-Reset beim Start (Busy-Modus).
+        self._reset_run_progress("Starte Ausführung ...")
         # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
         self._begin_sync_guard()
         self._run_worker.start()
@@ -1492,6 +1512,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """
         # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
         self._end_sync_guard()
+        self._reset_run_progress()
         self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
                  f"feature_store gespeichert ({scope_id}).")
         # 21.01b: Pill-Strip nach dem Run neu laden (neue Counts/last_run).
@@ -1504,12 +1525,35 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
         self._end_sync_guard()
+        self._reset_run_progress()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
         # 21.01b: Pill-Strip nach Fehler zuruecksetzen + Status neu laden.
         bar = getattr(self, "badge_bar", None)
         if bar is not None:
             bar.set_running(None)
         self._refresh_badge_bar()
+
+    @Slot(str, str, int, int)
+    def _on_service_progress(self, tf: str, iid: str, done: int,
+                             total: int) -> None:
+        """12.08.2026 (User-Meldung 2): Per-Service-Fortschritt anzeigen."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(max(total, 1))
+            bar.setValue(done)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(f"{tf}: {iid} ({done}/{total})")
+
+    def _reset_run_progress(self, label: str = "") -> None:
+        """Setzt den Fortschrittsbalken zurueck (Default: leeres Label)."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(0)
+            bar.setValue(0)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(label)
 
     # -------------------------------------------------------------------------
     # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip)
@@ -2646,7 +2690,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self, "Data Only Löschen",
             f"Berechnete Feature-Daten der Instanz '{label}' "
             f"(#{instance_hash}) dauerhaft löschen?\n\n"
-            "Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
+            "Gelöscht werden ALLE Timeframes (M1-MN1) dieser "
+            "Variante. Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
             "beim nächsten Scan neu berechnet.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
@@ -2659,7 +2704,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
             return
         self.log(f"Feature-Daten gelöscht: {n} Zeilen "
-                 f"(Instanz #{instance_hash}).")
+                 f"(Instanz #{instance_hash}, alle Timeframes).")
         event_bus.service_set_changed.emit()
 
     @Slot(str, str, str, str)
@@ -2712,7 +2757,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self, "Vollständig Löschen",
             f"Instanz '{label}' vollständig löschen?\n\n"
             "Die Instanz wird aus dem Set entfernt UND die berechneten "
-            "Feature-Daten dieser Parameter-Variante werden gelöscht.",
+            "Feature-Daten dieser Parameter-Variante werden gelöscht "
+            "(ALLE Timeframes M1-MN1).",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -2766,7 +2812,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             f"Preset '{preset_name}' von '{plugin_id}' vollständig löschen?"
             f"\n\nDas Preset wird aus indicator_presets entfernt UND die "
             "berechneten Feature-Daten dieser Parameter-Variante werden "
-            "gelöscht.",
+            "gelöscht (ALLE Timeframes M1-MN1).",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
