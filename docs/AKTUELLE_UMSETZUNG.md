@@ -226,7 +226,7 @@ DETACH new_db;
 
 ---
 
-# 21.03 - Bugfix-Runde 12.08.2026 (Service-UI & Heatmap)
+# 21.02.1 – Bugfix-Runde 12.08.2026 (Service-UI & Heatmap)  [ehem. Kap. 21.03]
 
 > Implementierungs-Log (Commit `271a81b`, 12.08.2026): 5 neue User-Meldungen
 > aus dem Bugfixing-Modus (Fortschrittsbalken, Data-Only-Loeschen,
@@ -344,10 +344,10 @@ bestimmt.
 
 ---
 
-# 21.04 - Bugfix-Runde 12.08.2026 (Fortschrittsbalken & TF-Badges)
+# 21.02.2 – Bugfix-Runde 12.08.2026 (Fortschrittsbalken & TF-Badges)  [ehem. Kap. 21.04]
 
 > Implementierungs-Log (Commit `ef81fb0`, 12.08.2026): 2 neue User-Meldungen
-> aus dem Bugfixing-Modus (Folge-Runde zu 21.03):
+> aus dem Bugfixing-Modus (Folge-Runde zu 21.02.1):
 >   1) "Fortschrittsbalken laeuft dauerhaft -> Fehler?"
 >   2) "Data only loeschen: nur in einer Variante alles geloescht (Datum nie),
 >      aber alle TF wird immer noch angezeigt; Fehler bei Kopie 99 (swing volume)"
@@ -433,3 +433,254 @@ sofort; die Pills der uebrigen Varianten zeigen nur noch deren eigene Daten.
 
 **Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
 `config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
+
+---
+
+# 21.03 – Multi-Timeframe Focus & Context (MTF-FC v4)
+
+---
+
+## 🎯 1. Zielstellung & System-Anforderungen
+
+Das MTF-FC-System bietet eine mathematisch und visuell konsistente Multi-Timeframe-Analyse für PyTrader. Es löst Inkongruenzen zwischen Kerzen- und Service-Timeframes, verhindert UI-Flackern beim Zoomen, schützt vor Datenverlusten bei engem Zoom-Fokus und führt den Benutzer transparent durch unvollständige Datenhistorien.
+
+* **Hinweis:** „MTF-FC v4“ ist eine interne Revisionsbezeichnung der Spezifikation (iterativer Entwurfsprozess v1 → v2 → v3 → v4). Es fehlen keine früheren Quellcode-Kapitel; das Modul ordnet sich als Kapitel 21.03 nahtlos nach der DB-Maintenance (21.02) in die Dokumentationsstruktur ein.
+
+---
+
+## 🏗️ 2. Schichten-Architektur & System-Schnittstellen
+
+Das System trennt strikt zwischen drei Funktionsschichten:
+
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  SCHICHT 3: UI- / Chart-Orchestrierung (Frontend & PyLWC)                              │
+│  - MtfFilterBarWidget (Data-TF, Chart-TF, Range, View-Templates, Confluence-Slider)   │
+│  - Hysterese-Engine (Range-Monitoring, Breadcrumb-Puls)                                │
+│  - Interaktive Badges, Geister-Marker & Temporary Guard Override                       │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ (Lese-Pfade & EventBus)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  SCHICHT 2: MTF-FC Data Provider & Partition Manager (Middleware)                    │
+│  - Namespace-Isolierung: shared_state["mtf_fc"] (Active TF, Boundaries, Generation)     │
+│  - Cache-Versionierung: (symbol, timeframe, partition) + source_max_timestamp          │
+│  - Partitioned DuckDB-Reads (fetch_daily_ohlc, fetch_ohlcv_snapshot)                    │
+│  - Precision-Aware Boundary Policy (Native vs. Fallback Flags)                         │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ (Feature Calculate & Pipeline)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  SCHICHT 1: Backend- & Analytics-Engine (Core Infrastructure)                         │
+│  - ServiceSetEvaluator (execute_set_resilient() vs. execute_set() Fail-Fast)           │
+│  - PluginExecutor & PluginContext.shared_state                                         │
+│  - LiveAnalyzer (tail(2)-Evaluation & RAM-State-Buffer)                                │
+│  - SchemaMigrator (Transparente In-Memory-Migration & Rollback-Schutz)                 │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+---
+
+## 🚦 3. Formale State-Machine & Prioritäts-Kette
+
+### 3.1 Zustandstabelle (Data-TF vs. Chart-TF)
+
+| Data-TF (Filter) | Kaskade (Auto) | Resultierendes Chart-TF | System-Verhalten / Guard-Aktion |
+| --- | --- | --- | --- |
+| **🌐 Multi (M1..D1)** | ⚡ Auto | **Dynamisch (M1..D1)** | Standard. Kaskade wählt TF vollautomatisch nach Zoom-Level. |
+| **🔒 Fixiert auf M15** | ⚡ Auto | **$\le$ M15 (M1, M5, M15)** | **Guard aktiv:** Chart-TF schaltet nie höher als M15. Kaskade nach unten erlaubt. |
+| **🔒 Fixiert auf H4** | ⚡ Auto | **$\le$ H4 (M1..H4)** | **Guard aktiv:** Schaltet bei Zoom-Out maximal bis H4. D1-Upgrade gesperrt. |
+| **🔒 Fixiert auf M15** | 🔒 Manuell D1 | **M15 (Forced)** | **Inkongruenz-Warnung:** *"D1-Kerzen nicht möglich, da Data-TF auf M15 fixiert. Kerzen auf M15 gesetzt."* |
+| **Jeder Fix-State** | 📍 Klick Geister-Marker (D1) | **D1 (Temporär)** | **Guard Override:** Temporary Unlock mit Reset-Badge `[ 🌐 Data-TF gelockert ]`. |
+
+### 3.2 Prioritäts-Kette (Konflikt-Hierarchie)
+
+Trifft die Steuerung auf widersprüchliche Eingaben oder Beschränkungen, entscheidet folgende Kette (Ebene 1 gewinnt immer):
+
+1. **Ebene 1 – Hard Data Availability Guard:** Fehlen M1-Daten vor der tatsächlichen Daten-Grenze des Symbols (z. B. für frisch angelegte Symbole oder nach einem partiellen History-Purge), erzwingt das System `coverage_status = "fallback"` mit nächst-höherem TF (z. B. H1). Die Grenze wird dynamisch ermittelt: `m1_available_from = get_earliest_timestamp(symbol, "M1")` (reale SILVER-Daten: M1-Historie ab 2013-06-05). Die Boundary-Policy greift exakt an dem Punkt, an dem das älteste M1-Bar des gewählten Symbols liegt. Eine höhere Aggregationsstufe darf niemals als M1 deklariert werden ($H1 \to M1$ ist strikt verboten).
+2. **Ebene 2 – Temporary User Override (Geister-Marker Klick):** Klickt der Nutzer bei fixiertem `Data-TF = M15` auf einen D1-Geister-Marker, greift die Transaktions-Semantik:
+* `override.active = True`
+* `override.previous_data_tf = "M15"`
+* `override.target_tf = "D1"`
+* Das `Data-TF` wird gelockert und ein Badge `[ 🌐 Data-TF temporär gelockert auf D1 | Reset ]` erscheint. Klick auf *Reset* stellt exakt `previous_data_tf` wieder her.
+
+3. **Ebene 3 – Fixed Data-TF Guard:** Ohne temporären Override erzwingt ein auf M15 fixiertes `Data-TF`, dass das `Chart-TF` maximal M15 oder feiner ist.
+
+4. **Ebene 4 – Auto Cascade:** Standard-Hysterese schaltet den Chart-TF basierend auf der Viewport-Breite.
+
+5. **Ebene 5 – Visual Rendering Preference:** Benutzerdefinierte Farbschemas und Labels.
+
+---
+
+## 🧱 4. Die 3 Architektur-Säulen
+
+### Säule 1: MtfFilterBarWidget & Control-Panel
+
+1. **Steuerungselemente:**
+* **Source-Data-TF:** `🌐 Alle Timeframes` (Multi) vs. `🔒 Fixiert auf [TF]`.
+
+* **Chart-Overlay-TF:** `⚡ Auto (Kaskade)` vs. `🔒 Manuell Fix`.
+
+* **Range-Picker:** Presets (`24h`, `7d`, `30d`, `YTD`) & Benutzerdefiniert.
+
+* **View-Templates (Presets):** Speichern und Laden von kompletten Filter-Konfigurationen. Das `MtfFilterBarWidget` nutzt den bestehenden `SchemaMigrator` (`analytics/engine/schema_migrator.py`), um gespeicherte Preset-JSONs in-memory zu validieren und abwärtskompatibel um neue TFs/Session-Keys zu erweitern (Payload-Key `mtf_fc_schema_version = "1.0.0"`).
+* **Tabellen-Sortierung:** Dropdown für `[ Datum 🠇 ]`, `[ Signal-Stärke 🠇 ]`, `[ TF 🠅 ]`.
+
+2. **Session-Filter & DST-Normalisierung:**
+* Handelssessions (London, New York, Tokio) als Farbbalken im M1/M5-Zoom.
+* **DST-Invariante:** Alle Session-Grenzen werden strikt in **UTC-Epochs** berechnet und erst beim Rendern formatiert (Invariante 7).
+
+3. **Transparente Historien-Anzeige & Boundary Policy:**
+* Anzeigeelement: `ℹ️ M1 verfügbar ab DD.MM.JJJJ`.
+* **Boundary Policy:** Zoomt der Nutzer vor die Verfügbarkeitsgrenze, zeigt der Chart nahtlos H1-Kerzen mit dem Flag `coverage_status = "fallback"` und der Schraffur *"Keine M1-Rohdaten für diesen Zeitraum"* (keine Lücke, kein Absturz).
+
+4. **Confluence-Gewichtung & Normalisierung:**
+* **Formel:** $Score_j = \sum (W_{TF} \cdot Signal_{TF})$ mit vollständigem Gewichtungs-Schema:
+  * $W_{\text{D1}} = 3.0$
+  * $W_{\text{H4}} = 2.5$
+  * $W_{\text{H1}} = 2.0$
+  * $W_{\text{M15/M30}} = 1.5$
+  * $W_{\text{M5}} = 1.2$
+  * $W_{\text{M1}} = 1.0$
+* Die Gewichte fließen **un-normalisiert** in die Summe ein und werden anschließend durch die **Constant-Matrix-Policy / Min-Max-Skalierung** auf das Farb-Intervall $[0.0, 1.0]$ abgebildet.
+* **Constant-Matrix-Policy (Min-Max-Fix):** Ist $\text{max\_score} == \text{min\_score}$, gilt $\text{normalized\_score} = 0.5$ (verhindert Divisionen durch Null).
+* **Volatilitäts-Adaption (Toggle) mit Clamp-Protection:**
+
+$$ratio = \text{clamp}\left(\frac{\text{ATR}_{\text{TF}}}{\text{ATR}_{\text{Current}}}, \, 0.2, \, 5.0\right)$$
+
+Bei $\text{ATR}_{\text{Current}} \le 10^{-6}$ wird die Anpassung deaktiviert ($ratio = 1.0$).
+
+### Säule 2: Smart PyLWC-Zoom-Kaskade & Performance
+
+1. **Hysterese-Schaltlogik & Parameter:**
+* **Haupt-Stufen der Auto-Kaskade:** M1 → M5 → H1 → H4 → D1 (prägnante Stufen gegen visuelles Dauer-Flackern und unnötige Cache-Sprünge bei kleineren Zoom-Bewegungen).
+* **Zoom-Bänder (Auto):**
+  * **Band 1 ($< 2.0$ Tage):** Umschaltung M1 ↔ M5
+  * **Band 2 ($2.0$ bis $10.0$ Tage):** Umschaltung M15 ↔ H1 (Fein-Stufe M15)
+  * **Band 3 ($10.0$ bis $35.0$ Tage):** H4
+  * **Band 4 ($> 35.0$ Tage):** D1
+* **Schwellwerte (Hysterese zwischen den Bändern):**
+  * `ZOOM_OUT_THRESHOLD_M1` = $3.5\text{ Tage}$ ($84.0\text{ h}$) — M1/M5 → H1 (Zoom-Out)
+  * `ZOOM_IN_THRESHOLD_M1` = $2.0\text{ Tage}$ ($48.0\text{ h}$) — H1 → M1/M5 (Zoom-In)
+  * `ZOOM_OUT_THRESHOLD_H4` = $10.0\text{ Tage}$ — H1 → H4 (Grenze Band 2→3)
+  * `ZOOM_OUT_THRESHOLD_H1` = $35.0\text{ Tage}$ — H4 → D1 (Zoom-Out)
+  * `ZOOM_IN_THRESHOLD_H1` = $28.0\text{ Tage}$ — D1 → H4 (Zoom-In)
+* `CROSSFADE_DURATION_MS` = $250\text{ ms}$ (UI-Parameter)
+* **Manueller Modus (`Chart-TF` = 🔒 Fix):** Erlaubt das Erzwingen *jeder* beliebigen Zwischenstufe (z. B. M30 oder H2) – M15/M30/H2 sind nicht verboten, sondern dienen als Fein-Stufen innerhalb der Bänder.
+
+Zoom-Out (Zeitfenster vergrößern):
+   M1/M5 ───( > 3,5 Tage )───> H1 ───( > 10,0 Tage )───> H4 ───( > 35 Tage )───> D1
+
+Zoom-In (Zeitfenster verkleinern):
+   D1   ───( < 28 Tage )───> H4  ───( < 10,0 Tage )───> H1  ───( < 2,0 Tage )───> M1/M5
+
+
+2. **Transition Guard & Telemetrie:**
+* Ein Umschalten erfolgt erst, wenn $\text{now}() - transition\_started\_at \ge \frac{CROSSFADE\_DURATION\_MS}{1000.0}$.
+* Jedes Kaskaden-Event emittiert ein strukturiertes Telemetrie-Log (`trigger`, `from_tf`, `to_tf`, `range_days`).
+* **Puls-Breadcrumb:** Transparenter Badge oben rechts im Canvas (`[ ⚡ Kerzen: M5 ]`), der bei Umschaltung kurz hellblau aufleuchtet.
+
+
+3. **RAM-Caching & Event-basierte Invalidierung:**
+* Nutzt vorgepufferte Tages- und Stunden-Snapshots: `fetch_daily_ohlc` = echte SQL-Aggregation über das Wanduhr-Datum (Tages-Ohlc); „Stunden-Snapshot“ = direkte H1-Roh-Bar-Abfrage via `fetch_ohlcv_snapshot(symbol, "H1", limit)` (read-only auf `ohlcv_bars` in `market_data.duckdb`).
+* **Event-Partitionierung bei Late-Arriving Ticks:**
+
+$$affected\_partition = partition(symbol, timeframe, t_{\text{event}})$$
+
+Nachträglich eingehende Ticks invalidieren ausschließlich die RAM-Partition ihrer eigenen Event-Zeit $t_{\text{event}}$, nicht den gesamten Cache.
+
+### Säule 3: Interaktives Layering & Geister-Marker
+
+1. **Interaktive TF-Badges:**
+* Klick auf ein Badge (`[ H4-Swing ]`) filtert die aktuelle Ansicht synchron auf diesen Timeframe.
+* Strg + Klick ermöglicht Multi-Select.
+
+2. **Geister-Marker (Off-Screen Level):**
+* Übergeordnete Level (z. B. D1-Widerstand) außerhalb des Zoom-Blicks werden am Rand des Viewports als verblasster Pfeil gerendert: `▲ D1-Widerstand (27.85)`.
+* Klick löst den Guard-Override nach Ebene 2 aus und animiert den Viewport sanft zum Ziel-Level.
+
+---
+
+## 💾 5. Data-Provider & `shared_state`-Spezifikation
+
+Das System nutzt einen dedizierten, isolierten Namespace unter `PluginContext.shared_state["mtf_fc"]`:
+
+shared_state["mtf_fc"] = {
+    "active_data_tf": "M15",
+    "active_chart_tf": "M5",
+    "viewport_range": {"from_ts": 1785500000, "to_ts": 1785972000},  # ~5,4 Tage
+    "cascade_state": {
+        "current_tf": "M5",
+        "candidate_tf": "H1",
+        "direction": "zoom_out",
+        "transition_started_at": 1785971900.5,
+        "last_transition_at": 1785970000.0,
+        "range_days": 5.4,  # > 3.5 Tage (auslösender Zoom-Out-Bereich)
+    },
+    "history_boundaries": {
+        "m1_available_from": get_earliest_timestamp("SILVER", "M1"),  # dynamisch (real: 2013-06-05)
+        "coverage_status": "fallback",    # "native" | "fallback"
+        "source_tf": "H1",
+    },
+    "cache_generation": 42,
+    "temporary_guard_override": {
+        "active": True,
+        "previous_data_tf": "M15",
+        "target_tf": "D1",
+        "reason": "ghost_marker_click",
+    }
+}
+
+
+---
+
+## 🧼 6. Fehler-Differenzierung & Resilienz-Mapping
+
+Das System differenziert strikt zwischen fünf Fehlerklassen und verknüpft sie mit der bestehenden Backend-Resilienz (`ServiceSetEvaluator`):
+
+                      ┌────────────────────────────────────────┐
+                      │   Eingehender Fehler / Abweichung      │
+                      └───────────────────┬────────────────────┘
+                                          │
+        ┌─────────────────┬───────────────┼───────────────┬────────────────┐
+        ▼                 ▼               ▼               ▼                ▼
+ [ DATA_MISSING ]  [ CACHE_STALE ] [ CACHE_CORRUPT ] [ SERVICE_FAILED ] [ NO_SOURCE ]
+        │                 │               │               │                │
+        ▼                 ▼               ▼               ▼                ▼
+ Boundary-Policy    Kaskade invalid   Cache verwerfen   Bestehender State-   UI-Degraded-
+ (Umschaltung auf   & Partial Re-     & DB-Rebuild      Fallback des        State mit Lade-
+ nächstes TF mit    Load über         anstoßen          ServiceSet-         Hinweis &
+ Fallback-Badge)    Event-Time-                         Evaluators          Retry-Button
+                    Partition                           (RAM-Quarantäne)
+
+---
+
+## 📊 7. Headless-Validierung (`test/test.py`)
+
+Folgende Tests verifizieren das System in `test/test.py` ohne GUI-Ausführung:
+
+1. **Hysterese-Boundary-Test:**
+* Testet exakt die Schwellwerte: $1.99\text{ d} \to M1$, $2.01\text{ d} \to$ kein Wechsel, $3.49\text{ d} \to$ kein Wechsel, $3.51\text{ d} \to H1$.
+
+
+2. **20-fach Anti-Oszillations-Test:**
+* Oszilliert den Viewport 20-mal im Fenster $[1.9\text{ d}, 3.6\text{ d}]$ und verifiziert, dass `transition_started_at` fehlerfreies Schalten garantiert.
+
+
+3. **M1-Historien-Boundary-Test:**
+* Prüft Daten vor der dynamischen M1-Grenze des Symbols (`get_earliest_timestamp(symbol, "M1")`) auf `coverage_status = "fallback"` und `source_tf = "H1"`.
+
+
+4. **State-Machine & Guard-Override-Test:**
+* Fixiert `Data-TF = M15`, simuliert Klick auf D1-Geister-Marker, prüft `previous_data_tf = M15` sowie die korrekte Wiederherstellung nach `Reset`.
+
+
+5. **Constant-Matrix & Weight-Effect-Test:**
+* Prüft, dass eine flache Matrix den Wert $0.5$ liefert und dass $W_{\text{D1}}=3.0$ vor der Min-Max-Skalierung die proportionale Übermacht behält.
+
+
+6. **Late-Arriving Tick Partition-Test:**
+* Injiziert einen historischen Tick ($t_{\text{event}} = \text{vor 5 Tagen}$) und verifiziert, dass exakt die betroffene Zeit-Partition invalidiert wird.
+
+
+7. **Service-Failure-Degradation-Integrationstest:**
+* Validiert, dass drei aufeinanderfolgende Fehler von Service A zur RAM-Quarantäne führen, Service B weiterläuft, Service C `dependency_failed` meldet, der alte `shared_state` erhalten bleibt und `reset()` die Quarantäne aufhebt.
