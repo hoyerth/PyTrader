@@ -469,6 +469,97 @@ class AnalyticsViewModel(QObject):
                        QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
                        QUERY_DISTRIBUTION))
 
+    def set_field_selection(self, field_pairs, update_ids: bool = True) -> None:
+        """Setzt die (Service|Parameter)-Auswahl des 'Feld'-Dropdowns.
+
+        12.08.2026 (Option A, Bug 1/2): Die Feld-Auswahl ist eine explizite
+        Liste von '{service_id}|{key}'-Paaren (effective pairs) - der
+        Reader filtert damit auf PARAMETER-Ebene (field_pairs-WHERE:
+        `feature_data->>key IS NOT NULL` je Service). Leere Liste = kein
+        Paar-Filter (reines feature_ids-Verhalten wie bisher).
+
+        `update_ids=True` (USER-Interaktion, ServicePicker-Sync): Die
+        Services werden aus den Paaren abgeleitet und in `feature_ids`
+        uebernommen (Dropdown und Picker bleiben konsistent; Abwaehlen des
+        letzten Parameters eines Services entfernt ihn aus dem Picker).
+
+        `update_ids=False` (PROGRAMMATISCHER Sync am Ende des
+        Dropdown-Rebuilds): `feature_ids` bleibt UNANGETASTET - der
+        ServicePicker ist die Service-Quelle; Services OHNE numerische
+        Feld-Keys duerfen dadurch nicht stillschweigend aus der Auswahl
+        fallen (nur ihre Paare koennen fehlen).
+
+        Im Gegensatz zu set_feature_ids() wird der Refresh auch bei
+        UNVERAENDERTER Service-Menge ausgeloest, wenn sich die Parameter-
+        Auswahl geaendert hat. Idempotent ohne Aenderung (kein
+        Refresh/Dirty).
+        """
+        pairs = self._normalize_field_pairs(field_pairs)
+        ids = self._pairs_to_feature_ids(pairs)
+        current_pairs = self._params.get("field_selection") or []
+        current_ids = self._params.get("feature_ids") or []
+        pairs_changed = pairs != current_pairs
+        ids_changed = update_ids and ids != current_ids
+        if not pairs_changed and not ids_changed:
+            return
+        self._params["field_selection"] = pairs
+        if ids_changed:
+            self._params["feature_ids"] = ids
+        self._mark_dirty()
+        if ids_changed:
+            # Service-Satz geaendert -> ServicePicker + Feld-Metadaten
+            # (QUERY_FEATURES) synchron nachziehen (identisch zu
+            # set_feature_ids).
+            self.feature_ids_changed.emit()
+            self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+        else:
+            # NUR die Parameter-Auswahl hat sich geaendert -> nur die
+            # generische Heatmap neu aggregieren (Bug 1: An/Abwaehlen
+            # eines Parameters muss die Grafik aendern).
+            self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    @staticmethod
+    def _normalize_field_pairs(value) -> List[str]:
+        """Normalisiert '{service_id}|{key}'-Paare (dedupliziert, getrimmt).
+
+        12.08.2026 (Option A): Eintraege ohne `|` oder mit leerer Service-/
+        Key-Seite werden verworfen. Die Keys bleiben case-sensitiv (JSON-
+        Keys aus den Service-Payloads), die Service-ID wird getrimmt.
+        """
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if not s or "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if sid and key and f"{sid}|{key}" not in out:
+                out.append(f"{sid}|{key}")
+        return out
+
+    @staticmethod
+    def _pairs_to_feature_ids(pairs) -> List[str]:
+        """Leitet die aktiven Service-IDs aus '{service_id}|{key}'-Paaren ab.
+
+        12.08.2026 (Option A): Dedupliziert in Paar-Reihenfolge (die
+        Feld-Dropdown-Item-Reihenfolge bestimmt die ServicePicker-Reihenfolge
+        - konsistent zu _checked_field_service_ids()).
+        """
+        out: List[str] = []
+        for p in pairs or []:
+            s = str(p or "")
+            if "|" not in s:
+                continue
+            sid = s.split("|", 1)[0].strip()
+            if sid and sid not in out:
+                out.append(sid)
+        return out
+
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
         """Normalisiert feature_ids (Liste[str], dedupliziert, getrimmt)."""
@@ -905,6 +996,12 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # 12.08.2026 (Option A, Bug 1/2): Explizite (Service|Parameter)-
+            # Auswahl des 'Feld'-Dropdowns -> der Reader filtert auf
+            # PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer =
+            # kein Paar-Filter (verhalten wie bisher, reiner feature_ids-
+            # Filter). Wird in set_field_selection() gepflegt.
+            base["field_selection"] = p.get("field_selection") or []
             # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
             # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
             # 21.03.12: OR-verknuepft mit `all_timeframes` (data_tf='multi' -
@@ -1113,6 +1210,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (Alt-Payloads ohne den
+        # Key -> leer = kein Paar-Filter, Verhalten wie bisher).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # 20.01 (E5) + Runde 9 (Bug 1): Fehlende Services NUR melden -
         # die IDs bleiben im Filter (kein stilles Kuerzen des restaurierten
         # Filters; die DB liefert fuer unbekannte IDs keine Zeilen).
@@ -1321,6 +1423,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (identisch zu
+        # _apply_profile).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # Runde 9 (Bug 1): Fehlende Services NUR melden, NICHT aus dem
         # Filter entfernen - der Resolver wuerde sonst den restaurierten
         # Filter stillschweigend kuerzen (die DB liefert fuer unbekannte

@@ -374,6 +374,49 @@ class FeatureStoreReader:
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 
+    @staticmethod
+    def _apply_field_pair_filter(
+        field_pairs: Optional[List[str]],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um den (Service|Parameter)-Paar-Filter.
+
+        12.08.2026 (Option A, Bug 1/2): Jedes Paar '{service_id}|{key}'
+        des 'Feld'-Dropdowns wird zu einer OR-Bedingung
+        `LOWER(TRIM(feature_id)) = ? AND json_extract_string(feature_data,
+        '$.key') IS NOT NULL` - der Reader filtert damit auf PARAMETER-Ebene (nur Rows, deren
+        feature_data den gewaehlten JSON-Key des jeweiligen Services
+        wirklich traegt). Identifier-unsichere Keys werden defensiv
+        uebersprungen (kein SQL-Injection-Risiko, Muster
+        `_is_json_key_identifier`). Leere/None-Liste = kein Filter.
+        """
+        if not field_pairs:
+            return
+        clauses: List[str] = []
+        for pair in field_pairs:
+            s = str(pair or "")
+            if "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if not sid or not key or not FeatureStoreReader._is_json_key_identifier(key):
+                continue
+            # 12.08.2026 (Option A): `json_extract_string(..., '$.key')` statt
+            # `feature_data->>'key'` - der DuckDB-Arrow-Operator kollidiert in
+            # Kombination mit LOWER/TRIM-Equalities mit einem Optimizer-Bug
+            # (v1.5.5: versucht die JSON-Spalte auf numerisch/BOOL zu casten
+            # und wirft fuer nicht-matchende Zeilen). json_extract_string
+            # liefert NULL fuer fehlende Keys (identische Semantik) und ist
+            # sowohl fuer VARCHAR- als auch JSON-Spalten stabil.
+            clauses.append(
+                f"(LOWER(TRIM(feature_id)) = ? AND "
+                f"json_extract_string(feature_data, '$.{key}') IS NOT NULL)")
+            params.append(sid.lower().strip())
+        if clauses:
+            conditions.append("(" + " OR ".join(clauses) + ")")
+
     # 21.03.12 (MTF-FC auf Analytics): Optionaler bar_time-Zeitfilter.
     # Wird von allen Daten-Queries (fetch_rows/fetch_columns/fetch_heatmap/
     # fetch_generic_heatmap) ueber `from_ts`/`to_ts` aufgerufen.
@@ -968,6 +1011,11 @@ class FeatureStoreReader:
         bucket_tf: Optional[str] = None,
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data->>key IS NOT NULL je Service).
+        # Leer/None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -1090,6 +1138,12 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # des 'Feld'-Dropdowns - OR-Bedingung je Paar
+        # (`feature_id = ? AND json_extract_string(feature_data, '$.key')
+        # IS NOT NULL`). Leere Liste = kein Paar-Filter (nur
+        # feature_ids-Filter).
+        self._apply_field_pair_filter(field_pairs, conditions, params)
         self._apply_time_range(from_ts, to_ts, conditions, params)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":

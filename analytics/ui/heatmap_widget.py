@@ -88,7 +88,7 @@ pyqtgraph uebergibt an `tickValues` die ACHSEN-LAENGE in Pixeln (3. Param)
 
 import math
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pyqtgraph as pg
@@ -242,6 +242,35 @@ def _format_heatmap_value(val: Any) -> str:
     if fval == int(fval) and abs(fval) < 1e15:
         return f"{int(fval):,}".replace(",", ".")
     return f"{fval:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_legend_value(val: Any, span: float) -> str:
+    """Formatiert einen Legenden-Schwellwert mit adaptiver Genauigkeit.
+
+    12.08.2026 (Bug 5): Bei kleinen Werte-Spannen kollabierten die
+    Quartil-Schwellen der Legende unter der .2f-Rundung zu identischen
+    Labels ('0.01 - 0.01' war unsinnig). Die Nachkommastellen-Zahl wird
+    aus der Spanne abgeleitet, sodass die 25-%-Schritte (span/4) der
+    Viridis-Legende GARANTIERT unterscheidbar bleiben. Ganzzahlige
+    Schwellen ohne Nachkommastellen werden als Integer ausgegeben
+    ('25'), Bruchwerte ohne Nullen ('0.0125', '0.02').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if span is None or span <= 0:
+        decimals = 2
+    else:
+        step = span / 4.0
+        if step >= 1.0:
+            decimals = 0
+        else:
+            decimals = int(math.ceil(-math.log10(step))) + 1
+            decimals = max(0, min(decimals, 6))
+    return f"{fval:.{decimals}f}".rstrip("0").rstrip(".")
 
 
 class _HeatmapAxis(pg.AxisItem):
@@ -1031,8 +1060,18 @@ class HeatmapWidget(QWidget):
         if self._syncing or self._view_model is None:
             return
         self._reconcile_sammel_checks()
-        ids = self._checked_field_service_ids()
-        self._view_model.set_feature_ids(ids)
+        # 12.08.2026 (Option A, Bug 1/2): Die angehakten Items bestimmen die
+        # (Service|Parameter)-Paare (`set_field_selection`) - An/Abwaehlen
+        # eines Parameters aendert die Grafik auch bei unveraenderter
+        # Service-Menge. Leere Auswahl = kein Paar-Filter (alle Features,
+        # ViewModel-Semantik 15.03-E). Alt-/Test-ViewModel ohne
+        # Parameter-Ebene fallen auf den Service-Pfad zurueck.
+        pairs = self._checked_field_pairs()
+        if hasattr(self._view_model, "set_field_selection"):
+            self._view_model.set_field_selection(pairs)
+        else:
+            ids = self._checked_field_service_ids()
+            self._view_model.set_feature_ids(ids)
 
     def _reconcile_sammel_checks(self) -> None:
         """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
@@ -1124,6 +1163,55 @@ class HeatmapWidget(QWidget):
                 if sid and sid not in ids:
                     ids.append(sid)
         return ids
+
+    def _checked_field_pairs(self) -> List[str]:
+        """(Service|Parameter)-Paare der angehakten Feld-Items (12.08.2026).
+
+        Option A (Bug 1/2): Grundlage des Parameter-Filters
+        (`set_field_selection`). `ALL|<key>` expandiert ueber
+        `self._field_sources[key]` auf ALLE Quellen-Services des Keys,
+        `{service_id}|<key>` liefert genau das Paar. Roh-Keys ohne `|`
+        (Legacy) bleiben aussen vor (tragen keine Service-Zuordnung).
+        Dedupliziert, in Item-Reihenfolge.
+        """
+        pairs: List[str] = []
+        for ud in self._combo_field.checked_data():
+            s = str(ud or "")
+            if s.startswith("ALL|"):
+                key = s.split("|", 1)[1]
+                for sid in (self._field_sources.get(key) or []):
+                    if sid and f"{sid}|{key}" not in pairs:
+                        pairs.append(f"{sid}|{key}")
+            elif "|" in s:
+                sid, key = s.split("|", 1)
+                if sid and f"{sid}|{key}" not in pairs:
+                    pairs.append(f"{sid}|{key}")
+        return pairs
+
+    def _sync_field_selection_to_vm(self) -> None:
+        """Spiegelt die effektive Paar-Auswahl in den ViewModel (12.08.2026).
+
+        Wird am Ende jedes `_rebuild_field_dropdown()` gerufen: Die
+        effektiven (Service|Parameter)-Paare (aus der Dropdown-Auswahl)
+        werden via `set_field_selection` persistiert, damit a) die
+        DEFAULT-Vorbelegung (erster Parameter je aktivem Service) auch die
+        Query steuert (Bug 2) und b) verwaiste/entfernte Paare automatisch
+        bereinigt werden. Nur bei aktivem Service-Filter (feature_ids nicht
+        leer) - ohne Filter (alle Features) bleibt field_selection None und
+        die Heatmap zeigt weiterhin alle Features ohne Paar-Filter.
+        Idempotent via set_field_selection (kein Refresh bei Gleichstand).
+        """
+        if self._view_model is None:
+            return
+        p = self._view_model.params
+        if not (p.get("feature_ids") or []):
+            return
+        if not hasattr(self._view_model, "set_field_selection"):
+            return
+        pairs = self._checked_field_pairs()
+        # update_ids=False: feature_ids (ServicePicker) bleibt die
+        # Service-Quelle - der Sync verkleinert die Service-Auswahl nie.
+        self._view_model.set_field_selection(pairs, update_ids=False)
 
     # ------------------------------------------------------------------
     # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
@@ -1607,21 +1695,62 @@ class HeatmapWidget(QWidget):
                       or self._field_key(self._combo_field.currentData()))
         active_ids = {str(f).strip().lower()
                       for f in (p.get("feature_ids") or [])}
+        # 12.08.2026 (Option A, Bug 1/2): EXPLIZITE (Service|Parameter)-
+        # Auswahl (`field_selection`) gewinnt - sie wird bei Check/Uncheck
+        # persistiert und beim Aggregations-/Restore-Wechsel EXAKT wieder
+        # hergestellt (Bug 2: keine 'alle Parameter'-Vorbelegung mehr; Bug 1:
+        # An/Abwaehlen eines Parameters aendert die Grafik). Ohne explizite
+        # Auswahl greift die DEFAULT-Vorbelegung: bei aktivem Service-Filter
+        # wird je aktivem Service genau der ERSTE Parameter angehakt (fuer
+        # AVG/SUM/MIN/MAX ist genau EIN aktives Hauptfeld sinnvoll), bei
+        # leerem Filter (alle Features) nur der erste Eintrag insgesamt
+        # (Verhalten wie bisher).
+        sel_pairs = [str(x) for x in (p.get("field_selection") or [])]
+        sel_map: Dict[str, Set[str]] = {}
+        for _sp in sel_pairs:
+            if "|" in _sp:
+                _sid, _k = _sp.split("|", 1)
+                sel_map.setdefault(_k, set()).add(_sid.strip().lower())
+        explicit = bool(sel_pairs)
         no_filter = not active_ids
-        # 21.03.15 (Bug 2): Bei leerem Filter (kein feature_ids-Filter)
-        # wird NICHT mehr jede Checkbox angehakt, sondern nur der ERSTE
-        # Parameter vorbelegt (fuer AVG/SUM/MIN/MAX ist genau EIN aktives
-        # Hauptfeld sinnvoll). `_chk` liefert im no_filter-Modus genau
-        # einmal True.
-        first_done = [no_filter]
+        # Default-Vorbelegung: erster Parameter je aktivem Service
+        # (sortierte Key-Reihenfolge aus self._field_keys).
+        first_key_by_service: Dict[str, str] = {}
+        if not explicit and not no_filter:
+            for k in sorted(self._field_keys):
+                for sid in self._field_sources.get(k) or []:
+                    sid_l = sid.strip().lower()
+                    if (sid_l in active_ids
+                            and sid_l not in first_key_by_service):
+                        first_key_by_service[sid_l] = k
+        # no_filter-Semantik: genau der ERSTE Eintrag insgesamt wird
+        # vorbelegt (first_done); alle weiteren folgen `match`.
+        first_done = [no_filter and not explicit]
 
         def _chk(match: bool) -> bool:
-            if no_filter:
-                if first_done[0]:
-                    first_done[0] = False
-                    return True
-                return False
+            if first_done[0]:
+                first_done[0] = False
+                return True
             return match
+
+        def _chk_pair(sid: str, key: str) -> bool:
+            """Check-Vorgabe fuer einen '{sid}|{key}'-Einzel-Eintrag."""
+            sid_l = str(sid).strip().lower()
+            if explicit:
+                # Nur AKTIVE Services: ein Paar eines im ServicePicker
+                # abgewaehlten Services darf nicht angehakt bleiben.
+                return (sid_l in active_ids
+                        and sid_l in sel_map.get(key, ()))
+            return first_key_by_service.get(sid_l) == key
+
+        def _chk_all(key: str, src: List[str]) -> bool:
+            """Check-Vorgabe fuer den 'ALL|<key>'-Sammel-Eintrag."""
+            if explicit:
+                return all(str(s).strip().lower() in active_ids
+                           and str(s).strip().lower() in sel_map.get(key, ())
+                           for s in src)
+            return all(first_key_by_service.get(str(s).strip().lower())
+                       == key for s in src)
 
         try:
             self._combo_field.blockSignals(True)
@@ -1635,31 +1764,32 @@ class HeatmapWidget(QWidget):
                     src = self._field_sources.get(k) or []
                     self._combo_field.add_checkable_item(
                         f"Alle Services / {k}", f"ALL|{k}",
-                        checked=_chk(all(
-                            s.lower() in active_ids for s in src)))
+                        checked=_chk(_chk_all(k, src)))
             if self._field_keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
             for k in sorted(self._field_keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
-                    # Eindeutiger Service: nur angehakt, wenn der Service im
-                    # aktiven Filter liegt (ohne Filter der erste Eintrag).
+                    # Eindeutiger Service: nur angehakt, wenn das
+                    # (Service|Parameter)-Paar aktiv ist (Default: erster
+                    # Parameter; explizit: field_selection).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
-                        checked=_chk(sids[0].lower() in active_ids))
+                        checked=_chk(_chk_pair(sids[0], k)))
                 elif not sids:
                     # Legacy ohne field_sources (roher Key, defensiv).
                     self._combo_field.add_checkable_item(k, k,
-                                                         checked=_chk(True))
+                                                         checked=_chk(False))
                 else:
-                    # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
-                    # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
-                    all_active = all(s.lower() in active_ids for s in sids)
+                    # Shared Key: je Quelle ein Einzel-Eintrag; der Sammel-
+                    # Eintrag deckt die Quellen ab (Q5/XOR), daher nur
+                    # anhaken, solange NICHT alle Quellen des Keys aktiv.
+                    all_checked = _chk_all(k, sids)
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
-                            checked=_chk(sid.lower() in active_ids
-                                         and not all_active))
+                            checked=_chk(_chk_pair(sid, k)
+                                         and not all_checked))
             if prev_field in self._field_keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
@@ -1697,6 +1827,10 @@ class HeatmapWidget(QWidget):
                     self._combo_field.setCurrentIndex(fidx)
             else:
                 self._apply_config()
+        # 12.08.2026 (Option A, Bug 1/2): Effektive Paar-Auswahl in den VM
+        # spiegeln (Default-Vorbelegung materialisieren / verwaiste Paare
+        # bereinigen). Idempotent; kein Refresh bei Gleichstand.
+        self._sync_field_selection_to_vm()
 
     def _render_no_data_items(self) -> None:
         """Rendert die No-Data-Hinweise aus dem Payload-Cache (B4-2/B4-5).
@@ -2309,25 +2443,31 @@ class HeatmapWidget(QWidget):
                 label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            # 21.03.15 (Bug 5): Viridis als halboffene Intervalle [a,b) -
-            # die Schwellen v25/v50/v75/vmax gehoeren exakt zu EINEM
-            # Intervall (keine ueberlappenden Kanten mehr): `< v25`,
-            # `v25..v50`, `v50..v75`, `v75..vmax`, `>= vmax`.
+            # 12.08.2026 (Bug 5): Viridis als OPERATOR-Intervalle. Die
+            # Schwellen v25/v50/v75/vmax werden mit adaptiver Genauigkeit
+            # formatiert (_format_legend_value, Spannen-abhaengige Nach-
+            # kommastellen), damit sie bei kleinen Spannen (z. B. vmin=0.01,
+            # vmax=0.02) NICHT zusammenfallen ('0.01 - 0.01' war unsinnig).
+            # Die Labels sind eindeutige Operator-Angaben (`<`, `<=`,
+            # `>=`) statt Bindestrich-Bereichen.
             span = vmax - vmin
             v25 = vmin + 0.25 * span
             v50 = vmin + 0.50 * span
             v75 = vmin + 0.75 * span
-            fmt = _format_heatmap_value
+            fmt = lambda v: _format_legend_value(v, span)
             self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
                                     "< {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
-                                    "{} - {}".format(fmt(v25), fmt(v50)))
+                                    "{} ≤ x < {}".format(fmt(v25),
+                                                              fmt(v50)))
             self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
-                                    "{} - {}".format(fmt(v50), fmt(v75)))
+                                    "{} ≤ x < {}".format(fmt(v50),
+                                                              fmt(v75)))
             self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
-                                    "{} - {}".format(fmt(v75), fmt(vmax)))
+                                    "{} ≤ x ≤ {}".format(fmt(v75),
+                                                                  fmt(vmax)))
             self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
-                                    ">= {}".format(fmt(vmax)))
+                                    "≥ {}".format(fmt(vmax)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:

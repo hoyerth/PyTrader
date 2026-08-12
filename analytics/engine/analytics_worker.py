@@ -214,6 +214,10 @@ class AnalyticsAsyncWorker(QThread):
                 # date-Raster + optionaler Zeitfilter (Wanduhr-Epochs).
                 bucket_tf=bucket_tf,
                 from_ts=from_ts, to_ts=to_ts,
+                # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-
+                # Auswahl des 'Feld'-Dropdowns -> Reader filtert auf
+                # Parameter-Ebene (feature_data-JSON-Keys je Service).
+                field_pairs=p.get("field_selection") or [],
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None

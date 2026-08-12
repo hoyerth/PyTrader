@@ -228,6 +228,11 @@ class AnalyticsRepository:
         bucket_tf: Optional[str] = None,
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer/
+        # None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -276,6 +281,7 @@ class AnalyticsRepository:
                 instance_hashes=instance_hashes, limit=limit,
                 all_timeframes=all_timeframes,
                 bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
+                field_pairs=field_pairs,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
