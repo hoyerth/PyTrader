@@ -341,3 +341,95 @@ bestimmt.
 
 **Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
 `config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
+
+---
+
+# 21.04 - Bugfix-Runde 12.08.2026 (Fortschrittsbalken & TF-Badges)
+
+> Implementierungs-Log (Commit `ef81fb0`, 12.08.2026): 2 neue User-Meldungen
+> aus dem Bugfixing-Modus (Folge-Runde zu 21.03):
+>   1) "Fortschrittsbalken laeuft dauerhaft -> Fehler?"
+>   2) "Data only loeschen: nur in einer Variante alles geloescht (Datum nie),
+>      aber alle TF wird immer noch angezeigt; Fehler bei Kopie 99 (swing volume)"
+> Verifikation headless (keine UI): `py_compile` (3 Dateien),
+> `test/check_2101b.py` (18/18 PASS), read-only-DB-Check gegen die reale
+> `analytics.duckdb` (Varianten-Hashes von `srv_swing_volume_profile`).
+
+## ?? 1. Punkt 1 - Fortschrittsbalken laeuft dauerhaft
+
+**Meldung:** Der Fortschrittsbalken unter dem MasterTree laeuft dauerhaft
+(kein Fehler, aber endlose Animation).
+
+**Ursache:** `QProgressBar.setMaximum(0)` startet eine **indeterminate
+Busy-Animation**, die nie endet. In `service_win.py` (Init Zeile ~255) und
+`service_selector_dialog.py` (Init Zeile ~453) sowie nach jedem
+`_reset_run_progress()` (`bar.setMaximum(0)`) wurde damit eine Endlos-Animation
+angestossen - unabhaengig von laufenden Service-Runs.
+
+**Fix (beide Dateien):**
+1. **Init:** `setMaximum(0)` ersetzt durch `setRange(0, 1)` + `setValue(0)`
+   (determinate leere Range statt Busy-Loop).
+2. **`_reset_run_progress()`:** `setMaximum(0)` ersetzt durch
+   `setRange(0, 1)` + `setValue(0)`.
+3. `_on_service_progress` setzt beim Run weiterhin die echte Range
+   (`setMaximum(max(total, 1))`) - unveraendert.
+
+Damit ist der Balken ausserhalb von Runs ruhig (leer) und zeigt nur waehrend
+eines echten Service-Runs Fortschritt an.
+
+**Verifikation:** `py_compile` OK; keine `setMaximum(0)`-Aufrufe mehr im Code
+(nur Kommentar-Hinweise in den neuen Kommentaren).
+
+## ?? 2. Punkt 2 - "Data only loeschen": TF-Pills bleiben sichtbar
+
+**Meldung:** Nach "Data only loeschen" einer Variante (Kopie 99 von
+`srv_swing_volume_profile`) wurde das Datum korrekt auf "nie" gesetzt
+(Purge OK), aber ALLE TF-Pills werden weiterhin angezeigt.
+
+**Befund (DB, read-only):** Der Pill-Strip wurde SERVICE-weit geladen:
+`fetch_service_tf_status` (feature_store_reader.py:1327) gruppierte nur nach
+`feature_id`, NICHT nach `instance_hash`. Die Variante 8c21542a (Kopie 99)
+war nach dem Purge aus der DB entfernt, aber die uebrigen Varianten
+(69141755 "Default (Kopie)", 7341c563 "srv_swing 34566") besassen weiterhin
+je ~100k Rows pro TF -> die Pills blieben korrekt (aber verwirrend) sichtbar.
+Antwort auf die User-Frage: Die TFs wurden bisher NICHT je Variante einzeln
+angezeigt.
+
+**Fix (Varianten-Scope):**
+1. `feature_store_reader.py`: `fetch_service_tf_status(plugin_id,
+   instance_hash=None)` - optionaler Hash filtert die Rows exakt auf GENAU
+   diese Variante (`AND LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))`).
+   Ohne Hash bleibt das service-weite Verhalten erhalten (Alt-Caller
+   kompatibel: `analytics_win.py`, `check_2101b.py`).
+2. `service_win.py` + `service_selector_dialog.py`: `_resolve_badge_plugin`
+   umbenannt zu `_resolve_badge_scope` (liefert Tuple
+   `(plugin_id, instance_hash)`):
+   * Clone-Knoten: instance_hash aus dem `service_id`-Slot
+     (MasterTree._emit_selection_details, 20.04 Q7).
+   * Set-/Service-Zeilen: `cfg['instance_hash']` aus der Set-Definition,
+     sonst `generate_instance_hash(plugin_id, params)` (Params-only).
+   * Plugin/Standalone: Hash = None (service-weit, wie bisher).
+3. `_refresh_badge_bar(plugin_id, instance_hash=None)` merkt sich den Hash
+   (`_badge_instance_hash`) und uebergibt ihn an den Reader.
+
+**Effekt:** Nach "Data only loeschen" einer Variante verschwinden ihre TF-Pills
+sofort; die Pills der uebrigen Varianten zeigen nur noch deren eigene Daten.
+
+**Verifikation (read-only, reale DB):**
+* `fetch_service_tf_status(PID)` -> 9 TFs (D1..M5), Summe = alle Varianten.
+* `fetch_service_tf_status(PID, "69141755")` -> 9 TFs, Summe < service-weit
+  (nur eigene ~100k/TF).
+* `fetch_service_tf_status(PID, "8c21542a")` -> **{}** (purged, korrekt leer).
+* `fetch_service_tf_status(PID, "does_not_exist")` -> {} ; leere Parameter -> {}.
+* `test/check_2101b.py` -> 18/18 PASS (Alt-Signatur kompatibel).
+
+## ?? 3. Geaenderte Dateien (Commit `ef81fb0`)
+
+| Datei | Aenderung |
+|---|---|
+| `analytics/engine/feature_store_reader.py` | `fetch_service_tf_status(plugin_id, instance_hash=None)` - Varianten-Filter |
+| `serviceui/service_win.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
+| `serviceui/service_selector_dialog.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
+
+**Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
+`config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
