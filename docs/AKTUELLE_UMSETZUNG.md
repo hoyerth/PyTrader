@@ -974,3 +974,64 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   sind Bestandszustand: Test-DB-Fixtures ohne `instance_hash`-Spalte bzw. Qt-offscreen-
   Geometrie - nicht durch MTF-FC verursacht).
 - **Commit:** `eae1d7b`
+
+## 21.03.14 - Entscheidungen: 3 Anpassungswuensche (Range-Picker, Preset-Rueckbau, Kursluecken) (12.08.2026 20:42, Stand: Analyse & Entscheidung, KEIN Coding)
+
+> **Anwender-Vorgabe (12.08.2026):** Drei Anpassungswuensche an der MTF-FC-Filterleiste
+> (`MtfFilterBarWidget` im AnalyticsWindow) bzw. an der Heatmap-Darstellung wurden
+> analysiert. Stand: Nur Analyse + Entscheidungs-Doku (kein Coding). Umsetzung erst
+> nach explizitem Startschuss des Anwenders (Schritt 5).
+
+### Wunsch 1 - "Benutzerdefiniert"-Range: Von-/Bis-Felder mit Date/Time-Picker (BESTAETIGT)
+
+- **Entscheidung:** Bei benutzerdefiniertem Range werden ZWEI Eingabeboxen "Von" / "Bis"
+  mit Date/Time-Picker-Widget (`QDateTimeEdit` mit `setCalendarPopup(True)`) angezeigt.
+- **Zeitkonvention:** Bedienung als **Berlin-Wanduhr** (MT5-Epochs sind Wanduhr-encoded,
+  Invariante 7) - die Konvertierung muss die Wanduhr-Konvention explizit abbilden
+  (kein stiller OS-TZ-Offset wie bei Qt-Default).
+- **Vorbelegung:** Beim Wechsel auf "Benutzerdefiniert" werden die Picker mit dem
+  aktuellen Zeitraum (letzter gewaehlter Preset; Basis = letzter Datenpunkt
+  `MAX(bar_time)` des `now_provider`, nicht `time.time()`) vorbelegt, nicht leer.
+- **Validierung:** `from_ts <= to_ts` muss sichergestellt werden (Clamp/Swap oder
+  UI-Warnung) - sonst liefert `bar_time BETWEEN f AND t` still leere Ergebnisse.
+- **Backend-Status (bereits vorhanden):** `AnalyticsViewModel.set_range(from_ts, to_ts,
+  preset)` + `FeatureStoreReader._apply_time_range` (`bar_time BETWEEN`, Wanduhr-Epochs)
+  existieren; es fehlen nur UI + Restore. Aktuell wird der Eintrag "Benutzerdefiniert"
+  in `_on_range_changed`/`apply_external_state` (mtf_filter_bar.py) uebersprungen.
+- **UI-Platz:** Zwei Picker muessen platzsparend eingebaut werden (Bug-6-Hintergrund:
+  sizeHint der Leiste darf nicht aufbrechen; ggf. Zeile 2).
+
+### Wunsch 2 - Zusaetzliche Preset-Buttons rueckbauen + `sort_mode` ins Profil (BESTAETIGT)
+
+- **Entscheidung:** Die zusaetzlichen View-Template-Steuerelemente des
+  `MtfFilterBarWidget` ("Preset"-Namensfeld + 💾/📂-Buttons + Template-Combo, Zeile 2)
+  werden ENTFERNT. Die Filter-Konfiguration laeuft ausschliesslich ueber das
+  vorhandene Profil-Management (`AnalyticsProfileRepository`, Sektion `sources` im
+  Profil-Payload, Option-B-Explicit-Save).
+- **Begruendung:** `data_tf`/`agg_tf`/`range_preset`/`range_from`/`range_to` werden
+  bereits pro Profil persistiert (`_current_payload`); `MtfFcTemplateStore` ist nur
+  in-memory (Sitzungs-Scope) und ueberlebt keinen App-Neustart.
+- **Ergaenzung:** `sort_mode` wird ZUSAETZLICH in den Profil-Payload aufgenommen
+  (Sektion `sources`) - bisher laeuft die Sortierung nur ueber
+  `event_bus.mtf_fc_sort_changed` -> `table_page.set_external_sort_mode` (in-memory).
+  Ohne die Aufnahme ginge die Sortier-Auswahl nach dem Template-Rueckbau verloren.
+- **Sessions:** Die Session-Checkboxen (London/New York/Tokio) werden NICHT entfernt -
+  sie koennen zukuenftig wieder wichtig werden (bleiben im Analytics zunaechst
+  unverdrahtet/angezeigt).
+- **Hinweis:** `analytics/engine/mtf_fc_templates.py` wird nach dem Rueckbau toter
+  Code (bleibt gemaess Code-Preserving-Regel erhalten, wird aber nicht mehr aufgerufen).
+
+### Wunsch 3 - Durchgehende Kerzen- & Signalchart ohne Kursluecken (NICHT UMZUSETZEN)
+
+- **Entscheidung:** Wird **NICHT umgesetzt** und es wird **keine Doku** dazu gefuehrt
+  (kein Umsetzungs-Kapitel, kein Implementierungs-Log-Eintrag ueber eine Umsetzung).
+- **Begruendung:** Architektur-Eingriff (kategoriales Heatmap-Grid vs. kontinuierliche
+  Slot-Achse) bzw. neue Chart-Komponente; der Anwender hat den Wunsch nach Rueckfrage
+  zurueckgezogen. Die bestehende Luecken-Darstellung (echte Bar-Epochs, Wochenend-/
+  Handelspausen-Luecken) bleibt unveraendert.
+
+---
+
+- **Status:** Analyse + Entscheidungs-Doku abgeschlossen. KEIN Coding (wird nicht
+  angefasst). Umsetzung der Schritte (1) und (2) erst nach explizitem Startschuss.
+- **Commit:** `(nachgetragen)`
