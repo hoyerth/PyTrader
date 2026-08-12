@@ -97,6 +97,21 @@ class ServiceRunWorker(QThread):
         self.timeframe = timeframe
         self.set_definition = set_definition
         self.instance_id = instance_id
+        # 12.08.2026 (WAL-Korruption beim App-Exit): Abbruch-Flag fuer einen
+        # sauberen Worker-Stopp. Wird nur zwischen zwei DB-Writes geprueft
+        # (Service-Grenzen / Timeframe-Grenzen) - NIE mitten in einem
+        # store_plugin_payload-INSERT, sonst bleibt die WAL inkonsistent.
+        self._abort_requested = False
+
+    def stop(self) -> None:
+        """Fordert einen sauberen Abbruch an (12.08.2026).
+
+        Setzt das Abbruch-Flag. Der Worker beendet sich an der naechsten
+        Service-/Timeframe-Grenze - d. h. nach dem naechsten abgeschlossenen
+        store_plugin_payload-Write. Bereits gespeicherte Payloads bleiben
+        erhalten, die WAL bleibt konsistent (kein Abbruch mitten im INSERT).
+        """
+        self._abort_requested = True
 
     # ------------------------------------------------------------------
     # Ausfuehrungs-Scope (Single vs. Set)
@@ -215,6 +230,11 @@ class ServiceRunWorker(QThread):
         from analytics.engine.service_models import generate_instance_hash
         svc_cfgs = dict(definition.get("services") or {})
         for iid, result in results.items():
+            # 12.08.2026 (WAL-Korruption beim App-Exit): Sauberer Abbruch an
+            # der Service-Grenze - VOR dem naechsten store_plugin_payload.
+            # Bereits geschriebene Payloads dieses Timeframes bleiben intakt.
+            if self._abort_requested:
+                break
             payload = (result or {}).get("feature_store_payload") or {}
             records = payload.get("records") or []
             if not records:
@@ -322,6 +342,13 @@ class ServiceRunWorker(QThread):
             no_data_tfs: List[str] = []
             no_payload_tfs: List[str] = []
             for tf in timeframes:
+                # 12.08.2026 (WAL-Korruption beim App-Exit): Sauberer Abbruch
+                # an der Timeframe-Grenze (nach abgeschlossener Persistenz des
+                # vorherigen Timeframes) - nie mitten in einem DB-Write.
+                if self._abort_requested:
+                    self.log_message.emit("Abbruch angefordert - Ausfuehrung "
+                                          "wird sauber beendet.")
+                    break
                 self.tf_started.emit(tf)
                 try:
                     stored, had_data = self._execute_timeframe(

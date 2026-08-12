@@ -1939,6 +1939,15 @@ class ServiceSelectorDialog(QDialog):
         if lbl is not None:
             lbl.setText(label)
 
+    def closeEvent(self, event) -> None:
+        """12.08.2026 (WAL-Korruption beim App-Exit): Laufenden
+        ServiceRunWorker sauber stoppen, bevor der Dialog schliesst."""
+        worker = getattr(self, "_run_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(5000)
+        super().closeEvent(event)
+
     def _on_tf_started(self, tf: str) -> None:
         """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
         self.badge_bar.set_running(tf)

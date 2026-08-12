@@ -3340,5 +3340,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # PersistentWindow.save_state() wird in super().closeEvent gerufen
         # 05.08.2026: Gezielter Kontextmenue-Run-Worker sauber beenden.
         if self._run_worker and self._run_worker.isRunning():
-            self._run_worker.wait(2000)
+            # 12.08.2026 (WAL-Korruption beim App-Exit): Worker VOR dem
+            # Fenster-Close sauber stoppen - sonst stirbt der Thread mitten
+            # im DB-Write, wenn die App den Prozess beendet (korrupte WAL
+            # beim naechsten Start). stop() setzt nur das Abbruch-Flag; der
+            # Worker beendet sich an der naechsten Service-Grenze.
+            self._run_worker.stop()
+            self._run_worker.wait(5000)
         super().closeEvent(event)
