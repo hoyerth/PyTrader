@@ -1,21 +1,22 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Gesamt-Export (alle Projekt-Quellen)
 
-> Gesamt-Export (alle Projekt-Quellen). Teil-Exporte: export_core_app.md, export_service_engine.md, export_analytics.md, export_chart_engine.md, export_data_layer.md, export_analytics_engine.md, export_ui_windows.md, export_project_docs.md
-> Dateien in dieser Datei: 112
+> Gesamt-Export (alle Projekt-Quellen). Teil-Exporte: export_core_app.md, export_service_engine.md, export_analytics.md, export_chart_engine.md, export_data_layer.md, export_analytics_engine.md, export_ui_windows.md, export_project_docs.md, export_rest.md
+> Dateien in dieser Datei: 124
 
 ## 0. EXPORT-ÜBERSICHT
 
 | Datei | Inhalt | Dateien |
 |---|---|---|
-| export_Full.md | Gesamt-Export (diese Datei) | 112 |
+| export_Full.md | Gesamt-Export (diese Datei) | 124 |
 | export_core_app.md | Core App & Infrastruktur | 6 |
 | export_service_engine.md | Service-UI & Service-Engine | 17 |
 | export_analytics.md | Analytics-UI & Feature Store | 13 |
-| export_chart_engine.md | Chart-Fenster & Lightweight Charts | 22 |
+| export_chart_engine.md | Chart-Fenster & Lightweight Charts | 26 |
 | export_data_layer.md | Datenzugriff, Sync & Repositories | 10 |
 | export_analytics_engine.md | Analytics-Engine, Features & Auswertung | 27 |
 | export_ui_windows.md | Weitere Fenster, Worker & Konfiguration | 15 |
 | export_project_docs.md | Projekt-Dokumentation | 2 |
+| export_rest.md | Rest (automatisch ergaenzt) | 8 |
 
 ## 1. ORDNERSTRUKTUR
 ```
@@ -34,6 +35,14 @@ PyTrader/
             analytics_worker.py
             description_dialog.py
             feature_store_reader.py
+            mtf_fc_boundary.py
+            mtf_fc_cascade.py
+            mtf_fc_confluence.py
+            mtf_fc_guards.py
+            mtf_fc_partition.py
+            mtf_fc_provider.py
+            mtf_fc_state.py
+            mtf_fc_templates.py
             schema_migrator.py
             service_models.py
             service_selector_model.py
@@ -95,11 +104,15 @@ PyTrader/
             04_live_updates.js
             05_measurement.js
             06_two_tier.js
+            07_mtf_fc.js
+            08_mtf_layers.js
+            09_mtf_axis.js
         overlays/
             __init__.py
             style_models.py
         widgets/
             __init__.py
+            mtf_filter_bar.py
             named_item_actions.py
             style_picker_widget.py
     config/
@@ -1020,6 +1033,7 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
+    QLabel,
     QMainWindow,
     QPushButton,
     QTableWidget,
@@ -1720,6 +1734,8 @@ from PySide6.QtWidgets import (
 )
 
 from config.app_settings import AppSettings
+from config.event_bus import event_bus
+from db.db_utils import compact_database
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 
@@ -8666,7 +8682,7 @@ class FeatureStoreReader:
         return out
 
     def fetch_service_tf_status(
-        self, plugin_id: str
+        self, plugin_id: str, instance_hash: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """Timeframe-Verfuegbarkeit eines Services (21.01b, Schritt 1).
 
@@ -8674,9 +8690,17 @@ class FeatureStoreReader:
         Services die Anzahl der Feature-Store-Eintraege und den letzten
         Schreib-Zeitpunkt direkt aus der feature_store-Tabelle.
 
+        Bugfix 12.08.2026 (User-Meldung 'Data only loeschen'): Ohne
+        `instance_hash` ist die Abfrage service-weit (alle Varianten der
+        plugin_id). Wird ein `instance_hash` uebergeben, werden NUR die
+        Rows GENAU dieser Variante gezaehlt – nach dem Purge einer
+        Variante verschwinden ihre TF-Pills damit korrekt (vorher zeigten
+        die Pill-Badges die TFs aller Varianten des Services gemeinsam).
+
         SQL: SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
              FROM feature_store
              WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+               [AND LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))]
              GROUP BY LOWER(timeframe)
 
         Robustheit wie `fetch_last_execution_dates`: Case-insensitiv
@@ -8685,6 +8709,9 @@ class FeatureStoreReader:
 
         Args:
             plugin_id: Plugin-ID des Services (z.B. 'srv_proximity').
+            instance_hash: Optionaler Varianten-Hash – werden nur gesetzt,
+                zeigt der Status ausschliesslich diese Variante (Clone/
+                Preset/Set-Instanz). None/leer = service-weit.
 
         Returns:
             Dict Timeframe (upper, z.B. 'M1') -> {'count': int, 'last_run': str}
@@ -8693,16 +8720,26 @@ class FeatureStoreReader:
         """
         if not plugin_id or not str(plugin_id).strip():
             return {}
+        conditions = [
+            "feature_id IS NOT NULL AND TRIM(feature_id) != ''",
+            "LOWER(TRIM(feature_id)) = LOWER(TRIM(?))",
+        ]
+        params: List[Any] = [str(plugin_id)]
+        # Varianten-Scope (Bugfix 12.08.2026): exakter Hash-Match (nur diese
+        # Variante, keine service-weiten Alt-Rows anderer Instanzen).
+        h_s = str(instance_hash or "").strip()
+        if h_s:
+            conditions.append("LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))")
+            params.append(h_s)
         con = self._get_connection()
         try:
-            rows = con.execute("""
+            rows = con.execute(f"""
                 SELECT LOWER(TRIM(timeframe)) AS tf, COUNT(*) AS cnt,
                        MAX(created_at) AS last_run
                 FROM feature_store
-                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
-                  AND LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+                WHERE {' AND '.join(conditions)}
                 GROUP BY LOWER(TRIM(timeframe))
-            """, [str(plugin_id)]).fetchall()
+            """, params).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_service_tf_status "
                   f"fehlgeschlagen: {e}")
@@ -9393,6 +9430,1159 @@ class FeatureStoreReader:
     def exists(self) -> bool:
         """True, wenn die analytics.duckdb-Datei existiert."""
         return os.path.exists(self.db_path)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_boundary.py
+```py
+# analytics/engine/mtf_fc_boundary.py
+"""
+MTF-FC v4 (Kapitel 21.03.02) – Boundary Policy & Historien-Detection.
+
+Praezise Ermittlung der M1-Verfuegbarkeitsgrenze und Umsetzung der
+Boundary Policy (`coverage_status = "native" | "fallback"`, `source_tf`)
+gem. §3.2 Ebene 1 und §4 Säule 1.3.
+
+Regeln:
+  * `from_ts >= m1_available_from`  -> `coverage_status = "native"`,
+    `source_tf = "M1"`.
+  * `from_ts <  m1_available_from`  -> `coverage_status = "fallback"`,
+    `source_tf` = naechst-hoherer Timeframe, der fuer den Zeitraum Daten
+    besitzt (Kandidaten M5, M15, H1, H4, D1; Default H1).
+  * **Hartverbot:** Eine hoehere Aggregationsstufe darf niemals als M1
+    deklariert werden ($H1 \\to M1$ strikt verboten) – `source_tf` ist immer
+    der tatsaechlich verwendete TF.
+
+Reine Logik (kein UI-Import, Grundsatz 4/11). Alle Zeiten sind Wanduhr-Epochs
+(Invariante 7).
+"""
+
+from typing import Any, Dict, Optional
+
+from analytics.engine.mtf_fc_provider import MtfFcProvider
+
+#: Aufsteigend nach Granularitaet – der naechst-hoherer TF mit Daten.
+FALLBACK_TF_CANDIDATES = ("M5", "M15", "H1", "H4", "D1")
+#: Default-Fallback, wenn kein Kandidat Daten besitzt (Basis-Aggregation).
+DEFAULT_FALLBACK_TF = "H1"
+
+SECONDS_PER_DAY = 86400
+
+
+def format_available_date(epoch: Optional[int]) -> str:
+    """Formatiert die M1-Verfuegbarkeitsgrenze als `DD.MM.JJJJ` (Wanduhr).
+
+    Wanduhr-Garantie (Invariante 7): Die Epoch ist Wanduhr-encoded, daher
+    liefert die UTC-Darstellung exakt das Wanduhr-Datum.
+    """
+    if epoch is None:
+        return "unbekannt"
+    from datetime import datetime as _dt
+    from datetime import timezone as _utc
+    d = _dt.fromtimestamp(int(epoch), tz=_utc.utc)
+    return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"
+
+
+class MtfFcBoundary:
+    """Boundary-Evaluierung auf Basis des MtfFcProvider (reine Logik)."""
+
+    def __init__(self, provider: Optional[MtfFcProvider] = None) -> None:
+        self.provider = provider or MtfFcProvider()
+
+    def resolve_boundary(self, symbol: str) -> Dict[str, Any]:
+        """Ermittelt die Historien-Grenze des Symbols.
+
+        Returns:
+            {"m1_available_from": Optional[int] (Wanduhr-Epoch),
+             "coverage_status": "native",
+             "source_tf": "M1"}
+        """
+        m1_from = self.provider.get_earliest_timestamp(symbol, "M1")
+        return {
+            "m1_available_from": m1_from,
+            "coverage_status": "native" if m1_from is not None else "fallback",
+            "source_tf": "M1" if m1_from is not None else DEFAULT_FALLBACK_TF,
+        }
+
+    def evaluate_coverage(self, symbol: str, from_ts: Optional[int]) -> Dict[str, Any]:
+        """Bewertet die Datenabdeckung fuer einen angefragten Zeitfenster-Start.
+
+        Args:
+            symbol: Symbol (z. B. "SILVER").
+            from_ts: Linke Viewport-Kante als Wanduhr-Epoch (Optional).
+
+        Returns:
+            {"coverage_status": "native" | "fallback",
+             "source_tf": "M1" | naechst-hoherer TF,
+             "m1_available_from": Optional[int]}
+        """
+        boundary = self.resolve_boundary(symbol)
+        m1_from = boundary["m1_available_from"]
+
+        # Defensiv: keine M1-Daten bekannt -> Fallback auf DEFAULT_FALLBACK_TF.
+        if m1_from is None:
+            return {
+                "coverage_status": "fallback",
+                "source_tf": self._find_fallback_source(symbol, from_ts),
+                "m1_available_from": None,
+            }
+
+        # from_ts unbekannt -> native (Standard-Annahme: Daten vorhanden).
+        if from_ts is None:
+            return {
+                "coverage_status": "native",
+                "source_tf": "M1",
+                "m1_available_from": m1_from,
+            }
+
+        if from_ts >= m1_from:
+            return {
+                "coverage_status": "native",
+                "source_tf": "M1",
+                "m1_available_from": m1_from,
+            }
+
+        # Zoom vor die M1-Grenze -> Fallback auf naechst-hoherer TF mit Daten.
+        return {
+            "coverage_status": "fallback",
+            "source_tf": self._find_fallback_source(symbol, from_ts),
+            "m1_available_from": m1_from,
+        }
+
+    def _find_fallback_source(self, symbol: str, from_ts: Optional[int]) -> str:
+        """Naechst-hoherer TF, dessen Daten die linke Kante abdecken.
+
+        Es gewinnt der erste Kandidat (feinster zuerst), dessen aeltester Bar
+        <= from_ts liegt (d. h. der Zeitraum ist abgedeckt). Liefert kein
+        Kandidat Daten, wird DEFAULT_FALLBACK_TF verwendet.
+        """
+        for tf in FALLBACK_TF_CANDIDATES:
+            earliest = self.provider.get_earliest_timestamp(symbol, tf)
+            if earliest is None:
+                continue
+            if from_ts is None or earliest <= from_ts:
+                return tf
+        return DEFAULT_FALLBACK_TF
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_cascade.py
+```py
+# analytics/engine/mtf_fc_cascade.py
+"""
+MTF-FC v4 (Kapitel 21.03.03) – Hysterese-Kaskaden-Engine (Auto Cascade).
+
+Zoom-Kaskade mit Haupt-Stufen M1 → M5 → H1 → H4 → D1, Zoom-Baendern,
+Hysterese-Schwellwerten, Transition Guard und Telemetrie (§4 Säule 2).
+
+Zoom-Baender (Auto):
+  * Band 1 (< 2.0 d):            M1 ↔ M5
+  * Band 2 (2.0 d – 10.0 d):     M15 ↔ H1 (Fein-Stufe M15)
+  * Band 3 (10.0 d – 35.0 d):    H4
+  * Band 4 (> 35.0 d):           D1
+
+Hysterese (stabiler Zustand zwischen den Band-Grenzen verhindert Oszillation):
+  * M1/M5 → H1  bei Zoom-Out ab  3.5 d   (ZOOM_OUT_THRESHOLD_M1)
+  * H1   → M5   bei Zoom-In  unter 2.0 d (ZOOM_IN_THRESHOLD_M1)
+  * H1   → H4   bei Zoom-Out ab  10.0 d  (ZOOM_OUT_THRESHOLD_H4)
+  * H4   → H1   bei Zoom-In  unter 10.0 d
+  * H4   → D1   bei Zoom-Out ab  35.0 d  (ZOOM_OUT_THRESHOLD_H1)
+  * D1   → H4   bei Zoom-In  unter 28.0 d (ZOOM_IN_THRESHOLD_H1)
+
+Transition Guard: Ein Umschalten erfolgt erst, wenn
+`now() - transition_started_at >= CROSSFADE_DURATION_MS / 1000.0`.
+Jedes Kaskaden-Event emittiert ein strukturiertes Telemetrie-Log
+(trigger, from_tf, to_tf, range_days).
+
+Reine Logik (kein UI-Import, Grundsatz 4/11). Alle Zeiten sind Wanduhr-Epochs
+(Invariante 7). `now` ist injizierbar (Testbarkeit, Test 2).
+"""
+
+from typing import Any, Dict, Optional
+
+SECONDS_PER_DAY = 86400.0
+
+# ---------------------------------------------------------------------------
+# Schwellwerte (konfigurierbar, Test 1)
+# ---------------------------------------------------------------------------
+ZOOM_OUT_THRESHOLD_M1 = 3.5   # Tage – M1/M5 → H1 (Zoom-Out)
+ZOOM_IN_THRESHOLD_M1 = 2.0    # Tage – H1 → M1/M5 (Zoom-In)
+ZOOM_OUT_THRESHOLD_H4 = 10.0  # Tage – H1 → H4 (Grenze Band 2→3)
+ZOOM_OUT_THRESHOLD_H1 = 35.0  # Tage – H4 → D1 (Zoom-Out)
+ZOOM_IN_THRESHOLD_H1 = 28.0   # Tage – D1 → H4 (Zoom-In)
+CROSSFADE_DURATION_MS = 250.0  # UI-Parameter (Transition Guard)
+
+#: Haupt-Stufen der Auto-Kaskade (praegnante Stufen gegen visuelles Flackern).
+MAIN_STEPS = ("M1", "M5", "H1", "H4", "D1")
+
+#: Granularitaets-Rang fuer Vergleichsoperationen (kleiner = feiner).
+TF_RANK = {"M1": 1, "M5": 2, "M10": 3, "M15": 4, "M30": 5, "H1": 6, "H4": 7, "D1": 8}
+
+#: Fein-Stufen innerhalb der Baender (manuell erzwingbar, nicht verboten).
+BAND_FINE_STEPS = ("M15", "M30", "H2")
+
+
+def range_days_of(viewport_from_ts: Optional[int], viewport_to_ts: Optional[int]) -> float:
+    """Zeitfenster-Breite in Tagen (Wanduhr-Epochs). Unbekannte Werte -> 0.0."""
+    if not viewport_from_ts or not viewport_to_ts:
+        return 0.0
+    return max(0.0, (int(viewport_to_ts) - int(viewport_from_ts)) / SECONDS_PER_DAY)
+
+
+def _telemetry(trigger: str, from_tf: Optional[str], to_tf: Optional[str], range_days: float) -> Dict[str, Any]:
+    """Strukturiertes Telemetrie-Log eines Kaskaden-Events (§4 Säule 2.2)."""
+    return {"trigger": trigger, "from_tf": from_tf, "to_tf": to_tf, "range_days": range_days}
+
+
+def evaluate_cascade(
+    viewport_from_ts: Optional[int],
+    viewport_to_ts: Optional[int],
+    current_tf: str,
+    cascade_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bewertet die Kaskade fuer die aktuelle Viewport-Breite.
+
+    Args:
+        viewport_from_ts/to_ts: Viewport-Kanten als Wanduhr-Epochs.
+        current_tf: Aktueller Chart-Timeframe (z. B. "M5").
+        cascade_state: Optionaler Kaskaden-State (wird NICHT mutiert).
+
+    Returns:
+        {"current_tf": str, "candidate_tf": str|None,
+         "direction": "zoom_in"|"zoom_out"|None, "range_days": float,
+         "telemetry": Dict|None}
+    """
+    state = cascade_state or {}
+    current = current_tf or state.get("current_tf") or "M5"
+    range_days = range_days_of(viewport_from_ts, viewport_to_ts)
+    candidate = current
+    direction = None
+    telemetry = None
+
+    rank = TF_RANK.get(current, TF_RANK["M5"])
+
+    if current in ("M1", "M5") or rank <= TF_RANK["M5"]:
+        # Band 1 + Band 2-Untergrenze: Zoom-Out erst ab 3.5 d, Zoom-In Fein-
+        # Stufe M1 unter 2.0 d. Zwischen 2.0 d und 3.5 d stabil (Hysterese).
+        if range_days >= ZOOM_OUT_THRESHOLD_M1:
+            candidate, direction = "H1", "zoom_out"
+        elif current == "M5" and range_days < ZOOM_IN_THRESHOLD_M1:
+            candidate, direction = "M1", "zoom_in"
+        else:
+            candidate, direction = current, None
+
+    elif current in ("H1", "M15", "M30") or TF_RANK["M5"] < rank < TF_RANK["H4"]:
+        # Band 2: Zoom-Out ab 10.0 d -> H4; Zoom-In unter 2.0 d -> M5.
+        if range_days > ZOOM_OUT_THRESHOLD_H4:
+            candidate, direction = "H4", "zoom_out"
+        elif range_days < ZOOM_IN_THRESHOLD_M1:
+            candidate, direction = "M5", "zoom_in"
+        else:
+            candidate, direction = current, None
+
+    elif current in ("H4", "H2") or TF_RANK["H4"] <= rank < TF_RANK["D1"]:
+        # Band 3: Zoom-Out ab 35.0 d -> D1; Zoom-In unter 10.0 d -> H1.
+        if range_days > ZOOM_OUT_THRESHOLD_H1:
+            candidate, direction = "D1", "zoom_out"
+        elif range_days < ZOOM_OUT_THRESHOLD_H4:
+            candidate, direction = "H1", "zoom_in"
+        else:
+            candidate, direction = current, None
+
+    elif current == "D1" or rank >= TF_RANK["D1"]:
+        # Band 4: Zoom-In unter 28.0 d -> H4.
+        if range_days < ZOOM_IN_THRESHOLD_H1:
+            candidate, direction = "H4", "zoom_in"
+        else:
+            candidate, direction = current, None
+
+    if direction is not None:
+        telemetry = _telemetry(direction, current, candidate, range_days)
+
+    return {
+        "current_tf": current,
+        "candidate_tf": candidate if candidate != current else None,
+        "direction": direction,
+        "range_days": range_days,
+        "telemetry": telemetry,
+    }
+
+
+def transition_guard_ok(cascade_state: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """Transition Guard (§4 Säule 2.2): Umschalten erst nach CROSSFADE-Zeit.
+
+    True, wenn seit `transition_started_at` mindestens
+    `CROSSFADE_DURATION_MS / 1000.0` Sekunden vergangen sind (oder der State
+    noch nie eine Transition gestartet hat).
+    """
+    if now is None:
+        import time
+        now = time.time()
+    started = float(cascade_state.get("transition_started_at") or 0.0)
+    if started <= 0.0:
+        return True
+    return (now - started) >= (CROSSFADE_DURATION_MS / 1000.0)
+
+
+def apply_transition(
+    cascade_state: Dict[str, Any],
+    candidate_tf: str,
+    direction: str,
+    range_days: float,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Wendet eine bestaetigte Transition auf den Kaskaden-State an.
+
+    Setzt `current_tf`, `last_transition_at` (= jetzt) und startet die naechste
+    Guard-Periode via `transition_started_at`. Rueckgabe: Telemetrie-Log.
+    """
+    if now is None:
+        import time
+        now = time.time()
+    from_tf = cascade_state.get("current_tf")
+    cascade_state["current_tf"] = candidate_tf
+    cascade_state["candidate_tf"] = None
+    cascade_state["direction"] = None
+    cascade_state["range_days"] = range_days
+    cascade_state["last_transition_at"] = float(now)
+    cascade_state["transition_started_at"] = float(now)
+    return _telemetry(direction, from_tf, candidate_tf, range_days)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_confluence.py
+```py
+# analytics/engine/mtf_fc_confluence.py
+"""
+MTF-FC v4 (Kapitel 21.03.04) – Confluence-Gewichtung & Normalisierung.
+
+Gewichtete Confluence-Scores mit vollstaendigem Gewichtungs-Schema,
+Min-Max-Normalisierung, Constant-Matrix-Policy und Volatilitaets-Adaption
+(§4 Säule 1.4).
+
+Formel:
+  $Score_j = \\sum (W_{TF} \\cdot Signal_{TF})$ – un-normalisiert.
+  Die Gewichte fliessen un-normalisiert in die Summe und werden anschliessend
+  durch Min-Max-Skalierung auf das Farb-Intervall [0.0, 1.0] abgebildet.
+
+Constant-Matrix-Policy (Min-Max-Fix):
+  Ist max_score == min_score, gilt normalized_score = 0.5
+  (verhindert Divisionen durch Null).
+
+Volatilitaets-Adaption (Toggle) mit Clamp-Protection:
+  ratio = clamp(ATR_TF / ATR_Current, 0.2, 5.0)
+  Bei ATR_Current <= 1e-6 wird die Anpassung deaktiviert (ratio = 1.0).
+
+Reine Logik (kein UI-Import, Grundsatz 4/11).
+"""
+
+from typing import Dict, List, Optional
+
+#: Vollstaendiges Gewichtungs-Schema (W_TF).
+WEIGHTS: Dict[str, float] = {
+    "D1": 3.0,
+    "H4": 2.5,
+    "H1": 2.0,
+    "M30": 1.5,
+    "M15": 1.5,
+    "M5": 1.2,
+    "M1": 1.0,
+}
+
+#: Clamp-Grenzen der Volatilitaets-Adaption.
+VOLATILITY_CLAMP_MIN = 0.2
+VOLATILITY_CLAMP_MAX = 5.0
+#: ATR-Grenze: darunter wird die Anpassung deaktiviert (ratio = 1.0).
+ATR_EPSILON = 1e-6
+
+#: Wert der Constant-Matrix-Policy (flache Matrix).
+CONSTANT_MATRIX_VALUE = 0.5
+
+
+def weight_of(timeframe: str) -> float:
+    """Gewicht des Timeframes (Default 1.0 fuer unbekannte TFs)."""
+    return WEIGHTS.get(str(timeframe).upper(), 1.0)
+
+
+def compute_scores(signals: Dict[str, float]) -> Dict[str, float]:
+    """Rohe gewichtete Scores je Timeframe: $W_{TF} \\cdot Signal_{TF}$.
+
+    Args:
+        signals: Dict Timeframe -> Signalstaerke (typ. 0.0..1.0).
+
+    Returns:
+        Dict Timeframe -> roher Score (un-normalisiert).
+    """
+    scores: Dict[str, float] = {}
+    for tf, signal in (signals or {}).items():
+        try:
+            value = float(signal)
+        except (TypeError, ValueError):
+            value = 0.0
+        scores[str(tf).upper()] = weight_of(tf) * value
+    return scores
+
+
+def aggregate_score(signals: Dict[str, float]) -> float:
+    """Gesamter Confluence-Score $\\sum (W_{TF} \\cdot Signal_{TF})$."""
+    return float(sum(compute_scores(signals).values()))
+
+
+def min_max_normalize(scores: List[float]) -> List[float]:
+    """Min-Max-Skalierung auf [0.0, 1.0] mit Constant-Matrix-Policy.
+
+    Ist max == min (flache Matrix), liefert jeder Eintrag 0.5
+    (keine Division durch Null).
+    """
+    if not scores:
+        return []
+    lo, hi = float(min(scores)), float(max(scores))
+    if hi - lo <= 1e-12:
+        return [CONSTANT_MATRIX_VALUE] * len(scores)
+    return [(float(s) - lo) / (hi - lo) for s in scores]
+
+
+def normalize_named_scores(scores: Dict[str, float]) -> Dict[str, float]:
+    """Min-Max-Normalisierung fuer ein benanntes Score-Dict (Order erhalten)."""
+    keys = list((scores or {}).keys())
+    values = [float(scores[k]) for k in keys]
+    normed = min_max_normalize(values)
+    return {k: normed[i] for i, k in enumerate(keys)}
+
+
+def volatility_ratio(
+    atr_tf: Optional[float],
+    atr_current: Optional[float],
+) -> float:
+    """Volatilitaets-Verhaeltnis mit Clamp-Protection.
+
+    ratio = clamp(ATR_TF / ATR_Current, 0.2, 5.0).
+    Bei fehlendem oder ATR_Current <= 1e-6 wird 1.0 zurueckgegeben
+    (Anpassung deaktiviert).
+    """
+    if atr_current is None or atr_tf is None:
+        return 1.0
+    try:
+        current = float(atr_current)
+        tf = float(atr_tf)
+    except (TypeError, ValueError):
+        return 1.0
+    if current <= ATR_EPSILON:
+        return 1.0
+    ratio = tf / current
+    return max(VOLATILITY_CLAMP_MIN, min(VOLATILITY_CLAMP_MAX, ratio))
+
+
+def adaptive_score(
+    signals: Dict[str, float],
+    atr_tf: Dict[str, Optional[float]],
+    atr_current: Optional[float],
+) -> Dict[str, float]:
+    """Volatilitaets-adaptive gewichtete Scores je Timeframe.
+
+    Jeder rohe Score wird mit dem Volatilitaets-Ratio seines Timeframes
+    multipliziert (Toggle in der UI aktiviert diese Adaption).
+    """
+    ratio_cur = volatility_ratio(1.0, atr_current)  # Normierungsbasis
+    result: Dict[str, float] = {}
+    for tf, raw in compute_scores(signals).items():
+        ratio = volatility_ratio(atr_tf.get(tf), atr_current)
+        result[tf] = raw * (ratio / ratio_cur) if ratio_cur else raw
+    return result
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_guards.py
+```py
+# analytics/engine/mtf_fc_guards.py
+"""
+MTF-FC v4 (Kapitel 21.03.05) – State-Machine & Prioritaets-Kette (Guards).
+
+Umsetzung der Zustandstabelle (§3.1) und der Prioritaets-Kette (§3.2):
+
+  Ebene 1 – Hard Data Availability Guard: Fehlen M1-Daten vor der Daten-
+            Grenze, erzwingt das System `coverage_status = "fallback"` mit
+            dem naechst-hoherer TF (21.03.02). H1→M1 ist strikt verboten.
+  Ebene 2 – Temporary User Override (Geister-Marker Klick): Transaktions-
+            Semantik mit `previous_data_tf` und Reset-Rueckstellung.
+  Ebene 3 – Fixed Data-TF Guard: Chart-TF schaltet nie hoeher als das
+            fixierte Data-TF; D1-Upgrade gesperrt.
+  Ebene 4 – Auto Cascade (21.03.03).
+  Ebene 5 – Visual Rendering Preference (Farbschemata/Labels, UI).
+
+Reine Logik (kein UI-Import, Grundsatz 4/11).
+"""
+
+from typing import Any, Dict, Optional
+
+from analytics.engine.mtf_fc_cascade import TF_RANK, evaluate_cascade
+
+#: Repraesentation des freien (Multi-)Zustands des Data-TF.
+MULTI_DATA_TF = "multi"
+
+#: Inkongruenz-Warnung bei manuellem D1-Wunsch bei fixiertem M15-Data-TF.
+WARNING_INCONGRUENT = (
+    "D1-Kerzen nicht möglich, da Data-TF auf M15 fixiert. Kerzen auf M15 gesetzt."
+)
+
+#: Badge-Text des Temporary Override (UI-Anzeige, 21.03.09).
+OVERRIDE_BADGE_TEMPLATE = "🌐 Data-TF temporär gelockert auf {target_tf} | Reset"
+
+
+def _tf_rank(tf: Optional[str]) -> int:
+    """Granularitaets-Rang eines Timeframes (unbekannt -> sehr fein = 1)."""
+    if not tf:
+        return 1
+    return TF_RANK.get(str(tf).upper(), 1)
+
+
+def apply_priority_chain(
+    data_tf: str,
+    requested_chart_tf: str,
+    cascade_state: Optional[Dict[str, Any]] = None,
+    override: Optional[Dict[str, Any]] = None,
+    boundary: Optional[Dict[str, Any]] = None,
+    viewport_range: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Wendet die Prioritaets-Kette an und liefert den effektiven Chart-TF.
+
+    Args:
+        data_tf: Data-TF aus dem Filter (z. B. "M15", "multi").
+        requested_chart_tf: Vom Nutzer gewuenschter Chart-TF (oder "auto").
+        cascade_state: Kaskaden-State (21.03.03).
+        override: Temporary User Override (Ebene 2).
+        boundary: Boundary-Bewertung (21.03.02, Ebene 1).
+        viewport_range: {"from_ts", "to_ts"} fuer die Auto-Kaskade.
+
+    Returns:
+        {"effective_tf": str, "guard": str|None, "warning": str|None,
+         "source_tf": str|None}
+    """
+    cascade_state = cascade_state or {}
+    override = override or {}
+    boundary = boundary or {}
+    viewport_range = viewport_range or {}
+    result: Dict[str, Any] = {
+        "effective_tf": requested_chart_tf or "M5",
+        "guard": None,
+        "warning": None,
+        "source_tf": None,
+    }
+
+    # --- Ebene 2: Temporary User Override gewinnt vor dem Fixed-Guard -------
+    if override.get("active") and override.get("target_tf"):
+        result["effective_tf"] = str(override["target_tf"])
+        result["guard"] = "temporary_override"
+        return result
+
+    # --- Ebene 1: Hard Data Availability Guard ------------------------------
+    coverage = boundary.get("coverage_status")
+    source_tf = boundary.get("source_tf") or "M1"
+    if coverage == "fallback":
+        # Fallback-TF ist der tatsaechlich verwendete TF (nie als M1 deklariert).
+        result["effective_tf"] = source_tf
+        result["guard"] = "data_availability"
+        result["source_tf"] = source_tf
+        return result
+
+    # --- Ebene 3: Fixed Data-TF Guard ---------------------------------------
+    if data_tf and str(data_tf).lower() != MULTI_DATA_TF:
+        data_rank = _tf_rank(data_tf)
+        chart_tf = requested_chart_tf or "auto"
+        if str(chart_tf).lower() != "auto":
+            if _tf_rank(chart_tf) > data_rank:
+                result["effective_tf"] = str(data_tf)
+                result["guard"] = "fixed_data_tf"
+                if str(chart_tf).upper() == "D1" and str(data_tf).upper() in ("M1", "M5", "M15"):
+                    result["warning"] = WARNING_INCONGRUENT
+                return result
+
+    # --- Ebene 4: Auto Cascade ----------------------------------------------
+    if str(requested_chart_tf).lower() in ("auto", ""):
+        from_ts = viewport_range.get("from_ts")
+        to_ts = viewport_range.get("to_ts")
+        current = cascade_state.get("current_tf") or "M5"
+        cascade = evaluate_cascade(from_ts, to_ts, current, cascade_state)
+        result["effective_tf"] = cascade.get("candidate_tf") or current
+        result["guard"] = "auto_cascade" if cascade.get("candidate_tf") else None
+        return result
+
+    # --- Sonst: unveraenderter Wunsch-TF ------------------------------------
+    result["effective_tf"] = requested_chart_tf
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Temporary User Override (Ebene 2) – Transaktions-Semantik
+# ---------------------------------------------------------------------------
+def start_override(
+    override: Dict[str, Any],
+    previous_data_tf: str,
+    target_tf: str,
+    reason: str = "ghost_marker_click",
+) -> Dict[str, Any]:
+    """Startet den Temporary Override (Transaktions-Semantik).
+
+    Setzt `active=True`, `previous_data_tf` (fuer Reset), `target_tf`
+    und `reason`. Rueckgabe: der mutierte Override-Dict.
+    """
+    override["active"] = True
+    override["previous_data_tf"] = previous_data_tf
+    override["target_tf"] = target_tf
+    override["reason"] = reason
+    return override
+
+
+def reset_override(override: Dict[str, Any]) -> str:
+    """Setzt den Override zurueck und stellt `previous_data_tf` wieder her.
+
+    Rueckgabe: der wiederhergestellte Data-TF (z. B. "M15").
+    """
+    restored = override.get("previous_data_tf")
+    override["active"] = False
+    override["previous_data_tf"] = None
+    override["target_tf"] = None
+    override["reason"] = None
+    return restored or "multi"
+
+
+def override_badge_text(override: Dict[str, Any]) -> Optional[str]:
+    """Badge-Text `[ 🌐 Data-TF temporär gelockert auf X | Reset ]`."""
+    if not override.get("active"):
+        return None
+    target = override.get("target_tf") or "?"
+    return OVERRIDE_BADGE_TEMPLATE.format(target_tf=target)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_partition.py
+```py
+# analytics/engine/mtf_fc_partition.py
+"""
+MTF-FC v4 (Kapitel 21.03.06) – Event-Partitionierung & Cache-Invalidierung.
+
+Partitionierte RAM-Cache-Invalidierung:
+  $affected\\_partition = partition(symbol, timeframe, t_{event})$
+
+Nachtraeglich eingehende Ticks invalidieren ausschliesslich die RAM-Partition
+ihrer eigenen Event-Zeit $t_{event}$ – nie den gesamten Cache (§4 Säule 2.3).
+
+Integration mit der Cache-Versionierung (21.03.01): Nach einer Invalidierung
+wird `cache_generation` im Namespace inkrementiert.
+
+Reine Logik (kein UI-Import, Grundsatz 4/11). Alle Zeiten sind Wanduhr-Epochs
+(Invariante 7).
+"""
+
+from typing import Any, Dict, Optional, Tuple
+
+from analytics.engine.mtf_fc_provider import MtfFcProvider
+
+
+def partition(symbol: str, timeframe: str, ts: int) -> Tuple[str, str, str]:
+    """Partitions-Schluessel der Event-Zeit: `(symbol, timeframe, datum)`.
+
+    Das Datum ist das Wanduhr-Datum (`YYYY-MM-DD`) der Event-Zeit
+    (Invariante 7) – gleiche Kalendertage teilen sich eine RAM-Partition.
+    """
+    return MtfFcProvider.partition_of_event(symbol, timeframe, ts)
+
+
+def invalidate_partition(
+    cache: Dict[Tuple[str, str, str], Dict[str, Any]],
+    symbol: str,
+    timeframe: str,
+    t_event: int,
+    namespace: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Entfernt ausschliesslich die Partition der Event-Zeit aus dem Cache.
+
+    Args:
+        cache: Der RAM-Partitions-Cache (`shared_state["mtf_fc"]["ram_cache"]`).
+        symbol/timeframe: Betroffenes Symbol/TF.
+        t_event: Event-Zeit (Wanduhr-Epoch) des nachtraeglichen Ticks.
+        namespace: Optionaler MTF-FC-Namespace – bei Erfolg wird hier
+            `cache_generation` inkrementiert (21.03.06 Schritt 3).
+
+    Returns:
+        True, wenn genau ein Partitions-Eintrag entfernt wurde; False, wenn
+        die Partition nicht (oder nicht mehr) existiert.
+    """
+    key = partition(symbol, timeframe, t_event)
+    if not isinstance(cache, dict) or key not in cache:
+        return False
+    del cache[key]
+    if isinstance(namespace, dict):
+        namespace["cache_generation"] = int(namespace.get("cache_generation", 0)) + 1
+    return True
+
+
+def invalidate_partition_via_provider(
+    provider: MtfFcProvider,
+    context: Any,
+    symbol: str,
+    timeframe: str,
+    t_event: int,
+) -> bool:
+    """Komfort-Wrapper: Invalidierung direkt ueber den Provider/Namespace."""
+    ns = provider.read_namespace(context)
+    cache = ns.setdefault("ram_cache", {})
+    return invalidate_partition(cache, symbol, timeframe, t_event, ns)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_provider.py
+```py
+# analytics/engine/mtf_fc_provider.py
+"""
+MTF-FC v4 (Kapitel 21.03.01) – Data Provider & Cache-Versionierung (Schicht 2).
+
+Der Provider kapselt den gesamten Lese-Zugriff auf die Market-Daten
+(`ohlcv_bars` in `data/market_data.duckdb`, read-only via DbPool) und den
+Namespace `PluginContext.shared_state["mtf_fc"]`.
+
+Verantwortlichkeiten:
+  * `get_earliest_timestamp(symbol, timeframe)` – MIN("time") je Symbol/TF
+    (Wanduhr-Epoch, Invariante 7; defensiv None bei Fehler/leerer DB).
+  * `get_latest_timestamp(symbol, timeframe)`  – MAX("time") je Symbol/TF
+    (Basis der Cache-Versionierung).
+  * Cache-Versionierung `(symbol, timeframe, partition)`: Ein Eintrag traegt
+    `source_max_timestamp`; er ist nur gueltig, wenn diese Quellgrenze <= dem
+    aktuellen DB-Maximum liegt (sonst stale -> Partitions-Invalidierung, 21.03.06).
+  * Namespace-Schreibzugriff ausschliesslich ueber den Provider
+    (`read_namespace(context)` / `write_namespace(context, **changes)`).
+
+Wanduhr-Garantie (Invariante 7): Alle Zeiten sind Wanduhr-Epochs
+(Berlin-Wanduhr-encoded, 1:1 aus der DB gelesen) – keine Offset-Umrechnung.
+
+Open/Closed (Grundsatz 11): Kein Bestandsmodul wird veraendert; die
+Lese-Muster folgen FeatureStoreReader.fetch_ohlcv_snapshot / _epoch_of().
+"""
+
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from analytics.features.plugins.base_plugin import PluginContext
+from analytics.engine.mtf_fc_state import ensure_mtf_fc_namespace
+
+# Projekt-Root = 3 Ebenen ueber dieser Datei (engine/ -> analytics/ -> Root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
+
+#: Kompakte Partitions-Kodierung: Wanduhr-Datum (UTC) der Event-Zeit.
+from datetime import datetime as _dt_datetime
+from datetime import timezone as _dt_timezone
+
+
+def _epoch_to_partition(ts: int) -> str:
+    """Partitions-Schluessel einer Event-Zeit: Wanduhr-Datum `YYYY-MM-DD`.
+
+    Wanduhr-Garantie (Invariante 7): Die Epoch ist Wanduhr-encoded, daher
+    liefert die UTC-Darstellung exakt das Wanduhr-Datum der Event-Zeit.
+    """
+    return _dt_datetime.fromtimestamp(int(ts), tz=_dt_timezone.utc).strftime("%Y-%m-%d")
+
+
+class MtfFcProvider:
+    """Datenzugriff + Namespace-Verwaltung fuer das MTF-FC-System.
+
+    Args:
+        market_db_path: Testbarkeit (Seam) – Default `data/market_data.duckdb`.
+        pool: DbPool-Klasse/Objekt mit `get(db_path)`-API (Default `DbPool`).
+    """
+
+    def __init__(self, market_db_path: Optional[str] = None, pool: Any = None) -> None:
+        self.market_db_path = market_db_path or DB_MARKET
+        if pool is None:
+            from db.db_pool import DbPool
+            pool = DbPool
+        self._pool = pool
+
+    # ------------------------------------------------------------------
+    # Roh-Zeitgrenzen (Wanduhr-Epochs)
+    # ------------------------------------------------------------------
+    def get_earliest_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
+        """Aeltester Bar-Zeitpunkt des Symbols im Timeframe (Wanduhr-Epoch).
+
+        Defensiv: `None` bei leerer DB, unbekanntem Symbol/TF oder Fehler.
+        """
+        return self._query_bound("MIN", symbol, timeframe)
+
+    def get_latest_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
+        """Neuester Bar-Zeitpunkt des Symbols im Timeframe (Wanduhr-Epoch).
+
+        Defensiv: `None` bei leerer DB, unbekanntem Symbol/TF oder Fehler.
+        """
+        return self._query_bound("MAX", symbol, timeframe)
+
+    def _query_bound(self, agg: str, symbol: str, timeframe: str) -> Optional[int]:
+        if not symbol or not timeframe:
+            return None
+        try:
+            con = self._pool.get(self.market_db_path)
+            row = con.execute(
+                f'SELECT {agg}("time") FROM ohlcv_bars '
+                'WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?) '
+                'AND "time" IS NOT NULL',
+                [symbol, timeframe],
+            ).fetchone()
+            value = row[0] if row else None
+            if value is None:
+                return None
+            if hasattr(value, "timestamp"):  # datetime-Objekt -> Wanduhr-Epoch
+                return int(value.timestamp())
+            return int(value)
+        except Exception as e:
+            print(f"WARN [MtfFcProvider] {agg}('time') fehlgeschlagen "
+                  f"(symbol={symbol}, tf={timeframe}): {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Cache-Versionierung (21.03.01 Schritt 3 + 21.03.06)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def cache_key(symbol: str, timeframe: str, partition: str) -> Tuple[str, str, str]:
+        """Stabiler Cache-Schluessel `(symbol, timeframe, partition)`."""
+        return (symbol.upper(), timeframe.upper(), partition)
+
+    @staticmethod
+    def partition_of_event(symbol: str, timeframe: str, ts: int) -> Tuple[str, str, str]:
+        """Partitions-Schluessel einer Event-Zeit inkl. Symbol/TF.
+
+        $affected\\_partition = partition(symbol, timeframe, t_{event})$ –
+        die Partition einer nachtraeglich eingehenden Event-Zeit. Rein
+        deterministisch aus der Wanduhr-Epoch (Invariante 7).
+        """
+        return MtfFcProvider.cache_key(symbol, timeframe, _epoch_to_partition(ts))
+
+    def is_cache_valid(
+        self,
+        cache: Dict[Tuple[str, str, str], Dict[str, Any]],
+        symbol: str,
+        timeframe: str,
+        partition: str,
+    ) -> bool:
+        """True, wenn der Cache-Eintrag nicht stale ist.
+
+        Ein Eintrag ist genau dann gueltig, wenn sein `source_max_timestamp`
+        kleiner/gleich dem aktuellen DB-Maximum des Symbols/TF liegt. Ist die
+        Quelle gewachsen (neuer Bar nachgeladen), ist der Eintrag stale.
+        Fehlt der Eintrag oder das DB-Maximum, ist er ungueltig.
+        """
+        key = self.cache_key(symbol, timeframe, partition)
+        entry = cache.get(key)
+        if not isinstance(entry, dict):
+            return False
+        source_max = entry.get("source_max_timestamp")
+        if not isinstance(source_max, (int, float)):
+            return False
+        db_max = self.get_latest_timestamp(symbol, timeframe)
+        if db_max is None:
+            return False
+        return float(source_max) <= float(db_max)
+
+    # ------------------------------------------------------------------
+    # Namespace-Zugriff (einzige Schreib-Schnittstelle, 21.03.01 Schritt 4)
+    # ------------------------------------------------------------------
+    def read_namespace(self, context: PluginContext) -> Dict[str, Any]:
+        """Liefert den `mtf_fc`-Namespace des Contexts (ggf. initialisiert)."""
+        if context is None:
+            context = PluginContext(mode="batch")
+        return ensure_mtf_fc_namespace(context.shared_state)
+
+    def write_namespace(self, context: PluginContext, **changes: Any) -> Dict[str, Any]:
+        """Schreibt Aenderungen in den `mtf_fc`-Namespace (additiv, flach).
+
+        Es werden nur die uebergebenen Keys aktualisiert – nicht betroffene
+        Teil-Dicts bleiben unangetastet. Rueckgabe: der aktualisierte Namespace.
+        """
+        ns = self.read_namespace(context)
+        ns.update(changes)
+        return ns
+
+    def clear_partition(
+        self,
+        context: PluginContext,
+        symbol: str,
+        timeframe: str,
+        partition: str,
+    ) -> bool:
+        """Entfernt exakt einen Partitions-Eintrag aus dem RAM-Cache.
+
+        (21.03.06) Erhoeht bei Erfolg `cache_generation` im Namespace.
+        Rueckgabe: True, wenn ein Eintrag entfernt wurde.
+        """
+        ns = self.read_namespace(context)
+        cache = ns.setdefault("ram_cache", {})
+        key = self.cache_key(symbol, timeframe, partition)
+        if key in cache:
+            del cache[key]
+            ns["cache_generation"] = int(ns.get("cache_generation", 0)) + 1
+            return True
+        return False
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_state.py
+```py
+# analytics/engine/mtf_fc_state.py
+"""
+MTF-FC v4 (Kapitel 21.03.01) – Default-Factory & Struktur des isolierten
+Namespace `PluginContext.shared_state["mtf_fc"]`.
+
+Der Namespace ist der Single Source of Truth fuer alle MTF-FC-Komponenten
+(Data Provider, Boundary Policy, Hysterese-Kaskade, Confluence, Guards,
+Partitionierung, UI). Er wird ausschliesslich ueber den MtfFcProvider
+(read_namespace/write_namespace) gelesen und geschrieben – kein UI-Direktzugriff
+(Open/Closed, MVVM, Grundsatz 4/11).
+
+Wanduhr-Garantie (Invariante 7): Alle Zeiten in diesem Namespace sind
+Wanduhr-Epochs (Berlin-Wanduhr-encoded), keine Offset-Umrechnung.
+"""
+
+from typing import Any, Dict
+
+
+#: Schema-Version des Namespace (Semantic Versioning, fuer spaetere Migration).
+MTF_FC_SCHEMA_VERSION = "1.0.0"
+
+
+def default_cascade_state() -> Dict[str, Any]:
+    """Default-Zustand der Hysterese-Kaskade (§4 Säule 2, 21.03.03)."""
+    return {
+        "current_tf": "M5",
+        "candidate_tf": None,
+        "direction": None,          # "zoom_in" | "zoom_out" | None
+        "transition_started_at": 0.0,
+        "last_transition_at": 0.0,
+        "range_days": 0.0,
+    }
+
+
+def default_history_boundaries() -> Dict[str, Any]:
+    """Default der Historien-Grenzen (§3.2 Ebene 1, 21.03.02)."""
+    return {
+        "m1_available_from": None,  # Optional[int] Wanduhr-Epoch
+        "coverage_status": "native",  # "native" | "fallback"
+        "source_tf": "M1",
+    }
+
+
+def default_guard_override() -> Dict[str, Any]:
+    """Default des Temporary User Override (§3.2 Ebene 2, 21.03.05)."""
+    return {
+        "active": False,
+        "previous_data_tf": None,   # z. B. "M15"
+        "target_tf": None,          # z. B. "D1"
+        "reason": None,             # z. B. "ghost_marker_click"
+    }
+
+
+def default_mtf_fc_state() -> Dict[str, Any]:
+    """Default-Struktur des kompletten Namespace `shared_state["mtf_fc"]`.
+
+    Exakt die Keys aus §5 der Spezifikation – als tiefe, unabhaengige Kopie
+    (keine geteilten Referenzen zwischen mehreren Contexts/Namespaces).
+    """
+    return {
+        "active_data_tf": "M15",
+        "active_chart_tf": "M5",
+        "viewport_range": {"from_ts": None, "to_ts": None},
+        "cascade_state": default_cascade_state(),
+        "history_boundaries": default_history_boundaries(),
+        "cache_generation": 0,
+        "temporary_guard_override": default_guard_override(),
+        # 21.03.01: RAM-Partitions-Cache (nicht in DuckDB persistiert).
+        # Schlüssel: (symbol, timeframe, partition) -> {"source_max_timestamp": int}
+        "ram_cache": {},
+        "schema_version": MTF_FC_SCHEMA_VERSION,
+    }
+
+
+def ensure_mtf_fc_namespace(shared_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Stellt sicher, dass der `mtf_fc`-Namespace existiert und alle
+    Default-Keys enthaelt (additiv, abwaertskompatibel).
+
+    Args:
+        shared_state: `PluginContext.shared_state` (Dict des Contexts).
+
+    Returns:
+        Der (ggf. neu angelegte bzw. vervollstaendigte) `mtf_fc`-Eintrag.
+    """
+    ns = shared_state.get("mtf_fc")
+    if not isinstance(ns, dict):
+        ns = default_mtf_fc_state()
+        shared_state["mtf_fc"] = ns
+    defaults = default_mtf_fc_state()
+    for key, value in defaults.items():
+        if key not in ns or ns[key] is None:
+            ns[key] = value
+    return ns
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/mtf_fc_templates.py
+```py
+# analytics/engine/mtf_fc_templates.py
+"""
+MTF-FC v4 (Kapitel 21.03.07) – View-Template-Persistenz (Pure Logik).
+
+Speichern/Laden kompletter Filter-Konfigurationen des MtfFilterBarWidget
+über den bestehenden `SchemaMigrator` (`analytics/engine/schema_migrator.py`):
+Gespeicherte Preset-JSONs werden IN-MEMORY validiert und abwärtskompatibel
+um neue TFs/Session-Keys erweitert (Payload-Key `mtf_fc_schema_version =
+"1.0.0"`). Rollback-Schutz: Eine fehlerhafte Migration wirft TemplateError,
+der Aufrufer behält das Original.
+
+Reine Logik (kein UI-Import, Grundsatz 4/11). Kein Persistenz-Medium wird
+hier festgeschrieben – die UI/der Aufrufer entscheidet über die Ablage
+(Default: in-memory Dict-Registry für die Sitzung).
+"""
+
+from typing import Any, Dict, Optional
+
+from analytics.engine.schema_migrator import MigrationError, _needs_migration
+from analytics.engine.mtf_fc_confluence import WEIGHTS
+
+#: Aktuelle Template-Schema-Version (Payload-Key).
+MTF_FC_SCHEMA_VERSION = "1.0.0"
+
+#: Bekannte Template-Keys (Whitelist für die Migration).
+_TEMPLATE_KNOWN_KEYS = (
+    "mtf_fc_schema_version", "name", "data_tf", "chart_tf",
+    "range_preset", "custom_range", "sort_mode", "session_filters",
+    "confluence_weighting", "volatility_adaption", "view_templates_meta",
+)
+
+#: Defaults für fehlende/neue Keys (abwärtskompatible Erweiterung).
+_TEMPLATE_DEFAULTS: Dict[str, Any] = {
+    "data_tf": "multi",
+    "chart_tf": "auto",
+    "range_preset": "7d",
+    "custom_range": {"from_ts": None, "to_ts": None},
+    "sort_mode": "date",
+    "session_filters": [],
+    "confluence_weighting": dict(WEIGHTS),
+    "volatility_adaption": False,
+    "view_templates_meta": {"created": None, "updated": None},
+}
+
+
+class TemplateError(Exception):
+    """Wird bei einer fehlgeschlagenen Template-Migration geworfen.
+
+    Der Aufrufer behält dann das ORIGINAL-Template (Rollback-Schutz).
+    """
+
+
+def create_template(name: str, **filters: Any) -> Dict[str, Any]:
+    """Erzeugt ein neues View-Template (Schema-Version + Defaults + Filters)."""
+    template: Dict[str, Any] = {"mtf_fc_schema_version": MTF_FC_SCHEMA_VERSION}
+    template.update(_TEMPLATE_DEFAULTS)
+    template["name"] = name
+    for key, value in filters.items():
+        if key in _TEMPLATE_KNOWN_KEYS:
+            template[key] = value
+    return template
+
+
+def migrate_template(raw: Any) -> Dict[str, Any]:
+    """Validieret/migriert ein Template-JSON in-memory (SchemaMigrator-Semantik).
+
+    Ablauf (analog `SchemaMigrator.migrate_instance_config`):
+      1. Fehlende bekannte Keys werden mit ihren Defaults ergänzt.
+      2. Unbekannte Keys (nicht in der Whitelist) werden entfernt.
+      3. `mtf_fc_schema_version` wird auf die aktuelle Version angehoben.
+
+    Raises:
+        TemplateError: Bei nicht-Dict-Eingabe oder Migrationsfehler –
+        der Aufrufer führt den Rollback auf das Original aus.
+    """
+    try:
+        if not isinstance(raw, dict):
+            raise TemplateError(
+                f"Template ist kein JSON-Objekt: {type(raw).__name__}")
+        result: Dict[str, Any] = dict(raw)
+        current = str(result.get("mtf_fc_schema_version") or "0.0.0")
+
+        if not _needs_migration(current, MTF_FC_SCHEMA_VERSION):
+            # Nicht-migrationsbedürftig: trotzdem sicherstellen, dass alle
+            # Pflicht-Keys existieren (defensive Ergänzung, non-destruktiv).
+            for key, default in _TEMPLATE_DEFAULTS.items():
+                result.setdefault(key, default)
+            return result
+
+        # 1) Fehlende Schema-Keys mit Defaults ergänzen.
+        for key, default in _TEMPLATE_DEFAULTS.items():
+            if key not in result:
+                result[key] = default
+
+        # 2) Unbekannte Keys entfernen (Whitelist = Single Source of Truth).
+        for key in list(result.keys()):
+            if key not in _TEMPLATE_KNOWN_KEYS:
+                result.pop(key, None)
+
+        # 3) Schema-Version anheben.
+        result["mtf_fc_schema_version"] = MTF_FC_SCHEMA_VERSION
+        return result
+    except MigrationError:
+        raise
+    except TemplateError:
+        raise
+    except Exception as e:
+        raise TemplateError(f"Template-Migration fehlgeschlagen: {e}") from e
+
+
+class MtfFcTemplateStore:
+    """In-memory Template-Registry (Sitzungs-Scope).
+
+    Die Persistenz-Entscheidung (JSON-Datei, DB, Settings) trifft der
+    Aufrufer – der Store hält lediglich eine flache Dict-Registry
+    (name -> Template) und migriert beim Laden über `migrate_template`.
+    """
+
+    def __init__(self) -> None:
+        self._templates: Dict[str, Dict[str, Any]] = {}
+
+    def save(self, template: Dict[str, Any]) -> None:
+        """Speichert ein (bereits migriertes) Template unter seinem Namen."""
+        name = str(template.get("name") or "Unbenannt")
+        self._templates[name] = dict(template)
+
+    def load(self, name: str) -> Optional[Dict[str, Any]]:
+        """Lädt und migriert ein Template (Rollback-Schutz bei Fehler)."""
+        raw = self._templates.get(name)
+        if raw is None:
+            return None
+        try:
+            return migrate_template(raw)
+        except TemplateError as e:
+            print(f"WARN [MtfFcTemplateStore] Template '{name}' verworfen: {e}")
+            return None
+
+    def names(self) -> list:
+        """Alle gespeicherten Template-Namen (sortiert)."""
+        return sorted(self._templates.keys())
+
+    def delete(self, name: str) -> bool:
+        """Entfernt ein Template. Rueckgabe: True, wenn es existierte."""
+        return self._templates.pop(name, None) is not None
 
 ```
 
@@ -11115,7 +12305,7 @@ entfernt – es gibt keine Signal-Engine mehr.
 """
 
 from dataclasses import replace
-from typing import Any, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 import threading
 import time
 import traceback
@@ -11337,6 +12527,7 @@ class ServiceSetEvaluator:
         set_definition: Dict[str, Any],
         df: pd.DataFrame,
         context: Optional[PluginContext] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """Führt die Service-Pipeline elastisch aus (P14-03) – Ablösung des
         strikten Fail-Fast-Prinzips (A.3/A.4 des Kapitels):
@@ -11400,12 +12591,14 @@ class ServiceSetEvaluator:
         with self._execution_lock:
             self.last_skipped.clear()
             self.last_errors.clear()
-            for iid in execution_order:
+            for idx, iid in enumerate(execution_order):
                 # Quarantäne-Skip (Session-Scope, RAM only)
                 if self._is_quarantined(iid):
                     self.last_skipped[iid] = "quarantined"
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"uebersprungen (quarantined)")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 cfg = services[iid]
@@ -11424,6 +12617,8 @@ class ServiceSetEvaluator:
                         dep_failed = True
                         break
                 if dep_failed:
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Exakter Zuschnitt auf den Service-lookback
@@ -11457,6 +12652,8 @@ class ServiceSetEvaluator:
                               f"die Session quarantaenisiert (RAM only)")
                     # State-Fallback: alter shared_state-Eintrag (vorherige
                     # Kerze) bleibt unangetastet erhalten.
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
                 except Exception as e:
                     # Sicherheitsnetz: PluginExecutor kapselt eigentlich alle
@@ -11480,6 +12677,8 @@ class ServiceSetEvaluator:
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"(plugin '{log2['plugin_id']}') fehlgeschlagen: "
                           f"{log2['exception']}")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.
@@ -11492,6 +12691,8 @@ class ServiceSetEvaluator:
                 if iid not in context.shared_state:
                     context.shared_state[iid] = result
                 results[iid] = result
+                if progress_callback:
+                    progress_callback(iid, idx + 1, len(execution_order))
 
         return results
 
@@ -12863,7 +14064,8 @@ class FeatureBuilder:
                 con.close()
 
     def purge_instance_data(self, instance_hash: str, plugin_id: str = "",
-                            params: Optional[Dict[str, Any]] = None) -> int:
+                            params: Optional[Dict[str, Any]] = None,
+                            purge_legacy: bool = False) -> int:
         """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
 
         `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
@@ -12874,17 +14076,24 @@ class FeatureBuilder:
         und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
         unangetastet).
 
-        11.08.2026 (Bugfix Runde 5): Zusaetzlich werden bei uebergebenem
-        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht.
-        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen unter dem
-        reinen Params-only-Hash `generate_instance_hash(plugin_id, params)`
-        (ohne preset_name) und sind keiner Variante eindeutig zuordenbar
-        (Kollisions-Pool). Sie wurden ueber den (inzwischen entfernten)
-        Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten angezeigt
-        und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen' nicht
-        zuruecksetzen. Mit plugin_id + params werden diese Alt-Rows jetzt
-        zusammen mit den Varianten-Rows geloescht, damit das Datum im
-        MasterTree wirklich auf 'nie' zurueckgesetzt wird.
+        11.08.2026 (Bugfix Runde 5): Zusaetzlich koennen bei uebergebenem
+        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht
+        werden. Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name) und sind keiner Variante EINDEUTIG
+        zuordenbar (Kollisions-Pool). Sie wurden ueber den (inzwischen
+        entfernten) Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten
+        angezeigt und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen'
+        nicht zuruecksetzen.
+
+        12.08.2026 (Bugfix Runde 6, 'Data only loeschen loescht alle
+        Varianten'): Der Legacy-Purge laeuft seither NUR noch auf explizite
+        Anforderung (`purge_legacy=True`). Teilen sich mehrere aktive
+        Varianten dieselben Params (identischer Params-only-Hash), gehoert
+        der Legacy-Pool ALLEN – ihn beim 'Data Only Loeschen' einer einzelnen
+        Variante zu loeschen wuerde die Daten der uebrigen Varianten
+        entfernen. Der Aufrufer (service_win) entscheidet ueber die aktive
+        Varianten-Liste, ob der Pool EINDEUTIG dieser einen Variante gehoert.
 
         Args:
             instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash,
@@ -12892,6 +14101,10 @@ class FeatureBuilder:
             plugin_id: Plugin-ID (optional) – noetig fuer den Legacy-Purge.
             params: Parameter-Dict der Variante (optional) – Grundlage des
                 Params-only-Legacy-Hashes fuer den Legacy-Purge.
+            purge_legacy: True = auch den Params-only-Legacy-Pool loeschen
+                (nur wenn der Aufrufer die Eindeutigkeit geprueft hat).
+                Default False – der Legacy-Purge ist bewusst eine
+                Sonder-Aktion (sonst Kollisions-Gefahr).
 
         Returns:
             Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
@@ -12913,10 +14126,13 @@ class FeatureBuilder:
             rows = result.fetchall() if result is not None else []
             deleted += len(rows or [])
             # 2) Legacy-Pool-Rows (Params-only-Hash aus Runs vor der
-            #    Preset-Hash-Umstellung, 11.08.2026). Der Params-only-Hash
-            #    ist aus dem Preset-Hash (inkl. preset_name) nicht umkehrbar
-            #    – er wird hier aus plugin_id + params neu berechnet.
-            if plugin_id and params is not None:
+            #    Preset-Hash-Umstellung, 11.08.2026) – NUR auf explizite
+            #    Anforderung (purge_legacy=True), sonst Kollisions-Gefahr
+            #    zwischen Varianten mit identischen Params (Bugfix Runde 6).
+            #    Der Params-only-Hash ist aus dem Preset-Hash (inkl.
+            #    preset_name) nicht umkehrbar – er wird hier aus plugin_id
+            #    + params neu berechnet.
+            if purge_legacy and plugin_id and params is not None:
                 try:
                     from analytics.engine.service_models import (
                         generate_instance_hash)
@@ -18847,20 +20063,45 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
-        # 06.08.2026 (Punkt 5): Limit-Textfeld -> ViewModel. Der Default
-        # (App-Optionen 'Statistik-Signale') wird beim Start gesetzt, damit
-        # Feld und VM-Parameter konsistent sind.
-        self.edit_limit.textChanged.connect(self._on_limit_text_changed)
-        self._vm.set_limit(self._default_limit)
-        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
-        self.btn_profile_new.clicked.connect(self._on_profile_new)
-        self.btn_profile_save.clicked.connect(self._on_profile_save)
-        self.btn_profile_delete.clicked.connect(self._on_profile_delete)
-        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
-        self.sidebar.currentRowChanged.connect(self._on_page_changed)
-        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
-        self._refresh_symbol_combo()
-        self._refresh_timeframe_combo()
+        # 21.03.11 (Bug 3): Nach abgeschlossenem Service-Run (der Worker
+        # emittiert `service_set_changed` einmalig nach der ALLE-TFs-/
+        # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
+        # automatisch neu laden. `refresh_all` ist im VM debounced.
+        event_bus.service_set_changed.connect(self._on_service_set_changed)
+        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
+        event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+
+    @Slot()
+    def _on_service_set_changed(self) -> None:
+        """21.03.11 (Bug 3): Nach abgeschlossenem Service-Run neu laden.
+
+        Der `ServiceRunWorker` emittiert `event_bus.service_set_changed`
+        genau einmal nach Abschluss der Ausfuehrung (auch bei Teilerfolg).
+        `refresh_all()` ist im ViewModel debounced (kein SQL-Feuer) und
+        stösst die aktiven Seiten-Queries (Tabelle/Heatmap) neu an.
+        """
+        if getattr(self, "_vm", None) is None:
+            return
+        try:
+            self._vm.refresh_all()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] service_set_changed-Refresh: {e}")
+
+    @Slot(str)
+    def _on_mtf_fc_sort_changed(self, mode: str) -> None:
+        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+
+        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
+        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
+        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        """
+        if getattr(self, "table_page", None) is None:
+            return
+        try:
+            self.table_page.set_external_sort_mode(str(mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:
@@ -20687,6 +21928,27 @@ def _nice_int_step(span: float, max_ticks: int) -> float:
     return float(math.ceil(raw))
 
 
+def _format_heatmap_value(val: Any) -> str:
+    """Formatiert einen Heatmap-Zahlenwert OHNE Exponential-Notation.
+
+    Bugfix 12.08.2026 (User-Meldung 'EXP-Wert in der Legende'):
+    `f'{val:.2g}'` wechselt ab 100 in wissenschaftliche Notation
+    ('1.2e+02'); `f'{v:g}'` ab 1e6 ('1e+06'). Ganzzahlige Werte
+    (z. B. COUNT-Zaehler je Zelle/Bucket) werden in deutscher
+    Tausender-Schreibweise ausgegeben ('4.380'), Bruchwerte (z. B.
+    AVG/SUM/MIN/MAX) als Dezimalzahl ohne Nullen ('0.25', '62.5').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if fval == int(fval) and abs(fval) < 1e15:
+        return f"{int(fval):,}".replace(",", ".")
+    return f"{fval:.2f}".rstrip("0").rstrip(".")
+
+
 class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
@@ -21031,6 +22293,15 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
+        # 12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'):
+        # TF-Anzeige des Kerzen-Overlays - der Nutzer sieht, welcher
+        # Timeframe die Kerzenbreite bestimmt (z. B. 'D1' -> 16,8h-Kerzen).
+        self._label_overlay_tf = QLabel("")
+        self._label_overlay_tf.setStyleSheet(
+            "color: #808080; font-size: 11px;")
+        self._label_overlay_tf.setToolTip(
+            "Timeframe des Kerzen-Overlays - bestimmt die Kerzenbreite "
+            "(bar_sec * 0.7). Wird aus den OHLCV-Overlay-Daten gelesen.")
         self._slider_zoom_x = QSlider(Qt.Horizontal)
         self._slider_zoom_y = QSlider(Qt.Horizontal)
         self._label_info = QLabel("")
@@ -21047,6 +22318,7 @@ class HeatmapWidget(QWidget):
 
         ctrl2 = QHBoxLayout()
         ctrl2.addWidget(self._chk_candle)
+        ctrl2.addWidget(self._label_overlay_tf)
         ctrl2.addWidget(QLabel("Zoom X:"))
         ctrl2.addWidget(self._slider_zoom_x)
         ctrl2.addWidget(QLabel("Zoom Y:"))
@@ -21110,6 +22382,16 @@ class HeatmapWidget(QWidget):
         self._plot_hm.addItem(self._cross_x, ignoreBounds=True)
         self._plot_hm.addItem(self._cross_y, ignoreBounds=True)
         self._plot_hm.scene().sigMouseMoved.connect(self._on_mouse_moved)
+
+        # 21.03.11 (Bug 5): Zwei-Wege-Sync der Zoom-Slider - Maus-Zoom
+        # (Mausrad/Drag) auf der Heatmap-ViewBox muss die X-/Y-Slider
+        # mitbewegen (bisher nur einseitig Slider -> Range). Die Handler
+        # aktualisieren Slider + VM-Params (blockSignals/_syncing-Guard
+        # verhindern Endlos-Schleifen).
+        self._plot_hm.plotItem.vb.sigXRangeChanged.connect(
+            self._on_heatmap_x_range_changed)
+        self._plot_hm.plotItem.vb.sigYRangeChanged.connect(
+            self._on_heatmap_y_range_changed)
 
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a, 11.08.2026): Senkrechte
         # Teiler je Dateneinheit (Bar-Intervall des TFs, z. B. H1 -> jede
@@ -22412,7 +23694,16 @@ class HeatmapWidget(QWidget):
         # (Wick + Bull-Koerper + Bear-Koerper) fuer ALLE Bars (vorher bei
         # 5000 Bars = 10.000 Einzel-Items -> Pan/Zoom rueckelte). Die
         # Daten werden als numpy-Arrays an BarGraphItem uebergeben.
-        bar_sec = self._bar_interval_seconds()
+        # 12.08.2026 (User-Meldung 4): Kerzenbreite an den DATEN-TF der
+        # OHLCV-Bars koppeln + TF im UI-Label anzeigen.
+        data_tf = str(data.get("timeframe") or "").strip().upper()
+        bar_sec = self._bar_interval_seconds(data_tf or None)
+        lbl_tf = getattr(self, "_label_overlay_tf", None)
+        if lbl_tf is not None:
+            if data_tf:
+                lbl_tf.setText(f"Overlay: {data_tf}")
+            else:
+                lbl_tf.setText("Overlay: ?")
         times = np.asarray([c[0] for c in candles], dtype=np.float64)
         opens = np.asarray([c[1] for c in candles], dtype=np.float64)
         highs = np.asarray([c[2] for c in candles], dtype=np.float64)
@@ -22525,16 +23816,80 @@ class HeatmapWidget(QWidget):
     # ------------------------------------------------------------------
     # 21.01 Bugfix 5: Adaptives Overlay (OHLCV im Heatmap-Timeframe)
     # ------------------------------------------------------------------
-    def _bar_interval_seconds(self) -> float:
-        """Bar-Intervall des Heatmap-Timeframes in Sekunden (Bugfix 5).
+    def _bar_interval_seconds(self,
+                             data_tf: Optional[str] = None) -> float:
+        """Bar-Intervall des Overlay-Timeframes in Sekunden (Bugfix 5).
 
-        Liest `params["timeframe"]` des ViewModels (z. B. 'H1' -> 3600) und
-        liefert einen Fallback (3600s), falls der TF unbekannt/leer ist.
+        12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'): Der
+        TF wird zunaechst aus den OHLCV-Overlay-DATEN gelesen (diejenige
+        Zeitebene, deren Kerzen tatsaechlich gerendert werden) und erst
+        dann aus `params["timeframe"]` des ViewModels - die Breite folgt
+        damit IMMER der angezeigten Datenbasis (Race-/Divergenz-sicher).
+        Fallback 3600s, falls beide TF unbekannt/leer sind.
         """
         tf = ""
-        if self._view_model is not None:
+        if data_tf:
+            tf = str(data_tf)
+        elif self._view_model is not None:
             tf = str(self._view_model.params.get("timeframe") or "")
         return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
+
+    # ------------------------------------------------------------------
+    # 21.03.11 (Bug 5): Zoom-Slider Zwei-Wege-Sync (Maus-Zoom -> Slider)
+    # ------------------------------------------------------------------
+    def _on_heatmap_x_range_changed(self, _vb, xrange) -> None:
+        """Aktualisiert den X-Zoom-Slider nach Maus-Zoom auf der X-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_x, xrange,
+            self._x_min, self._x_max, "zoom_x_range")
+
+    def _on_heatmap_y_range_changed(self, _vb, yrange) -> None:
+        """Aktualisiert den Y-Zoom-Slider nach Maus-Zoom auf der Y-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_y, yrange,
+            self._y_min, self._y_max, "zoom_y_range")
+
+    def _sync_slider_from_range(self, slider, vrange, vmin, vmax, key) -> None:
+        """Setzt Slider + VM-Params aus einem ViewBox-Range (Bug 5).
+
+        Rechnet den sichtbaren Achsen-Anteil [lo, hi] aus dem Range in den
+        normalisierten [0,1]-Bereich um und stellt den Slider invers ein.
+        Kein DB-Requery (set_heatmap_zoom ist rein client-seitig).
+        """
+        span = float(vmax) - float(vmin)
+        if span <= 0:
+            return
+        try:
+            lo = (float(vrange[0]) - float(vmin)) / span
+            hi = (float(vrange[1]) - float(vmin)) / span
+        except (TypeError, ValueError, IndexError):
+            return
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+        if hi <= lo:
+            return
+        self._set_zoom_slider(slider, [lo, hi])
+        # VM-Params aktualisieren (Persistenz) - Endlos-Schleifen-Guard via
+        # _syncing (set_heatmap_zoom emittiert kein ViewBox-Range-Event).
+        try:
+            if getattr(self, "_syncing", False) or self._view_model is None:
+                return
+            self._syncing = True
+            zx = list(self._view_model.params.get("zoom_x_range") or [0.0, 1.0])
+            zy = list(self._view_model.params.get("zoom_y_range") or [0.0, 1.0])
+            if key == "zoom_x_range":
+                zx = [lo, hi]
+            else:
+                zy = [lo, hi]
+            self._view_model.set_heatmap_zoom(zx, zy)
+        except Exception:
+            pass
+        finally:
+            self._syncing = False
 
     # ------------------------------------------------------------------
     # 21.01 Bugfix 3: Fadenkreuz + Zellwert-Info
@@ -22608,7 +23963,7 @@ class HeatmapWidget(QWidget):
         except (TypeError, ValueError, IndexError):
             self._label_info.setText(f"{time_txt}Zelle({row},{col}) = n/a")
             return
-        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
+        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {_format_heatmap_value(v)}")
 
     # ------------------------------------------------------------------
     # 21.01 Bugfix 2: Diskrete Schwellwert-Legende (oben rechts)
@@ -22639,13 +23994,27 @@ class HeatmapWidget(QWidget):
                 frac = (c - vmin) / (vmax - vmin)
                 frac = max(0.0, min(1.0, frac))
                 color = cmap.map(frac, mode="qcolor")
-                label = str(c) if c < 5 else "5+"
+                # 21.03.11 (Bug 1): Operator-korrekte Beschriftung
+                # (= Treffer-Wert, >=" fuer alles darueber).
+                label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-                val = vmin + frac * (vmax - vmin)
-                color = cmap.map(frac, mode="qcolor")
-                self._add_legend_swatch(color, f"{val:.2g}")
+            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            span = vmax - vmin
+            v25 = vmin + 0.25 * span
+            v50 = vmin + 0.50 * span
+            v75 = vmin + 0.75 * span
+            fmt = _format_heatmap_value
+            self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
+                                    "<= {}".format(fmt(v25)))
+            self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
+                                    "{} - {}".format(fmt(v25), fmt(v50)))
+            self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
+                                    "{} - {}".format(fmt(v50), fmt(v75)))
+            self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
+                                    "{} - {}".format(fmt(v75), fmt(vmax)))
+            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
+                                    ">= {}".format(fmt(v75)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:
@@ -22981,6 +24350,27 @@ class _SortableTimeItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class _SortableValueItem(QTableWidgetItem):
+    """JSON-Union-Item mit numerischem Vergleich (21.03.11, Bug 6).
+
+    Die dynamischen Feature-Werte (z. B. `signal_strength`) sind im Text
+    auf 4 signifikante Stellen gekuerzt ('9.5' > '10.2' lexikografisch falsch).
+    Diese Subklasse vergleicht den Rohwert aus dem UserRole numerisch,
+    damit die 'Signal-Staerke'-Sortierung der MTF-FC-Filterleiste korrekt ist.
+    """
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, QTableWidgetItem):
+            try:
+                a = self.data(Qt.UserRole)
+                b = other.data(Qt.UserRole)
+                if a is not None and b is not None:
+                    return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
+
+
 class TablePage(QWidget):
     """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
 
@@ -23007,6 +24397,12 @@ class TablePage(QWidget):
         self._page_size: int = 100
         self._current_page: int = 0
         self._total_pages: int = 1
+        # 21.03.11 (Bug 6): Externe Sortierung aus der MTF-FC-Filterleiste
+        # ('date' | 'signal' | 'tf'). None = keine externe Vorgabe (die
+        # TablePage sortiert wie bisher nach Profil/User-Klick). Ein gesetzter
+        # Modus hat VORRANG vor der Profil-Sortierung (wird nach jedem
+        # Befuellen erneut angewendet) und persistiert NICHT als User-Setting.
+        self._external_sort_mode: Optional[str] = None
 
         self._header = QLabel("Feature-Store-Tabelle")
         self._table = QTableWidget(0, len(_BASE_COLUMNS))
@@ -23135,6 +24531,77 @@ class TablePage(QWidget):
             self._render_current_page()
 
     # ------------------------------------------------------------------
+    # 21.03.11 (Bug 6): Externe Sortierung (MTF-FC-Filterleiste via EventBus)
+    # ------------------------------------------------------------------
+    def set_external_sort_mode(self, mode: str) -> None:
+        """Setzt die externe Sortierung ('date' | 'signal' | 'tf').
+
+        Wird vom AnalyticsWindow aufgerufen, wenn die MTF-FC-Filterleiste
+        des ChartWindows eine neue Sortierung emittiert (EventBus). Der Modus
+        hat VORRANG vor der Profil-/User-Sortierung, wird nach jedem
+        Befuellen erneut angewendet und persistiert NICHT als User-Setting.
+        Ein leerer/ungueltiger Modus deaktiviert die externe Vorgabe.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = ""
+        if mode == (self._external_sort_mode or ""):
+            return
+        self._external_sort_mode = mode or None
+        if self._table.rowCount() > 0:
+            self._apply_external_sort()
+
+    def _apply_external_sort(self) -> None:
+        """Wendet die externe Sortierung auf die Tabelle an (Bug 6).
+
+        Spalten-Mapping: 'date' -> Zeit (absteigend, UserRole-Epoch),
+        'signal' -> Header-Substring (signal/stärke/score/conf/wert) auf den
+        dynamischen JSON-Union-Spalten (absteigend, numerisch via
+        `_SortableValueItem`), 'tf' -> Header-Substring (timeframe/tf)
+        aufsteigend. Fallback (keine passende Spalte): Zeit absteigend.
+        Die QTableWidget-Sortierung (setSortingEnabled + sortItems) betrifft
+        nur die ANZEIGE – `_current_rows` und das Jump-to-Chart-Mapping
+        (UserRole+1) bleiben unveraendert.
+        """
+        mode = self._external_sort_mode or "date"
+        column: int = _COL_TIME
+        order: Qt.SortOrder = Qt.DescendingOrder
+        if mode == "signal":
+            col = self._find_dynamic_header(
+                ("signal", "stärke", "staerke", "score", "conf", "wert"))
+            if col is not None:
+                column, order = col, Qt.DescendingOrder
+        elif mode == "tf":
+            col = self._find_dynamic_header(("timeframe", "tf"))
+            if col is not None:
+                column, order = col, Qt.AscendingOrder
+        # Signale blockieren: externe Sortierung ist KEINE User-Aktion und
+        # darf nicht `table_settings_changed` (Profil-Persistenz) ausloesen.
+        header = self._table.horizontalHeader()
+        header.blockSignals(True)
+        try:
+            self._table.setSortingEnabled(True)
+            self._table.sortItems(column, order)
+        finally:
+            header.blockSignals(False)
+
+    def _find_dynamic_header(self, needles: tuple) -> Optional[int]:
+        """Findet eine dynamische JSON-Union-Spalte per Header-Substring.
+
+        Sucht NUR die Spalten ab `_COL_SERVICE + 1` (die dynamischen
+        Feature-Keys) – Basis-Spalten 'Zeit (Wanduhr)'/'Service' werden nie
+        getroffen (ein 'tf'-Substring in 'Zeit' waere falsch).
+        """
+        for col in range(_COL_SERVICE + 1, self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            text = str(item.text()).lower()
+            if any(n in text for n in needles):
+                return col
+        return None
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -23256,6 +24723,11 @@ class TablePage(QWidget):
         finally:
             for w in blocked:
                 w.blockSignals(False)
+        # 21.03.11 (Bug 6): Externe MTF-FC-Sortierung hat Vorrang vor der
+        # Profil-Sortierung und wird nach JEDEM Befuellen erneut angewendet
+        # (nur Anzeige, kein User-Setting, kein Dirty-Flag).
+        if self._external_sort_mode:
+            self._apply_external_sort()
         self._update_page_controls()
 
     def _populate_rows(
@@ -23288,6 +24760,10 @@ class TablePage(QWidget):
             self._table.setItem(r, _COL_SERVICE,
                                 QTableWidgetItem(service_names[r] or "-"))
             # JSON-Union-Spalten: Wert aus feature_data, sonst "-".
+            # 21.03.11 (Bug 6): Numerische Werte als `_SortableValueItem` mit
+            # Rohwert im UserRole – die 'Signal-Staerke'-Sortierung der
+            # MTF-FC-Filterleiste vergleicht dann numerisch statt lexiko-
+            # grafisch ('9.5' < '10.2' korrekt).
             fd = row.get("feature_data")
             if not isinstance(fd, dict):
                 fd = {}
@@ -23296,7 +24772,9 @@ class TablePage(QWidget):
                 if v is None:
                     self._table.setItem(r, ci, QTableWidgetItem("-"))
                 elif isinstance(v, (int, float)):
-                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
+                    item = _SortableValueItem(f"{v:.4g}")
+                    item.setData(Qt.UserRole, float(v))
+                    self._table.setItem(r, ci, item)
                 else:
                     self._table.setItem(r, ci, QTableWidgetItem(str(v)))
 
@@ -23605,6 +25083,15 @@ JS_FILES = [
     # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
     # werden (hängt sich über optionale Hooks in 04 ein).
     "06_two_tier.js",
+    # Phase 21.03 (MTF-FC v4): Zoom-Kaskade, Puls-Breadcrumb, Boundary-UI
+    # (07) und interaktive TF-Badges & Geister-Marker (08). Beide hängen
+    # sich über optionale Hooks in 04 ein (Muster 06_two_tier.js).
+    "07_mtf_fc.js",
+    "08_mtf_layers.js",
+    # 21.03.11 (Bug 4): TF-spezifische Achsen-Ticks – Overlay-Layer rendert
+    # Zeit-Tick-Labels aligniert zum gewählten Timeframe (M15 -> 15-min-
+    # Marken, H1 -> 1h-Marken); 04 liefert die Intraday-Labels zurück.
+    "09_mtf_axis.js",
 ]
 
 
@@ -23778,6 +25265,12 @@ class ChartBridge(QObject):
     measurementChanged = Signal(str)
     olderDataRequested = Signal(int, int, int, int)
     jumpToLiveRequested = Signal()
+    # Phase 21.03 (MTF-FC v4): Viewport-Epochs für die Kaskaden-Engine,
+    # interaktive TF-Badges und Geister-Marker (21.03.08/21.03.09).
+    viewportChanged = Signal(int, int)
+    badgeClicked = Signal(str, bool)
+    ghostMarkerClicked = Signal(float, str)
+    guardOverrideReset = Signal()
 
     @Slot(float, float, float)
     def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
@@ -23794,6 +25287,21 @@ class ChartBridge(QObject):
 
     @Slot()
     def onJumpToLive(self): self.jumpToLiveRequested.emit()
+
+    @Slot(int, int)
+    def onViewportChanged(self, from_epoch, to_epoch):
+        self.viewportChanged.emit(from_epoch, to_epoch)
+
+    @Slot(str, bool)
+    def onBadgeClick(self, tf, ctrl):
+        self.badgeClicked.emit(tf, ctrl)
+
+    @Slot(float, str)
+    def onGhostMarkerClick(self, price, target_tf):
+        self.ghostMarkerClicked.emit(price, target_tf)
+
+    @Slot()
+    def onGuardOverrideReset(self): self.guardOverrideReset.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -23977,6 +25485,25 @@ class PyTraderChartWindow(QMainWindow):
         self._js_window_first_real: Optional[int] = None
         self._js_window_last_real: Optional[int] = None
 
+        # Phase 21.03 (MTF-FC v4): Data Provider + Boundary + isolierter
+        # Namespace (Schicht 2, 21.03.01/02). Die Engine-Module sind reine
+        # Logik; die UI greift NIE direkt auf shared_state zu, sondern über
+        # den Provider (MVVM, Grundsatz 4). Der Namespace ist fenster-lokal.
+        self.mtf_fc_provider: MtfFcProvider = MtfFcProvider()
+        self.mtf_fc_boundary: MtfFcBoundary = MtfFcBoundary(provider=self.mtf_fc_provider)
+        self._mtf_fc_context = None  # PluginContext wird lazy je Aufruf erzeugt
+        self._mtf_fc_ns: Dict[str, Any] = default_mtf_fc_state()
+        self._mtf_fc_last_viewport: Optional[Tuple[int, int]] = None
+        # 21.03.11 (Bug 2): Pending-Viewport-Epochs nach einem Kaskaden-TF-
+        # Wechsel. Die persistierten `visible_from/visible_to` sind Bar-Offsets
+        # des ALTEN TF-Fensters (H1) und dürfen NICHT auf das neue Fenster
+        # (z. B. M5) angewendet werden (sonst zeigt der Chart einen winzigen
+        # Ausschnitt und die Kaskade springt direkt weiter). Stattdessen wird
+        # der Zeitbereich des auslösenden Viewports (Wanduhr-Epochs) beim
+        # Refresh beibehalten und in logische Indizes des neuen Fensters
+        # übersetzt (`_resolve_epoch_logical_range`).
+        self._mtf_fc_pending_epochs: Optional[Tuple[int, int]] = None
+
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
         matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
@@ -24117,6 +25644,26 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
+        # Phase 21.03 (MTF-FC v4): Filterleiste (21.03.07) in die Toolbar
+        # einsetzen (nach row2). MVVM: Das Widget enthält KEIN SQL und
+        # kommuniziert ausschliesslich über Signale (Grundsatz 4/5).
+        self.mtf_filter_bar: MtfFilterBarWidget = MtfFilterBarWidget(
+            provider=self.mtf_fc_provider)
+        toolbar_layout = self.ui_widget.findChild(QVBoxLayout, "verticalLayout_toolbar")
+        if toolbar_layout is not None:
+            toolbar_layout.addWidget(self.mtf_filter_bar)
+        self.mtf_filter_bar.data_tf_changed.connect(self._on_mtf_fc_data_tf_changed)
+        self.mtf_filter_bar.chart_tf_changed.connect(self._on_mtf_fc_chart_tf_changed)
+        self.mtf_filter_bar.range_changed.connect(self._on_mtf_fc_range_changed)
+        self.mtf_filter_bar.guard_override_requested.connect(self._on_mtf_fc_guard_override_requested)
+        # 21.03.11 (Bug 6): Fehlende Verdrahtung nachgerüstet – Sortierung,
+        # Session-Filter und Template-Anwendung waren als UI vorhanden, aber
+        # nicht an die Logik angebunden (Dropdowns/Buttons wirkungslos).
+        self.mtf_filter_bar.sort_mode_changed.connect(self._on_mtf_fc_sort_mode_changed)
+        self.mtf_filter_bar.sessions_changed.connect(self._on_mtf_fc_sessions_changed)
+        self.mtf_filter_bar.template_applied.connect(self._on_mtf_fc_template_applied)
+        self.mtf_filter_bar.refresh_templates()
+
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
         self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -24136,6 +25683,11 @@ class PyTraderChartWindow(QMainWindow):
         # Live-Ende („Live"-Button).
         self.bridge.olderDataRequested.connect(self._on_older_data_requested)
         self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
+        # Phase 21.03 (MTF-FC v4): Kaskaden-/Layer-Signale (21.03.08/09).
+        self.bridge.viewportChanged.connect(self._on_mtf_fc_viewport_changed)
+        self.bridge.badgeClicked.connect(self._on_mtf_fc_badge_clicked)
+        self.bridge.ghostMarkerClicked.connect(self._on_mtf_fc_ghost_marker_clicked)
+        self.bridge.guardOverrideReset.connect(self._on_mtf_fc_guard_reset)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -24658,6 +26210,9 @@ class PyTraderChartWindow(QMainWindow):
             # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
             # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
             "hasMoreHistory": self.chart_buffer.has_more_history,
+            # Phase 21.03 (MTF-FC v4): Kaskaden-/Boundary-State für die
+            # JS-Hooks (Breadcrumb, Boundary-UI, Layer-Badges).
+            "mtfFcState": self._mtf_fc_js_state(),
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -24669,8 +26224,19 @@ class PyTraderChartWindow(QMainWindow):
 
         # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
         # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
-        range_from, range_to = self._resolve_visible_logical_range(
-            len(continuous_candles))
+        # 21.03.11 (Bug 2): Nach einem Kaskaden-TF-Wechsel (z. B. H1 -> M5)
+        # werden die auslösenden Viewport-EPOCHS beibehalten, statt die
+        # Bar-Offsets des alten TF-Fensters auf das neue Fenster anzuwenden
+        # (die Offsets sind fensterspezifisch -> winziger/verrutschter
+        # Ausschnitt, Kaskade würde sofort weiter springen).
+        if self._mtf_fc_pending_epochs is not None:
+            vp_from, vp_to = self._mtf_fc_pending_epochs
+            self._mtf_fc_pending_epochs = None
+            range_from, range_to = self._resolve_epoch_logical_range(
+                continuous_candles, vp_from, vp_to)
+        else:
+            range_from, range_to = self._resolve_visible_logical_range(
+                len(continuous_candles))
         if range_from is not None and range_to is not None:
             update_package["rangeFrom"] = range_from
             update_package["rangeTo"] = range_to
@@ -24825,6 +26391,80 @@ class PyTraderChartWindow(QMainWindow):
         f = max(0, min(vf, total - 1))
         t = max(f + 1, min(vt, total))
         return f, t
+
+    def _resolve_epoch_logical_range(
+        self, candles: List[Dict[str, Any]],
+        from_epoch: Optional[int], to_epoch: Optional[int]):
+        """21.03.11 (Bug 2): Übersetzt einen Zeitbereich (Wanduhr-Epochs) in
+        logische Indizes des aktuellen Tier-1-Fensters.
+
+        Nach einem Kaskaden-TF-Wechsel wird der auslösende Viewport-Zeitbereich
+        beibehalten (statt der fensterspezifischen Bar-Offsets). Die konti-
+        nuierlichen Candle-Zeiten werden über `_time_cont_to_real` auf echte
+        Epochs gemappt und per Binärsuche in Indizes übersetzt.
+
+        Args:
+            candles: Tier-1-Kerzen (kontinuierliche Zeiten).
+            from_epoch/to_epoch: Zeitbereich als Wanduhr-Epochs.
+
+        Returns:
+            (range_from, range_to) als ints oder (None, None).
+        """
+        if not candles:
+            return None, None
+        if from_epoch is None or to_epoch is None:
+            return None, None
+        try:
+            from_epoch, to_epoch = int(from_epoch), int(to_epoch)
+        except (TypeError, ValueError):
+            return None, None
+        # Zeitbereich -> kontinuierliche Zeiten (Binärsuche auf cont-Keys).
+        # _time_cont_to_real mappt cont -> real (bijektiv, monoton steigend,
+        # Invariante 7). Die reale Epoch ist in cont monoton wachsend, daher
+        # ist die Binärsuche auf den sortierten cont-Keys korrekt.
+        if not self._time_cont_to_real:
+            return None, None
+        cont_keys = sorted(self._time_cont_to_real.keys())
+        if not cont_keys:
+            return None, None
+        f_cont = self._epoch_to_cont(cont_keys, from_epoch)
+        t_cont = self._epoch_to_cont(cont_keys, to_epoch)
+        if f_cont is None or t_cont is None:
+            return None, None
+        # Kontinuierliche Zeiten -> Indizes im Tier-1-Fenster.
+        f_idx, t_idx = 0, len(candles) - 1
+        for i, c in enumerate(candles):
+            if int(c["time"]) >= f_cont:
+                f_idx = i
+                break
+        for i in range(len(candles) - 1, -1, -1):
+            if int(candles[i]["time"]) <= t_cont:
+                t_idx = i
+                break
+        if t_idx < f_idx:
+            t_idx = f_idx
+        return f_idx, t_idx
+
+    def _epoch_to_cont(self, cont_keys: List[int], epoch: int) -> Optional[int]:
+        """Binärsuche: kontinuierliche Zeit für einen Wanduhr-Epoch.
+
+        Liefert den cont-Key, dessen reale Epoch am nächsten unterhalb der
+        gesuchten liegt (obere Schranke), damit der Viewport den Zeitbereich
+        inklusive der linken Kante abdeckt. Liegt die gesuchte Epoch vor dem
+        ersten Datenpunkt, wird der erste Key geliefert."""
+        if not cont_keys:
+            return None
+        lo, hi = 0, len(cont_keys) - 1
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            mid_real = self._time_cont_to_real[cont_keys[mid]]
+            if mid_real <= epoch:
+                best = cont_keys[mid]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best if best is not None else cont_keys[0]
 
     def _on_jump_to_live(self) -> None:
         """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
@@ -25236,6 +26876,267 @@ class PyTraderChartWindow(QMainWindow):
         if not self._is_loading_data:
             self.measurement_state = json.loads(m) if m else None
             self.save_state()
+
+    # ======================================================================
+    # Phase 21.03 – MTF-FC v4 (Kaskade, Boundary, Guards, Filterleiste)
+    # ======================================================================
+
+    def _mtf_fc_js_state(self) -> Dict[str, Any]:
+        """Baut den JS-freundlichen MTF-FC-State für das Update-Payload.
+
+        Keys sind camelCase (JS-Hooks in 07/08) und werden aus dem fenster-
+        lokalen Namespace abgeleitet. `m1_available_from` wird über den
+        Boundary-Resolver live ermittelt (21.03.02)."""
+        hb = dict(self._mtf_fc_ns.get("history_boundaries") or {})
+        try:
+            boundary = self.mtf_fc_boundary.evaluate_coverage(
+                self.current_symbol,
+                self._mtf_fc_last_viewport[0] if self._mtf_fc_last_viewport else None,
+            )
+            hb["m1_available_from"] = boundary.get("m1_available_from")
+            hb["coverage_status"] = boundary.get("coverage_status")
+            hb["source_tf"] = boundary.get("source_tf")
+        except Exception as e:
+            print(f"⚠️ [MTF-FC] Boundary-Evaluierung fehlgeschlagen: {e}")
+        cascade = self._mtf_fc_ns.get("cascade_state") or {}
+        override = self._mtf_fc_ns.get("temporary_guard_override") or {}
+        return {
+            "activeChartTf": self.current_tf,
+            "activeDataTf": self._mtf_fc_ns.get("active_data_tf") or "M15",
+            "historyBoundaries": hb,
+            "transitionStartedAt": cascade.get("transition_started_at", 0.0),
+            "rangeDays": cascade.get("range_days", 0.0),
+            "temporaryGuardOverride": {
+                "active": bool(override.get("active")),
+                "previousDataTf": override.get("previous_data_tf"),
+                "targetTf": override.get("target_tf"),
+                "reason": override.get("reason"),
+            },
+        }
+
+    def _on_mtf_fc_viewport_changed(self, from_ts: int, to_ts: int) -> None:
+        """Kaskaden-Trigger: JS meldet die Viewport-Kanten (Wanduhr-Epochs).
+
+        Ruft die Hysterese-Engine (21.03.03) auf. Bei Zoom-Out/-In über die
+        Schwellwerte und bestandener Transition-Guard-Periode wird der
+        Chart-TF gewechselt (`tf_combo`-Sync + Refresh)."""
+        if self._is_loading_data:
+            return
+        try:
+            from_ts, to_ts = int(from_ts), int(to_ts)
+            self._mtf_fc_last_viewport = (from_ts, to_ts)
+            ns = self._mtf_fc_ns
+            cascade = ns.setdefault("cascade_state", {})
+
+            # Boundary (21.03.02) in den Namespace übernehmen (Level 1).
+            boundary = self.mtf_fc_boundary.evaluate_coverage(
+                self.current_symbol, from_ts)
+            ns["history_boundaries"] = {
+                "m1_available_from": boundary.get("m1_available_from"),
+                "coverage_status": boundary.get("coverage_status"),
+                "source_tf": boundary.get("source_tf"),
+            }
+            if boundary.get("coverage_status") == "fallback":
+                # Ebene 1 – Hard Data Availability Guard: Fallback-TF erzwingen.
+                source_tf = boundary.get("source_tf") or "H1"
+                if source_tf != self.current_tf:
+                    print(f"⚠️ [MTF-FC] Fallback-Guard: {self.current_tf} -> {source_tf}")
+                    self._mtf_fc_switch_tf(source_tf)
+                return
+
+            # 21.03.11 (Bug 2/6): Chart-TF-Modus 'fix' unterbindet die Auto-
+            # Kaskade (kein automatischer TF-Wechsel bei Zoom). Der Modus war
+            # bisher nur gespeichert (Namespace), aber nie ausgewertet.
+            if ns.get("chart_tf_mode") == "fix":
+                return
+
+            # Auto-Kaskade (21.03.03): Kandidat aus Viewport-Breite.
+            cascade["current_tf"] = self.current_tf
+            result = evaluate_cascade(from_ts, to_ts, self.current_tf, cascade)
+            cascade["candidate_tf"] = result["candidate_tf"]
+            cascade["direction"] = result["direction"]
+            cascade["range_days"] = result["range_days"]
+
+            candidate = result["candidate_tf"]
+            if candidate is None:
+                return
+            # Transition Guard: Umschalten erst nach CROSSFADE-Zeit.
+            if not transition_guard_ok(cascade):
+                return
+            if candidate != self.current_tf:
+                telemetry = apply_transition(
+                    cascade, candidate, result["direction"],
+                    result["range_days"])
+                print(f"[MTF-FC] Kaskade: {telemetry}")
+                self._mtf_fc_switch_tf(candidate)
+        except Exception as e:
+            print(f"⚠️ [MTF-FC] Kaskaden-Trigger fehlgeschlagen: {e}")
+
+    def _mtf_fc_switch_tf(self, new_tf: str) -> None:
+        """Wechselt den Chart-TF konsistent (tf_combo-Sync + Refresh).
+
+        Setzt `current_tf` und synchronisiert die ComboBox, damit die
+        bestehende `on_tf_changed`-Logik (Zustand laden, Refresh) sauber
+        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt.
+
+        21.03.11 (Bug 2): Der aktuelle Viewport-ZEITBEREICH (Wanduhr-Epochs)
+        wird als pending übernommen, damit der neue TF nach dem Refresh
+        denselben Zeitausschnitt zeigt (statt der fensterspezifischen
+        Bar-Offsets des alten TF -> sonst winziger/verrutschter Ausschnitt)."""
+        new_tf = str(new_tf or "").upper()
+        if not new_tf or new_tf == self.current_tf:
+            return
+        # Viewport-Epochs für den folgenden Refresh merken (sofern bekannt).
+        if self._mtf_fc_last_viewport is not None:
+            self._mtf_fc_pending_epochs = self._mtf_fc_last_viewport
+        if self.tf_combo is not None:
+            idx = self.tf_combo.findText(new_tf)
+            if idx < 0:
+                self.tf_combo.addItem(new_tf)
+                idx = self.tf_combo.findText(new_tf)
+            if idx >= 0:
+                self.tf_combo.blockSignals(True)
+                self.tf_combo.setCurrentIndex(idx)
+                self.tf_combo.blockSignals(False)
+        self.current_tf = new_tf
+        self._update_window_title()
+        self.refresh_chart_data()
+
+    def _on_mtf_fc_data_tf_changed(self, data_tf: str) -> None:
+        """Filterleiste: Source-Data-TF geändert (multi | fixiert)."""
+        self._mtf_fc_ns["active_data_tf"] = data_tf
+        # Ebene 3 (Fixed Data-TF Guard): Fixierter Data-TF begrenzt den
+        # Chart-TF nach oben (nie höher als das Data-TF).
+        if data_tf and str(data_tf).lower() != "multi":
+            if self.current_tf is not None:
+                from analytics.engine.mtf_fc_guards import _tf_rank
+                if _tf_rank(self.current_tf) > _tf_rank(data_tf):
+                    print(f"⚠️ [MTF-FC] Fixed-Guard: Chart-TF {self.current_tf} "
+                          f"-> {data_tf} (Data-TF fixiert)")
+                    self._mtf_fc_switch_tf(data_tf)
+
+    def _on_mtf_fc_chart_tf_changed(self, mode: str) -> None:
+        """Filterleiste: Chart-Overlay-Modus ('auto' | 'fix')."""
+        self._mtf_fc_ns["chart_tf_mode"] = mode
+
+    def _on_mtf_fc_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
+        """Filterleiste: Range-Preset -> Viewport im Namespace + JS-Sync."""
+        self._mtf_fc_ns["viewport_range"] = {"from_ts": from_ts, "to_ts": to_ts}
+        self._mtf_fc_last_viewport = (int(from_ts), int(to_ts))
+        # JS-Viewport auf das Preset-Fenster setzen (sofern Chart geladen).
+        try:
+            self.web_view.page().runJavaScript(
+                "if(window._mtfFcApplyRange) _mtfFcApplyRange("
+                f"{int(from_ts)}, {int(to_ts)});")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _on_mtf_fc_badge_clicked(self, tf: str, ctrl: bool) -> None:
+        """Interaktives TF-Badge (21.03.09): Klick filtert auf diesen TF.
+
+        Strg+Klick = Multi-Select (in dieser Version: zusätzliches Setzen
+        des aktiven TF im Namespace, ohne harten Wechsel)."""
+        tf = str(tf or "").upper()
+        if not tf:
+            return
+        if ctrl:
+            # Multi-Select: TF dem Namespace-Vektor hinzufügen (kein Wechsel).
+            multi = self._mtf_fc_ns.setdefault("multi_select_tfs", [])
+            if tf not in multi:
+                multi.append(tf)
+            return
+        self._mtf_fc_switch_tf(tf)
+
+    def _on_mtf_fc_ghost_marker_clicked(self, price: float, target_tf: str) -> None:
+        """Geister-Marker-Klick (21.03.09): Ebene-2-Guard-Override.
+
+        Startet den Temporary Override (previous_data_tf = aktives Data-TF)
+        und wechselt auf den Ziel-TF (z. B. D1). Der Reset stellt exakt den
+        vorherigen Data-TF wieder her (21.03.05)."""
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            price = 0.0
+        target_tf = str(target_tf or "D1").upper()
+        ns = self._mtf_fc_ns
+        override = ns.setdefault("temporary_guard_override", {})
+        current_data_tf = str(ns.get("active_data_tf") or "M15")
+        start_override(override, current_data_tf, target_tf, "ghost_marker_click")
+        print(f"[MTF-FC] Guard-Override: Data-TF {current_data_tf} "
+              f"-> temporär {target_tf}")
+        # Override-UI (Reset-Badge) an JS schicken.
+        self._push_mtf_fc_override_ui()
+        self._mtf_fc_switch_tf(target_tf)
+
+    def _on_mtf_fc_guard_override_requested(self, target_tf: str, reason: str) -> None:
+        """Filterleiste: Override angefordert (z. B. Geister-Marker)."""
+        self._on_mtf_fc_ghost_marker_clicked(0.0, target_tf)
+
+    def _on_mtf_fc_guard_reset(self) -> None:
+        """Reset-Badge-Klick: Override zurücksetzen, previous_data_tf wiederherstellen."""
+        ns = self._mtf_fc_ns
+        override = ns.setdefault("temporary_guard_override", {})
+        if not override.get("active"):
+            return
+        restored = reset_override(override)
+        print(f"[MTF-FC] Guard-Reset: Data-TF wiederhergestellt -> {restored}")
+        ns["active_data_tf"] = restored
+        # Filterleisten-State synchronisieren (falls vorhanden).
+        fb = getattr(self, "mtf_filter_bar", None)
+        if fb is not None:
+            fb.apply_namespace_state(self)
+        self._push_mtf_fc_override_ui()
+        if restored and str(restored).lower() != "multi":
+            self._mtf_fc_switch_tf(restored)
+
+    def _on_mtf_fc_sort_mode_changed(self, mode: str) -> None:
+        """Filterleiste: Tabellen-Sortierung ('date' | 'signal' | 'tf').
+
+        21.03.11 (Bug 6): Nachgeruestete Verdrahtung. Der Modus wird im
+        MTF-FC-Namespace persistiert und zusaetzlich ueber den EventBus
+        emittiert (`mtf_fc_sort_changed`) - das AnalyticsWindow wendet ihn
+        auf die TablePage-Sortierung an (Entkopplung, kein Fenster-Know-how).
+        """
+        self._mtf_fc_ns["sort_mode"] = mode
+        try:
+            event_bus.mtf_fc_sort_changed.emit(mode)
+        except Exception as e:  # pragma: no cover
+            print(f"WARN [MTF-FC] Sort-EventBus-Emission fehlgeschlagen: {e}")
+        print(f"[MTF-FC] Sortierung: {mode}")
+
+    def _on_mtf_fc_sessions_changed(self, sessions: list) -> None:
+        """Filterleiste: Session-Farbbalken (London/NY/Tokio) im M1/M5-Zoom."""
+        self._mtf_fc_ns["sessions"] = list(sessions)
+        print(f"[MTF-FC] Sessions: {list(sessions)}")
+
+    def _on_mtf_fc_template_applied(self, template: dict) -> None:
+        """Filterleiste: View-Template geladen.
+
+        Die Werte (Data-TF, Range, Sortierung, Sessions) wurden vom Widget
+        bereits über die Einzelsignale emittiert – hier nur der Log-/Sync-
+        Abschluss, damit die Filterleiste den konsolidierten State zeigt.
+        """
+        print(f"[MTF-FC] Template angewendet: "
+              f"{template.get('name') or 'Unbenannt'}")
+        fb = getattr(self, "mtf_filter_bar", None)
+        if fb is not None:
+            fb.apply_namespace_state(self)
+
+    def _push_mtf_fc_override_ui(self) -> None:
+        """Sendet den Override-Zustand an die JS-Layer (Reset-Badge)."""
+        ns = self._mtf_fc_ns
+        override = ns.get("temporary_guard_override") or {}
+        try:
+            self.web_view.page().runJavaScript(
+                "if(window.renderMtfLayers) renderMtfLayers("
+                + json.dumps({
+                    "badges": [],
+                    "ghostMarkers": [],
+                    "overrideActive": bool(override.get("active")),
+                    "overrideTargetTf": override.get("target_tf"),
+                }) + ");")
+        except (RuntimeError, AttributeError):
+            pass
 
     def save_state(self):
         if not self.state_manager or self._is_loading_data: return
@@ -29339,9 +31240,18 @@ def resolve_bull_color(
 
 
 def _sma_values(values: np.ndarray, period: int) -> np.ndarray:
-    """SMA über rollierende Fenster (konstanter Gewichtsvektor)."""
+    """SMA über rollierende Fenster (konstanter Gewichtsvektor).
+
+    Bugfix 12.08.2026 (srv_trend_hma_pivot / LiveAnalyzer): Ist die Serie
+    KÜRZER als `period`, liefert `np.convolve(..., mode="valid")` ein Array
+    der Länge `period-n+1`, während `result[period-1:]` leer ist -> ValueError
+    "could not broadcast input array from shape (k,) into shape (0,)". Guard:
+    kurze Serien -> komplett NaN (Warmup-Vertrag, kein Crash).
+    """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     window = np.ones(period, dtype=float)
     conv = np.convolve(values, window, mode="valid") / float(period)
     result = np.full(len(values), np.nan, dtype=float)
@@ -29359,6 +31269,8 @@ def _wma_values(values: np.ndarray, period: int) -> np.ndarray:
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     weights = np.arange(period, 0, -1, dtype=float)
     conv = np.convolve(values, weights, mode="valid") / weights.sum()
     result = np.full(len(values), np.nan, dtype=float)
@@ -29496,6 +31408,8 @@ def _alma_values(values: np.ndarray, period: int) -> np.ndarray:
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     offset = (period - 1) * _ALMA_OFFSET
     sigma = period / 6.0
     m = np.arange(period, dtype=float) - offset
@@ -29518,6 +31432,8 @@ def _vwma_values(
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     vol = np.where(np.isnan(volume), 0.0, volume)
     pv = values * vol
     pv_sum = np.convolve(pv, np.ones(period, dtype=float), mode="valid")
@@ -30739,6 +32655,11 @@ function applyFullChartUpdate(data) {
                         if (isDailyOrHigher || tickMarkType <= 2) {
                             return p.day + '.' + p.month + '.' + p.year.slice(-2);
                         }
+                        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) aktiv -> die
+                        // TF-alignierten Zeit-Ticks rendert das Overlay selbst
+                        // (M15 -> 15-min-Marken statt 12h-Blöcke). LWC-Intraday-
+                        // Labels hier abgeben; Tagesgrenzen behalten das Datum.
+                        if (window._mtfAxisActive) return '';
                         return p.hour + ':' + p.minute;
                     }
                 },
@@ -30790,6 +32711,12 @@ function applyFullChartUpdate(data) {
         // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
         // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
         try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
+        // P21.03 (MTF-FC, 08/12): State-Reset für Kaskade/Boundary/Layer.
+        // Muster 06_two_tier.js – optionaler Hook, kein Umbau des Kern-Pfads.
+        try { if (window._onMtfFcFullUpdate) window._onMtfFcFullUpdate(data); } catch(e) {}
+        try { if (window._onMtfLayersFullUpdate) window._onMtfLayersFullUpdate(data); } catch(e) {}
+        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) – TF-alignierte Tick-Labels.
+        try { if (window._onMtfAxisFullUpdate) window._onMtfAxisFullUpdate(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -30811,6 +32738,10 @@ function applyFullChartUpdate(data) {
                     // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
                     // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
                     try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
+                    // P21.03 (MTF-FC): Kaskaden-Trigger (Zoom -> Python).
+                    try { if (window._onMtfFcVisibleRangeChanged) window._onMtfFcVisibleRangeChanged(); } catch(e) {}
+                    // P21.03.11 (Bug 4): MTF-Axis-Overlay bei Zoom/Scroll neu rendern.
+                    try { if (window._onMtfAxisVisibleRangeChanged) window._onMtfAxisVisibleRangeChanged(); } catch(e) {}
                 }
             });
 
@@ -31538,6 +33469,641 @@ function _isHistoryView() {
 
 --------------------------------------------------
 
+### DATEI: chart/js/07_mtf_fc.js
+```js
+// chart/js/07_mtf_fc.js
+// Phase 21.03.08 – MTF-FC Chart-Integration (JS-Tier)
+//
+// Zuständigkeiten:
+//   * Zoom-Hook: bei visibleRangeChanged werden die Viewport-Kanten
+//     (reale Wanduhr-Epochs) debounced an Python geschickt
+//     (pyBridge.onViewportChanged) -> Python bewertet die Kaskade (21.03.03)
+//     und liefert {current_tf, candidate_tf} via Payload zurück.
+//   * Puls-Breadcrumb: transparenter Badge `[ ⚡ Kerzen: M5 ]` oben rechts,
+//     der bei TF-Umschaltung kurz hellblau aufleuchtet (§4 Säule 2.2).
+//   * Boundary-UI: `ℹ️ M1 verfügbar ab DD.MM.JJJJ` sowie Fallback-Hinweis
+//     "Keine M1-Rohdaten für diesen Zeitraum" (§4 Säule 1.3, 21.03.02).
+//
+// Dieses Modul wird NACH 04_live_updates.js geladen und hängt sich über die
+// optionalen Hooks ein:
+//   window._onMtfFcFullUpdate(data)        – State-Reset nach Full-Update
+//   window._onMtfFcVisibleRangeChanged()   – Kaskaden-Trigger (Zoom)
+// (04_live_updates.js ruft beide optional auf – Muster 06_two_tier.js.)
+
+// =============================================================================
+// Zustand
+// =============================================================================
+let _mtfFc = {
+    activeChartTf: null,       // aktueller Chart-TF (aus Python-Payload)
+    lastChartTf: null,         // vorheriger Chart-TF (Breadcrumb-Detection)
+    transitionStartedAt: 0,    // Transition Guard (Zeitstempel der letzten Schaltung)
+    rangeDays: 0,
+    historyBoundaries: null,   // { m1AvailableFrom, coverageStatus, sourceTf }
+    breadcrumbTimer: null,
+    viewportTimer: null,       // Debounce-Timer für Kaskaden-Trigger
+};
+
+const MTF_FC_VIEWPORT_DEBOUNCE_MS = 150;  // JS-Debounce für Zoom-Hook
+const MTF_FC_BREADCRUMB_MS = 1500;        // Puls-Dauer des Breadcrumbs
+
+// =============================================================================
+// Helper: Viewport-Epochs aus der logischen Range
+// =============================================================================
+function _mtfFcComputeViewportEpochs() {
+    if (!chart || !rawCandleData || rawCandleData.length === 0) return null;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (!lr || lr.from === null || lr.to === null) return null;
+        var fromIdx = Math.max(0, Math.floor(lr.from));
+        var toIdx = Math.min(rawCandleData.length - 1, Math.floor(lr.to));
+        if (toIdx < fromIdx) return null;
+        var fromEpoch = toReal(rawCandleData[fromIdx].time);
+        var toEpoch = toReal(rawCandleData[toIdx].time);
+        if (fromEpoch === undefined || toEpoch === undefined) return null;
+        return { from: fromEpoch, to: toEpoch };
+    } catch (e) {
+        return null;
+    }
+}
+
+// =============================================================================
+// Puls-Breadcrumb (§4 Säule 2.2)
+// =============================================================================
+function _mtfFcEnsureBreadcrumb() {
+    var el = document.getElementById('mtf-fc-breadcrumb');
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = 'mtf-fc-breadcrumb';
+    el.style.cssText =
+        'position:absolute; top:4px; right:70px; background:rgba(41,98,255,0.15);' +
+        ' border:1px solid #2962FF; color:#d1d4dc; font-size:11px; font-weight:bold;' +
+        ' padding:2px 8px; border-radius:3px; z-index:1001; pointer-events:none;' +
+        ' opacity:0; transition:opacity 0.25s;';
+    document.getElementById('chart-container').appendChild(el);
+    return el;
+}
+
+function _mtfFcShowBreadcrumb(text) {
+    var el = _mtfFcEnsureBreadcrumb();
+    el.innerText = text;
+    el.style.opacity = '1';
+    if (_mtfFc.breadcrumbTimer) clearTimeout(_mtfFc.breadcrumbTimer);
+    _mtfFc.breadcrumbTimer = setTimeout(function() {
+        el.style.opacity = '0';
+    }, MTF_FC_BREADCRUMB_MS);
+}
+
+// =============================================================================
+// Boundary-UI (§4 Säule 1.3): ℹ️ M1 verfügbar ab + Fallback-Hinweis
+// =============================================================================
+function _mtfFcUpdateBoundaryInfo() {
+    var hb = _mtfFc.historyBoundaries || {};
+    var fallback = (hb.coverageStatus === 'fallback');
+    var srcTf = hb.sourceTf || 'H1';
+
+    // Fallback-Schraffur-Hinweis (keine Lücke, kein Absturz)
+    var el = document.getElementById('mtf-fc-boundary-info');
+    if (fallback) {
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'mtf-fc-boundary-info';
+            el.style.cssText =
+                'position:absolute; left:8px; bottom:8px;' +
+                ' background:rgba(242,54,69,0.15); border:1px solid #F23645;' +
+                ' color:#d1d4dc; font-size:11px; padding:3px 8px;' +
+                ' border-radius:3px; z-index:1000; pointer-events:none;';
+            document.getElementById('chart-container').appendChild(el);
+        }
+        el.style.display = 'block';
+        el.innerText = '⚠️ Keine M1-Rohdaten für diesen Zeitraum (' + srcTf + '-Fallback)';
+    } else if (el) {
+        el.style.display = 'none';
+    }
+
+    // ℹ️ M1 verfügbar ab DD.MM.JJJJ
+    var info2 = document.getElementById('mtf-fc-m1-available');
+    var from = hb.m1AvailableFrom;
+    if (typeof from === 'number' && !isNaN(from)) {
+        if (!info2) {
+            info2 = document.createElement('div');
+            info2.id = 'mtf-fc-m1-available';
+            info2.style.cssText =
+                'position:absolute; left:8px; top:4px;' +
+                ' background:rgba(41,98,255,0.12); border:1px solid #2962FF;' +
+                ' color:#d1d4dc; font-size:11px; padding:2px 8px;' +
+                ' border-radius:3px; z-index:1000; pointer-events:none;';
+            document.getElementById('chart-container').appendChild(info2);
+        }
+        var p = getBerlinParts(from);
+        info2.style.display = 'block';
+        info2.innerText = 'ℹ️ M1 verfügbar ab ' + p.day + '.' + p.month + '.' + p.year;
+    } else if (info2) {
+        info2.style.display = 'none';
+    }
+}
+
+// =============================================================================
+// Kaskaden-Trigger (Zoom-Hook)
+// =============================================================================
+function _mtfFcTriggerCascade() {
+    if (!pyBridge || !pyBridge.onViewportChanged) return;
+    if (isUpdatingChart) return;
+    var vp = _mtfFcComputeViewportEpochs();
+    if (!vp) return;
+    if (_mtfFc.viewportTimer) clearTimeout(_mtfFc.viewportTimer);
+    var from = Math.floor(vp.from);
+    var to = Math.floor(vp.to);
+    _mtfFc.viewportTimer = setTimeout(function() {
+        _mtfFc.viewportTimer = null;
+        try {
+            pyBridge.onViewportChanged(from, to);
+        } catch (e) {}
+    }, MTF_FC_VIEWPORT_DEBOUNCE_MS);
+}
+
+// =============================================================================
+// Hooks (04_live_updates.js ruft optional auf)
+// =============================================================================
+function _onMtfFcFullUpdate(data) {
+    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
+    _mtfFc.historyBoundaries = st.historyBoundaries || null;
+    if (st.activeChartTf) {
+        _mtfFc.activeChartTf = st.activeChartTf;
+        if (_mtfFc.lastChartTf && _mtfFc.lastChartTf !== st.activeChartTf) {
+            _mtfFcShowBreadcrumb('⚡ Kerzen: ' + st.activeChartTf);
+        }
+        _mtfFc.lastChartTf = st.activeChartTf;
+    }
+    if (st.transitionStartedAt) {
+        _mtfFc.transitionStartedAt = st.transitionStartedAt;
+    }
+    _mtfFcUpdateBoundaryInfo();
+}
+
+function _onMtfFcVisibleRangeChanged() {
+    _mtfFcTriggerCascade();
+}
+
+// =============================================================================
+// Externe API (Python -> JS via runJavaScript)
+// =============================================================================
+function applyMtfFcCascade(payload) {
+    // Python liefert {current_tf, candidate_tf, direction, range_days}
+    // nach einer Kaskaden-Entscheidung (Breadcrumb + State-Sync).
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.current_tf && payload.current_tf !== _mtfFc.activeChartTf) {
+        _mtfFc.activeChartTf = payload.current_tf;
+        _mtfFcShowBreadcrumb('⚡ Kerzen: ' + payload.current_tf);
+    }
+    if (payload.rangeDays !== undefined) {
+        _mtfFc.rangeDays = payload.rangeDays;
+    }
+    if (payload.transitionStartedAt) {
+        _mtfFc.transitionStartedAt = payload.transitionStartedAt;
+    }
+}
+
+// Viewport auf ein Range-Preset setzen (Python -> JS, 21.03.07).
+function _mtfFcApplyRange(fromEpoch, toEpoch) {
+    if (!chart || !rawCandleData || rawCandleData.length === 0) return;
+    try {
+        var fromIdx = -1, toIdx = -1;
+        for (var i = 0; i < rawCandleData.length; i++) {
+            var real = toReal(rawCandleData[i].time);
+            if (real === undefined) continue;
+            if (fromIdx < 0 && real >= fromEpoch) fromIdx = i;
+            if (real <= toEpoch) toIdx = i;
+        }
+        if (fromIdx < 0) fromIdx = 0;
+        if (toIdx < fromIdx) toIdx = rawCandleData.length - 1;
+        chart.timeScale().setVisibleLogicalRange({ from: fromIdx, to: toIdx });
+    } catch (e) {}
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/08_mtf_layers.js
+```js
+// chart/js/08_mtf_layers.js
+// Phase 21.03.09 – Interaktives Layering: TF-Badges & Geister-Marker
+//
+// Zuständigkeiten (§4 Säule 3):
+//   * Interaktive TF-Badges (z. B. `[ H4-Swing ]`): Klick filtert die
+//     aktuelle Ansicht synchron auf diesen Timeframe; Strg+Klick = Multi-
+//     Select. Badge-Klicks werden an Python gereicht
+//     (pyBridge.onBadgeClick(tf, ctrlKey)).
+//   * Geister-Marker (Off-Screen Level): übergeordnete Level außerhalb des
+//     Zoom-Blicks werden am Rand des Viewports als verblasster Pfeil
+//     gerendert (`▲ D1-Widerstand (27.85)`). Klick löst den Guard-Override
+//     aus (pyBridge.onGhostMarkerClick(price, targetTf)) und animiert den
+//     Viewport sanft zum Ziel-Level.
+//   * Reset-Badge `[ 🌐 Data-TF gelockert ]`: Klick auf *Reset* stellt
+//     previous_data_tf wieder her (pyBridge.onGuardOverrideReset()).
+//
+// Verhalten defensiv: Fehlende Elemente/pyBridge werden abgefangen
+// (kein Chart-Abbruch).
+
+// =============================================================================
+// Konstanten & Zustand
+// =============================================================================
+let _mtfLayers = {
+    badges: [],            // [{tf, label, active}]
+    ghostMarkers: [],      // [{price, tf, label, side}]
+    overrideActive: false,
+    overrideTargetTf: null,
+    animFrame: null,
+    animStart: null,
+};
+
+const MTF_GHOST_ANIMATION_MS = 400;  // sanfte Viewport-Animation
+
+// =============================================================================
+// Container sicherstellen
+// =============================================================================
+function _mtfLayersEnsureContainer() {
+    var c = document.getElementById('chart-container');
+    if (!c) return null;
+    var layer = document.getElementById('mtf-layers-layer');
+    if (!layer) {
+        layer = document.createElement('div');
+        layer.id = 'mtf-layers-layer';
+        layer.style.cssText =
+            'position:absolute; left:0; top:0; right:0; bottom:0;' +
+            ' pointer-events:none; z-index:1002; overflow:hidden;';
+        c.appendChild(layer);
+    }
+    return layer;
+}
+
+// =============================================================================
+// TF-Badges
+// =============================================================================
+function _mtfLayersRenderBadges() {
+    var layer = _mtfLayersEnsureContainer();
+    if (!layer) return;
+    var old = layer.querySelectorAll('.mtf-tf-badge');
+    for (var i = 0; i < old.length; i++) old[i].remove();
+
+    if (!_mtfLayers.badges || _mtfLayers.badges.length === 0) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'mtf-tf-badge-wrap';
+    wrap.style.cssText =
+        'position:absolute; left:8px; top:28px; display:flex; gap:4px;' +
+        ' pointer-events:auto; z-index:1003; flex-wrap:wrap; max-width:70%;';
+
+    for (var b = 0; b < _mtfLayers.badges.length; b++) {
+        (function(badge) {
+            var btn = document.createElement('button');
+            btn.className = 'mtf-tf-badge';
+            btn.innerText = badge.label || ('[' + badge.tf + ']');
+            btn.title = (badge.active ? 'Aktiv – Klick: Filter' : 'Klick: Filter auf ' + badge.tf)
+                + ' | Strg+Klick: Multi-Select';
+            var activeStyle = badge.active
+                ? 'background:rgba(41,98,255,0.35); border:1px solid #2962FF;'
+                : 'background:rgba(30,34,45,0.8); border:1px solid #3d4450;';
+            btn.style.cssText = activeStyle +
+                ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
+                ' padding:2px 8px; border-radius:3px; cursor:pointer;';
+            btn.addEventListener('click', function(ev) {
+                try {
+                    if (pyBridge && pyBridge.onBadgeClick) {
+                        pyBridge.onBadgeClick(badge.tf, !!(ev.ctrlKey || ev.metaKey));
+                    }
+                } catch (e) {}
+            });
+            wrap.appendChild(btn);
+        })(_mtfLayers.badges[b]);
+    }
+    layer.appendChild(wrap);
+
+    // Reset-Badge bei aktivem Temporary Override
+    if (_mtfLayers.overrideActive) {
+        var resetBtn = document.createElement('button');
+        resetBtn.className = 'mtf-tf-badge';
+        resetBtn.innerText = '🌐 Data-TF gelockert auf ' +
+            (_mtfLayers.overrideTargetTf || '?') + ' | Reset';
+        resetBtn.style.cssText =
+            'background:rgba(255,152,0,0.25); border:1px solid #FF9800;' +
+            ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
+            ' padding:2px 8px; border-radius:3px; cursor:pointer;' +
+            ' pointer-events:auto;';
+        resetBtn.addEventListener('click', function() {
+            try {
+                if (pyBridge && pyBridge.onGuardOverrideReset) pyBridge.onGuardOverrideReset();
+            } catch (e) {}
+        });
+        // Unter den TF-Badges positionieren
+        var wrap2 = document.createElement('div');
+        wrap2.className = 'mtf-tf-badge-wrap';
+        wrap2.style.cssText = wrap.style.cssText + ' top:52px;';
+        wrap2.appendChild(resetBtn);
+        layer.appendChild(wrap2);
+    }
+}
+
+// =============================================================================
+// Geister-Marker (Off-Screen Level)
+// =============================================================================
+function _mtfLayersRenderGhostMarkers() {
+    var layer = _mtfLayersEnsureContainer();
+    if (!layer) return;
+    var old = layer.querySelectorAll('.mtf-ghost-marker');
+    for (var i = 0; i < old.length; i++) old[i].remove();
+
+    if (!_mtfLayers.ghostMarkers || _mtfLayers.ghostMarkers.length === 0 || !candleSeries) return;
+
+    for (var m = 0; m < _mtfLayers.ghostMarkers.length; m++) {
+        (function(marker) {
+            var y = candleSeries.priceToCoordinate(marker.price);
+            if (y === null || y === undefined || isNaN(y)) return;
+            var x = (marker.side === 'left') ? 2 : (layer.clientWidth - 26);
+            var el = document.createElement('div');
+            el.className = 'mtf-ghost-marker';
+            el.style.cssText =
+                'position:absolute; left:' + x + 'px; top:' + Math.round(y - 10) + 'px;' +
+                ' background:rgba(30,34,45,0.6); border:1px solid #787B86;' +
+                ' color:#b2b5be; font-size:10px; padding:1px 5px; border-radius:3px;' +
+                ' opacity:0.55; cursor:pointer; pointer-events:auto; white-space:nowrap;';
+            el.innerText = (marker.side === 'left' ? '◀ ' : '▲ ') +
+                (marker.label || (marker.tf + '-Level')) + ' (' +
+                marker.price.toFixed(2) + ')';
+            el.addEventListener('click', function() {
+                try {
+                    if (pyBridge && pyBridge.onGhostMarkerClick) {
+                        pyBridge.onGhostMarkerClick(marker.price, marker.tf || 'D1');
+                    }
+                } catch (e) {}
+            });
+            layer.appendChild(el);
+        })(_mtfLayers.ghostMarkers[m]);
+    }
+}
+
+// Sanfte Viewport-Animation zum Ziel-Level (Preis-/Zeitkoordinaten)
+function animateToGhostLevel(price, targetTf) {
+    if (!chart || !candleSeries) return;
+    _mtfLayers.animStart = null;
+    if (_mtfLayers.animFrame) cancelAnimationFrame(_mtfLayers.animFrame);
+
+    function step(ts) {
+        if (!_mtfLayers.animStart) _mtfLayers.animStart = ts;
+        var progress = Math.min(1.0, (ts - _mtfLayers.animStart) / MTF_GHOST_ANIMATION_MS);
+        var eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+        try {
+            var lr = chart.timeScale().getVisibleLogicalRange();
+            if (!lr) return;
+            var target = candleSeries.coordinateToPrice(50);  // Ziel-Preisbereich Mitte
+            if (target !== null && target !== undefined) {
+                chart.priceScale('right').setVisibleRange({
+                    from: price - Math.abs(price - target) * (1 - eased) - 1,
+                    to: price + Math.abs(price - target) * (1 - eased) + 1,
+                });
+            }
+        } catch (e) {}
+        if (progress < 1.0) {
+            _mtfLayers.animFrame = requestAnimationFrame(step);
+        } else {
+            _mtfLayers.animFrame = null;
+        }
+    }
+    _mtfLayers.animFrame = requestAnimationFrame(step);
+}
+
+// =============================================================================
+// Externe API (Python -> JS via runJavaScript)
+// =============================================================================
+function renderMtfLayers(payload) {
+    // payload: { badges: [{tf,label,active}], ghostMarkers: [{price,tf,label,side}],
+    //            overrideActive: bool, overrideTargetTf: str }
+    if (!payload || typeof payload !== 'object') return;
+    if (Array.isArray(payload.badges)) _mtfLayers.badges = payload.badges;
+    if (Array.isArray(payload.ghostMarkers)) _mtfLayers.ghostMarkers = payload.ghostMarkers;
+    if (typeof payload.overrideActive === 'boolean') _mtfLayers.overrideActive = payload.overrideActive;
+    if (payload.overrideTargetTf) _mtfLayers.overrideTargetTf = payload.overrideTargetTf;
+    _mtfLayersRenderBadges();
+    _mtfLayersRenderGhostMarkers();
+}
+
+function clearMtfLayers() {
+    _mtfLayers.badges = [];
+    _mtfLayers.ghostMarkers = [];
+    _mtfLayers.overrideActive = false;
+    _mtfLayers.overrideTargetTf = null;
+    var layer = document.getElementById('mtf-layers-layer');
+    if (layer) {
+        layer.innerHTML = '';
+        layer.remove();
+    }
+}
+
+// =============================================================================
+// Full-Update-Hook: Layer auf bekannten State zurücksetzen (Muster 06)
+// =============================================================================
+function _onMtfLayersFullUpdate(data) {
+    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
+    _mtfLayers.overrideActive = !!(st.temporaryGuardOverride &&
+        st.temporaryGuardOverride.active);
+    _mtfLayers.overrideTargetTf = (st.temporaryGuardOverride &&
+        st.temporaryGuardOverride.targetTf) || null;
+    _mtfLayersRenderBadges();
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/09_mtf_axis.js
+```js
+// chart/js/09_mtf_axis.js
+// Phase 21.03.11 (Bug 4) – TF-spezifische Achsen-Ticks
+//
+// Problem (User-Meldung): Bei M15 statt H1 zeigte die X-Achse weiterhin
+// 12-Stunden-Blöcke – LWC v5 wählt die Tick-Dichte nur aus der Viewport-
+// Breite, nicht aus dem gewählten Timeframe.
+//
+// Lösung: Ein Overlay-Layer (#mtf-axis-layer) rendert Zeit-Tick-Labels,
+// die zum TF des Charts ausgerichtet sind (M15 -> 15-min-Marken, H1 ->
+// 1h-Marken, darunter gröbere Stufen je nach Zoom). Die LWC-eigenen
+// Intraday-Labels liefert der tickMarkFormatter (04_live_updates.js)
+// zugunsten des Overlays zurück (Tagesgrenzen behalten das Datum).
+//
+// Abhängigkeiten: 02_time_utils.js (getBerlinParts, toReal, toCont),
+// 01_core.js (chart, rawCandleData, currentTfInSeconds). Rein additiv,
+// kein Umbau des Kern-Rendering-Pfads.
+
+// =============================================================================
+// Zustand
+// =============================================================================
+let _mtfAxis = {
+    active: false,     // true = Intraday-TF (Overlay aktiv)
+    tfSeconds: 0,      // Sekunden des aktuellen Chart-TF
+};
+
+//: Kleinstmöglicher Label-Abstand in Pixeln (gegen Überlappung).
+const MTF_AXIS_MIN_LABEL_PX = 90;
+
+//: "Schöne" absolute Schritt-Größen (Sekunden), aus denen je Zoom der
+//: erste Wert >= gewünschtem Abstand gewählt wird.
+const MTF_AXIS_STEPS = [
+    60, 120, 300, 600, 900, 1800, 2700, 3600, 5400, 7200, 10800, 14400,
+    21600, 43200, 86400, 3 * 86400, 7 * 86400, 30 * 86400, 365 * 86400,
+];
+
+// =============================================================================
+// Container sicherstellen
+// =============================================================================
+function _mtfAxisContainer() {
+    var c = document.getElementById('chart-container');
+    if (!c) return null;
+    var layer = document.getElementById('mtf-axis-layer');
+    if (!layer) {
+        layer = document.createElement('div');
+        layer.id = 'mtf-axis-layer';
+        layer.style.cssText =
+            'position:absolute; left:0; right:0; bottom:0; height:22px;' +
+            ' pointer-events:none; z-index:998; overflow:hidden;' +
+            ' font-size:10px; color:#787B86; font-family:sans-serif;';
+        c.appendChild(layer);
+    }
+    return layer;
+}
+
+// =============================================================================
+// Render: TF-alignierte Tick-Labels über die Zeitachse legen
+// =============================================================================
+function mtfAxisRender() {
+    var layer = _mtfAxisContainer();
+    if (!layer) return;
+    layer.innerHTML = '';
+
+    if (!_mtfAxis.active || !chart || !rawCandleData ||
+        rawCandleData.length === 0) {
+        return;
+    }
+    var tfSec = _mtfAxis.tfSeconds;
+    if (!tfSec || tfSec <= 0) return;
+
+    var lr;
+    try {
+        lr = chart.timeScale().getVisibleLogicalRange();
+    } catch (e) { return; }
+    if (!lr || lr.from === null || lr.to === null) return;
+
+    var fromIdx = Math.max(0, Math.floor(lr.from));
+    var toIdx = Math.min(rawCandleData.length - 1, Math.ceil(lr.to));
+    if (toIdx <= fromIdx) toIdx = fromIdx + 1;
+
+    var fromReal = toReal(rawCandleData[fromIdx].time);
+    var toRealTs = toReal(rawCandleData[toIdx].time);
+    if (fromReal === undefined || toRealTs === undefined) return;
+
+    var rangeSec = toRealTs - fromReal;
+    if (rangeSec <= 0) return;
+
+    var container = document.getElementById('chart-container');
+    var totalPx = (container && container.clientWidth) || 800;
+    var desired = rangeSec * MTF_AXIS_MIN_LABEL_PX / Math.max(1, totalPx);
+
+    // Nächste "schöne" Schrittgröße >= gewünschtem Abstand. Dabei wird nur
+    // ein Schritt gewählt, der ein Vielfaches des TF ist (Tick aligniert
+    // auf TF-Grenzen). Ist das nicht möglich (sehr großer Zoom), fällt auf
+    // den nächstgrößeren "schönen" Schritt zurück (dann zeigt LWC die
+    // Datums-Labels selbst).
+    var stepSec = null;
+    for (var i = 0; i < MTF_AXIS_STEPS.length; i++) {
+        var s = MTF_AXIS_STEPS[i];
+        if (s >= desired) {
+            stepSec = (s % tfSec === 0) ? s : null;
+            if (stepSec) break;
+        }
+    }
+    if (stepSec === null) {
+        // Fallback: gröberer Schritt, der KEIN Vielfaches des TF ist – dann
+        // trotzdem rendern (Tages-/Stunden-Marken), falls TF < 1 Tag.
+        for (var k = 0; k < MTF_AXIS_STEPS.length; k++) {
+            if (MTF_AXIS_STEPS[k] >= desired) { stepSec = MTF_AXIS_STEPS[k]; break; }
+        }
+    }
+    if (stepSec === null) stepSec = 86400;
+    if (stepSec >= 86400) return;  // LWC zeigt die Datums-Marken selbst
+
+    var first = Math.ceil(fromReal / stepSec) * stepSec;
+    for (var t = first; t <= toRealTs + stepSec / 2; t += stepSec) {
+        var p = getBerlinParts(t);
+        // Tagesgrenzen behält LWC (Datum) – hier überspringen (kein Duplikat).
+        if (p.hour === '00' && p.minute === '00') continue;
+        var cont = toCont(t);
+        if (cont === undefined) continue;
+        var x;
+        try {
+            x = chart.timeScale().timeToCoordinate(cont);
+        } catch (e) { continue; }
+        if (x === null || x === undefined || isNaN(x)) continue;
+        var el = document.createElement('div');
+        el.style.cssText =
+            'position:absolute; top:4px; left:' + Math.round(x) + 'px;' +
+            ' transform:translateX(-50%); white-space:nowrap;';
+        el.innerText = p.hour + ':' + p.minute;
+        layer.appendChild(el);
+    }
+}
+
+// =============================================================================
+// Externe API (04_live_updates.js ruft auf)
+// =============================================================================
+function mtfAxisSetTf(tfSeconds, active) {
+    _mtfAxis.tfSeconds = (typeof tfSeconds === 'number') ? tfSeconds : 0;
+    _mtfAxis.active = !!active;
+    mtfAxisRender();
+}
+
+function mtfAxisClear() {
+    _mtfAxis.active = false;
+    _mtfAxis.tfSeconds = 0;
+    var layer = document.getElementById('mtf-axis-layer');
+    if (layer) {
+        layer.innerHTML = '';
+        layer.remove();
+    }
+}
+
+//: Flag für den tickMarkFormatter (04): Intraday-Labels an das Overlay
+//: abgeben (nur wenn das Overlay aktiv ist).
+window._mtfAxisActive = false;
+
+function _mtfAxisSyncWindowFlag() {
+    window._mtfAxisActive = _mtfAxis.active;
+    return _mtfAxis.active;
+}
+
+// In den Hook-Zyklus einhängen: nach Full-Update + nach Zoom/Range-Change.
+// 04_live_updates.js ruft die optionalen Hooks auf – hier registrieren.
+function _onMtfAxisFullUpdate(data) {
+    if (data && typeof data.timeframe === 'string' &&
+        TF_SECONDS_MAP && TF_SECONDS_MAP[data.timeframe]) {
+        var tfSec = TF_SECONDS_MAP[data.timeframe];
+        mtfAxisSetTf(tfSec, tfSec > 0 && tfSec < 86400);
+    } else {
+        mtfAxisSetTf(0, false);
+    }
+    _mtfAxisSyncWindowFlag();
+}
+
+function _onMtfAxisVisibleRangeChanged() {
+    _mtfAxisSyncWindowFlag();
+    mtfAxisRender();
+}
+
+// Kopplung: 04_live_updates.js ruft die dedizierten optionalen Hooks
+// _onMtfAxisFullUpdate / _onMtfAxisVisibleRangeChanged auf (Muster
+// 06_two_tier.js). Kein Konflikt mit den MTF-FC-Hooks von 07/08.
+
+```
+
+--------------------------------------------------
+
 ### DATEI: chart/overlays/__init__.py
 ```py
 # chart/overlays/__init__.py
@@ -31765,6 +34331,397 @@ from .style_picker_widget import StylePickerDialog, StylePickerWidget
 from .named_item_actions import NamedItemActionsMixin, NamedItemAdapter
 
 __all__ = ["LineStyle", "MarkerStyle", "StylePickerDialog", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/widgets/mtf_filter_bar.py
+```py
+# chart/widgets/mtf_filter_bar.py
+"""
+MTF-FC v4 (Kapitel 21.03.07) – MtfFilterBarWidget & Control-Panel.
+
+Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Range-Picker,
+View-Templates (über SchemaMigrator), Tabellen-Sortierung und
+Session-Filter (§4 Säule 1).
+
+MVVM (Grundsatz 4): KEINE SQL-Queries, KEINE DB-Connects in der UI.
+Der Zustand wird ausschliesslich über den `MtfFcProvider` im isolierten
+Namespace `shared_state["mtf_fc"]` gelesen/geschrieben. Die Kommunikation
+mit Orchestratoren läuft über Signale (keine direkten Fenster-Referenzen,
+Grundsatz 2/5).
+
+Das Widget ist bewusst zustandsarm: Es rendert die Steuerungselemente und
+emittiert Signale; die eigentliche Verarbeitung (Boundary, Kaskade, Guards)
+liegt in den Engine-Modulen (21.03.02-21.03.05).
+"""
+
+from typing import Any, Dict, List, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from analytics.engine.mtf_fc_confluence import WEIGHTS
+from analytics.engine.mtf_fc_provider import MtfFcProvider
+from analytics.engine.mtf_fc_templates import (
+    MtfFcTemplateStore,
+    TemplateError,
+    create_template,
+    migrate_template,
+)
+
+#: Data-TF-Auswahl (Multi + fixierte Timeframes). 21.03.11 (Bug 6):
+#: Labels kompakt, damit die Leiste in 1200-px-Fenster passt (sizeHint war
+#: w=2248 px -> Uberlauf/Clipping, Controls unsichtbar).
+DATA_TF_OPTIONS = ["🌐 Multi", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4"]
+
+#: Chart-Overlay-TF (Auto-Kaskade vs. manuell fix).
+CHART_TF_OPTIONS = ["⚡ Auto", "🔒 Fix"]
+
+#: Range-Presets.
+RANGE_PRESETS = ["24h", "7d", "30d", "YTD", "Benutzerdefiniert"]
+
+#: Tabellen-Sortierung.
+SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
+
+#: Session-Filter (Farbbalken im M1/M5-Zoom, 21.03.08).
+SESSION_OPTIONS = ["London", "New York", "Tokio"]
+
+_STRIP_PREFIX = ("🌐 ", "🔒 ", "⚡ ", "🠇", "🠅", " (Multi)", " (Kaskade)", " Manuell Fix", "Benutzerdefiniert")
+
+
+def _parse_data_tf(text: str) -> str:
+    """Konvertiert ein Data-TF-Dropdown-Label in den Wert ('multi' | 'M15')."""
+    for prefix in ("🌐 ", "🔒 "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    stripped = text.strip()
+    if not stripped or stripped.lower() in ("multi", "alle timeframes",
+                                            "alle tf", "alle timeframes (multi)"):
+        return "multi"
+    return stripped
+
+
+def _data_tf_label(data_tf: str) -> str:
+    """Erzeugt das kompakte Data-TF-Dropdown-Label aus dem Wert."""
+    return "🌐 Multi" if str(data_tf).lower() == "multi" else f"🔒 {data_tf}"
+
+
+def _parse_chart_tf(text: str) -> str:
+    """Konvertiert ein Chart-TF-Dropdown-Label in 'auto' oder fixierten TF."""
+    if text.startswith("⚡"):
+        return "auto"
+    return "fix"
+
+
+class MtfFilterBarWidget(QWidget):
+    """Filterleiste des MTF-FC-Systems (QWidget, reines Event-Handling).
+
+    Signale (Entkopplung über den Aufrufer, kein Fenster-Know-how):
+      * `data_tf_changed(str)`     – 'multi' oder fixierter TF (z. B. 'M15').
+      * `chart_tf_changed(str)`    – 'auto' (Kaskade) oder 'fix'.
+      * `range_changed(str, int, int)` – Preset-Name, from_ts, to_ts.
+      * `sort_mode_changed(str)`   – 'date' | 'signal' | 'tf'.
+      * `sessions_changed(list)`   – aktive Sessions (z. B. ['london']).
+      * `template_applied(dict)`   – geladenes View-Template.
+      * `guard_override_requested(str, str)` – target_tf, reason (21.03.05).
+    """
+
+    data_tf_changed = Signal(str)
+    chart_tf_changed = Signal(str)
+    range_changed = Signal(str, int, int)
+    sort_mode_changed = Signal(str)
+    sessions_changed = Signal(list)
+    template_applied = Signal(dict)
+    guard_override_requested = Signal(str, str)
+
+    def __init__(
+        self,
+        provider: Optional[MtfFcProvider] = None,
+        template_store: Optional[MtfFcTemplateStore] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        # Provider ist die EINZIGE Brücke zum shared_state-Namespace (MVVM).
+        self._provider = provider or MtfFcProvider()
+        self._store = template_store or MtfFcTemplateStore()
+        self._sessions: List[str] = []
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI-Aufbau
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        # 21.03.11 (Bug 6, 2. Fix): ZWEI-ZEILEN-Layout statt einer Zeile.
+        # Der 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
+        # minimumSizeHint=1209 -> das Fenster wird auf ~1220 px aufgezwungen,
+        # Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) waren rechts
+        # abgeschnitten/unsichtbar. Zeile 1 = Kern-Steuerung (Data/Chart/
+        # Range/Sort), Zeile 2 = Sessions + Templates -> sizeHint < 700 px.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(2)
+
+        # --- Zeile 1: Source-Data-TF / Chart-Overlay-TF / Range / Sort --
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+
+        row1.addWidget(QLabel("Data:"))
+        self._data_tf_combo = QComboBox()
+        self._data_tf_combo.addItems(DATA_TF_OPTIONS)
+        self._data_tf_combo.setMaximumWidth(105)
+        self._data_tf_combo.setToolTip(
+            "Source-Data-TF: 🌐 alle Timeframes (Multi) vs. 🔒 fixiert auf einen TF")
+        self._data_tf_combo.currentTextChanged.connect(self._on_data_tf_changed)
+        row1.addWidget(self._data_tf_combo)
+
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Chart:"))
+        self._chart_tf_combo = QComboBox()
+        self._chart_tf_combo.addItems(CHART_TF_OPTIONS)
+        self._chart_tf_combo.setMaximumWidth(85)
+        self._chart_tf_combo.setToolTip(
+            "Chart-Overlay-TF: ⚡ Auto (Kaskade) vs. 🔒 manuell fixiert")
+        self._chart_tf_combo.currentTextChanged.connect(self._on_chart_tf_changed)
+        row1.addWidget(self._chart_tf_combo)
+
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Range:"))
+        self._range_combo = QComboBox()
+        self._range_combo.addItems(RANGE_PRESETS)
+        self._range_combo.setMaximumWidth(100)
+        self._range_combo.setToolTip(
+            "Zeitfenster-Preset (24h/7d/30d/YTD) – filtert den anzuzeigenden Zeitraum")
+        self._range_combo.currentTextChanged.connect(self._on_range_changed)
+        row1.addWidget(self._range_combo)
+
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Sort:"))
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(SORT_MODES)
+        self._sort_combo.setMaximumWidth(95)
+        self._sort_combo.setToolTip(
+            "Tabellen-Sortierung: Datum, Signal-Stärke oder Timeframe")
+        self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        row1.addWidget(self._sort_combo)
+
+        row1.addStretch(1)
+        outer.addLayout(row1)
+
+        # --- Zeile 2: Session-Filter + View-Templates -------------------
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+
+        self._session_checks: Dict[str, QCheckBox] = {}
+        for session in SESSION_OPTIONS:
+            cb = QCheckBox(session)
+            cb.setToolTip("Session-Farbbalken im M1/M5-Zoom (UTC-Epochs)")
+            cb.stateChanged.connect(self._on_sessions_changed)
+            self._session_checks[session.lower()] = cb
+            row2.addWidget(cb)
+
+        row2.addSpacing(6)
+        self._template_name = QLineEdit()
+        self._template_name.setPlaceholderText("Preset")
+        self._template_name.setMaximumWidth(90)
+        self._template_name.setToolTip("Name des View-Templates")
+        row2.addWidget(self._template_name)
+
+        self._btn_save_template = QPushButton("💾")
+        self._btn_save_template.setToolTip(
+            "Aktuelle Filter-Konfiguration als View-Template speichern")
+        self._btn_save_template.setMaximumWidth(34)
+        self._btn_save_template.clicked.connect(self._save_template)
+        row2.addWidget(self._btn_save_template)
+
+        self._btn_load_template = QPushButton("📂")
+        self._btn_load_template.setToolTip("Gespeichertes View-Template laden")
+        self._btn_load_template.setMaximumWidth(34)
+        self._btn_load_template.clicked.connect(self._load_template)
+        row2.addWidget(self._btn_load_template)
+
+        self._template_combo = QComboBox()
+        self._template_combo.setToolTip("Verfügbare View-Templates")
+        self._template_combo.setMaximumWidth(110)
+        self._template_combo.currentIndexChanged.connect(self._on_template_selected)
+        row2.addWidget(self._template_combo)
+
+        row2.addStretch(1)
+        outer.addLayout(row2)
+
+    # ------------------------------------------------------------------
+    # Public API (State-Sync über Provider, kein SQL)
+    # ------------------------------------------------------------------
+    def apply_namespace_state(self, context: Any) -> None:
+        """Synchronisiert die Widgets aus dem MTF-FC-Namespace des Contexts.
+
+        Wird z. B. nach `applyFullChartUpdate` aufgerufen, damit die
+        Filterleiste die aktiven Werte (Data-TF, Chart-TF) anzeigt.
+        """
+        ns = self._provider.read_namespace(context)
+        data_tf = str(ns.get("active_data_tf") or "M15")
+        chart_tf = str(ns.get("active_chart_tf") or "M5")
+
+        self._data_tf_combo.blockSignals(True)
+        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
+        self._data_tf_combo.blockSignals(False)
+
+        # 'auto' wird im Chart über die Kaskade bestimmt; bei fixiertem
+        # aktiven Chart-TF bleibt die Auswahl auf '⚡ Auto (Kaskade)'.
+        self._chart_tf_combo.blockSignals(True)
+        self._chart_tf_combo.setCurrentText(CHART_TF_OPTIONS[0])
+        self._chart_tf_combo.blockSignals(False)
+
+    def current_data_tf(self) -> str:
+        """Aktiver Source-Data-TF ('multi' oder z. B. 'M15')."""
+        return _parse_data_tf(self._data_tf_combo.currentText())
+
+    def current_chart_tf(self) -> str:
+        """Aktiver Chart-Overlay-TF ('auto' oder 'fix')."""
+        return _parse_chart_tf(self._chart_tf_combo.currentText())
+
+    def current_sort_mode(self) -> str:
+        """Aktive Sortierung ('date' | 'signal' | 'tf')."""
+        text = self._sort_combo.currentText()
+        if text.startswith("Signal"):
+            return "signal"
+        if text.startswith("TF"):
+            return "tf"
+        return "date"
+
+    def active_sessions(self) -> List[str]:
+        """Aktive Session-Filter (klein geschrieben)."""
+        return [s for s, cb in self._session_checks.items() if cb.isChecked()]
+
+    def refresh_templates(self) -> None:
+        """Aktualisiert die Template-Dropdown-Liste aus dem Store."""
+        self._template_combo.blockSignals(True)
+        self._template_combo.clear()
+        self._template_combo.addItems(self._store.names())
+        self._template_combo.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+    def _on_data_tf_changed(self, _text: str) -> None:
+        self.data_tf_changed.emit(self.current_data_tf())
+
+    def _on_chart_tf_changed(self, _text: str) -> None:
+        self.chart_tf_changed.emit(self.current_chart_tf())
+
+    def _on_range_changed(self, preset: str) -> None:
+        if preset == "Benutzerdefiniert":
+            return
+        now = _now_epoch()
+        seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
+                   "YTD": _ytd_epoch_offset(now)}.get(preset, 86400)
+        self.range_changed.emit(preset, now - seconds, now)
+
+    def _on_sort_changed(self, _text: str) -> None:
+        self.sort_mode_changed.emit(self.current_sort_mode())
+
+    def _on_sessions_changed(self, _state: int) -> None:
+        self._sessions = self.active_sessions()
+        self.sessions_changed.emit(list(self._sessions))
+
+    def _save_template(self) -> None:
+        name = self._template_name.text().strip() or "Unbenannt"
+        template = create_template(
+            name=name,
+            data_tf=self.current_data_tf(),
+            chart_tf=self.current_chart_tf(),
+            range_preset=self._range_combo.currentText(),
+            sort_mode=self.current_sort_mode(),
+            session_filters=list(self._sessions),
+        )
+        self._store.save(template)
+        self.refresh_templates()
+        self._template_combo.setCurrentText(name)
+
+    def _load_template(self) -> None:
+        name = self._template_combo.currentText()
+        if not name:
+            return
+        template = self._store.load(name)
+        if template is None:
+            return
+        self._apply_template(template)
+        self.template_applied.emit(template)
+
+    def _on_template_selected(self, index: int) -> None:
+        if index < 0:
+            return
+        self._load_template()
+
+    def _apply_template(self, template: Dict[str, Any]) -> None:
+        """Wendet ein geladenes Template auf die Widgets an (in-memory).
+
+        21.03.11 (Bug 6): Nach der Widget-Anwendung werden die Signale
+        EXPLIZIT emittiert, damit der Orchestrator (chart_win) die Werte
+        übernimmt (blockSignals unterbindet sonst die Signal-Verdrahtung).
+        """
+        data_tf = str(template.get("data_tf") or "multi")
+        self._data_tf_combo.blockSignals(True)
+        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
+        self._data_tf_combo.blockSignals(False)
+
+        range_preset = str(template.get("range_preset") or "7d")
+        self._range_combo.blockSignals(True)
+        self._range_combo.setCurrentText(range_preset)
+        self._range_combo.blockSignals(False)
+
+        sort_mode = str(template.get("sort_mode") or "date")
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.setCurrentText(
+            {"date": SORT_MODES[0], "signal": SORT_MODES[1],
+             "tf": SORT_MODES[2]}.get(sort_mode, SORT_MODES[0]))
+        self._sort_combo.blockSignals(False)
+
+        sessions = template.get("session_filters") or []
+        for key, cb in self._session_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(key in sessions)
+            cb.blockSignals(False)
+        self._sessions = [s for s in sessions if s in self._session_checks]
+
+        # Explizite Signal-Emission nach der Anwendung (Bug 6).
+        self.data_tf_changed.emit(self.current_data_tf())
+        self.chart_tf_changed.emit(self.current_chart_tf())
+        self.sort_mode_changed.emit(self.current_sort_mode())
+        self.sessions_changed.emit(list(self._sessions))
+        if range_preset and range_preset != "Benutzerdefiniert":
+            self._on_range_changed(range_preset)
+
+    # ------------------------------------------------------------------
+    # Guard-Override (Ebene 2, 21.03.05) – Klick auf Reset-Badge
+    # ------------------------------------------------------------------
+    def request_guard_override(self, target_tf: str, reason: str = "ghost_marker_click") -> None:
+        """Leitet einen Geister-Marker-Klick an die State-Machine weiter."""
+        self.guard_override_requested.emit(target_tf, reason)
+
+
+def _now_epoch() -> int:
+    """Aktuelle Wanduhr-Epoch (Sekunden)."""
+    import time
+    return int(time.time())
+
+
+def _ytd_epoch_offset(now: int) -> int:
+    """Sekunden seit Jahresbeginn (Wanduhr)."""
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+    return int(now - start.timestamp())
 
 ```
 
@@ -32770,6 +35727,11 @@ class EventBus(QObject):
     favorites_changed = Signal()
     profile_changed = Signal(str)
     service_set_changed = Signal()
+    # 21.03.11 (Bug 6): Tabellen-Sortierung der Filterleiste. Das
+    # ChartWindow emittiert nach jeder Sortier-Aenderung ('date'|'signal'|
+    # 'tf'); das AnalyticsWindow wendet sie auf die TablePage an. Entkoppelt
+    # via EventBus – das ChartWindow kennt das AnalyticsWindow NICHT (IoC).
+    mtf_fc_sort_changed = Signal(str)
     # Phase 16 (05.08.2026): Concurrency-Guard gegen Konflikte zwischen
     # Service-Berechnungen (SetRunWorker/ServiceRunWorker/HistoricalScanner)
     # und dem 45s-Hintergrund-Sync (sync_timer in main.py). Entkoppelt via
@@ -37562,6 +40524,8 @@ class ServiceRunWorker(QThread):
         tf_started(str)       – Timeframe-Start (21.01b, Pill-Strip-Laufzeit).
         tf_finished(str, int, bool) – Timeframe fertig: tf, geschriebene
                                 Rows, ob OHLCV-Daten vorhanden waren.
+        service_progress(str, str, int, int) - Per-Service-Fortschritt:
+                                tf, instance_id, erledigte Services, Gesamt.
     """
 
     log_message = Signal(str)
@@ -37569,6 +40533,8 @@ class ServiceRunWorker(QThread):
     run_failed = Signal(str, str)
     tf_started = Signal(str)
     tf_finished = Signal(str, int, bool)
+    # 12.08.2026 (User-Meldung 2): Per-Service-Fortschritt.
+    service_progress = Signal(str, str, int, int)
 
     def __init__(self, evaluator, symbol: str, timeframe: str,
                  set_definition: Dict[str, Any],
@@ -37591,6 +40557,21 @@ class ServiceRunWorker(QThread):
         self.timeframe = timeframe
         self.set_definition = set_definition
         self.instance_id = instance_id
+        # 12.08.2026 (WAL-Korruption beim App-Exit): Abbruch-Flag fuer einen
+        # sauberen Worker-Stopp. Wird nur zwischen zwei DB-Writes geprueft
+        # (Service-Grenzen / Timeframe-Grenzen) - NIE mitten in einem
+        # store_plugin_payload-INSERT, sonst bleibt die WAL inkonsistent.
+        self._abort_requested = False
+
+    def stop(self) -> None:
+        """Fordert einen sauberen Abbruch an (12.08.2026).
+
+        Setzt das Abbruch-Flag. Der Worker beendet sich an der naechsten
+        Service-/Timeframe-Grenze - d. h. nach dem naechsten abgeschlossenen
+        store_plugin_payload-Write. Bereits gespeicherte Payloads bleiben
+        erhalten, die WAL bleibt konsistent (kein Abbruch mitten im INSERT).
+        """
+        self._abort_requested = True
 
     # ------------------------------------------------------------------
     # Ausfuehrungs-Scope (Single vs. Set)
@@ -37694,7 +40675,9 @@ class ServiceRunWorker(QThread):
             f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
         if hasattr(self.evaluator, "execute_set_resilient"):
             results = self.evaluator.execute_set_resilient(
-                definition, df_plugin, context=context)
+                definition, df_plugin, context=context,
+                progress_callback=lambda iid, pos, total: (
+                    self.service_progress.emit(tf, iid, pos, total)))
         else:
             results = self.evaluator.execute_set(definition, df_plugin,
                                                  context=context)
@@ -37707,6 +40690,11 @@ class ServiceRunWorker(QThread):
         from analytics.engine.service_models import generate_instance_hash
         svc_cfgs = dict(definition.get("services") or {})
         for iid, result in results.items():
+            # 12.08.2026 (WAL-Korruption beim App-Exit): Sauberer Abbruch an
+            # der Service-Grenze - VOR dem naechsten store_plugin_payload.
+            # Bereits geschriebene Payloads dieses Timeframes bleiben intakt.
+            if self._abort_requested:
+                break
             payload = (result or {}).get("feature_store_payload") or {}
             records = payload.get("records") or []
             if not records:
@@ -37814,6 +40802,13 @@ class ServiceRunWorker(QThread):
             no_data_tfs: List[str] = []
             no_payload_tfs: List[str] = []
             for tf in timeframes:
+                # 12.08.2026 (WAL-Korruption beim App-Exit): Sauberer Abbruch
+                # an der Timeframe-Grenze (nach abgeschlossener Persistenz des
+                # vorherigen Timeframes) - nie mitten in einem DB-Write.
+                if self._abort_requested:
+                    self.log_message.emit("Abbruch angefordert - Ausfuehrung "
+                                          "wird sauber beendet.")
+                    break
                 self.tf_started.emit(tf)
                 try:
                     stored, had_data = self._execute_timeframe(
@@ -37943,7 +40938,7 @@ Bugfix-Runde 06.08.2026 (User-Anweisung, Punkte 1-4):
      naechsten Oeffnen wiederhergestellt (Muster IndicatorSettingsDialog).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -37962,6 +40957,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -38255,6 +41251,10 @@ class ServiceSelectorDialog(QDialog):
         self._run_worker: Optional[ServiceRunWorker] = None
         #: Plugin-ID des Services, dessen TF-Pills aktuell angezeigt werden.
         self._badge_plugin_id: Optional[str] = None
+        # 12.08.2026 (User-Meldung 'Data only loeschen'): Optionaler
+        # instance_hash der angezeigten Variante - der Pill-Strip wird
+        # damit VARIANTEN-GENAU geladen (nach Purge verschwinden ihre TFs).
+        self._badge_instance_hash: Optional[str] = None
         # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
         # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
         # des Panels (analog service_win). Bleibt nach Modell-Refreshes
@@ -38321,6 +41321,24 @@ class ServiceSelectorDialog(QDialog):
         panel_layout.addLayout(tf_row)
         self.badge_bar = TfStatusBadgeBar()
         panel_layout.addWidget(self.badge_bar)
+        # 12.08.2026 (User-Meldung 2): Fortschrittsbalken fuer Service-Runs
+        # (Muster service_win) - zeigt je Service den Fortschritt ueber alle
+        # Services des aktuellen Timeframes (ServiceRunWorker.service_progress).
+        self.progress_label = QLabel("")
+        self.progress_bar = QProgressBar()
+        # 12.08.2026 (User-Meldung 'Fortschrittsbalken laeuft dauerhaft'):
+        # setMaximum(0) startet eine INDETERMINATE Busy-Animation, die nie
+        # endet. Determinate leere Range (0..1, Wert 0) statt Busy-Loop;
+        # _on_service_progress setzt beim Run die echte Range (max(total,1)).
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(16)
+        self.progress_bar.setTextVisible(False)
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(6)
+        progress_row.addWidget(self.progress_label, 3)
+        progress_row.addWidget(self.progress_bar, 2)
+        panel_layout.addLayout(progress_row)
         self._fill_run_tf_combo()
         self.param_panel = panel  # 06.08.2026: feste Breite auf dem PANEL-WIDGET
         self.param_scroll = QScrollArea(panel)
@@ -38673,6 +41691,67 @@ class ServiceSelectorDialog(QDialog):
             pass
         return None
 
+    def _purge_legacy_allowed(self, plugin_id: str,
+                              params: Optional[Dict[str, Any]]) -> bool:
+        """True, wenn der Params-only-Legacy-Pool der Variante EINDEUTIG
+        dieser Variante gehoert (12.08.2026, Bugfix Runde 6).
+
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung (11.08.2026) liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name). Dieser Pool ist mehreren Varianten mit
+        IDENTISCHEN Params gemeinsam - er darf beim 'Data Only Loeschen'
+        einer einzelnen Variante nur entfernt werden, wenn KEINE andere
+        aktive Variante (Preset/Clone ODER Set-Instanz) denselben
+        Params-only-Hash besitzt.
+
+        Returns:
+            True = Pool eindeutig dieser Variante zugeordnet (Legacy-Purge
+            erlaubt); False = Pool wird geteilt oder nicht bestimmbar.
+        """
+        if not plugin_id or params is None:
+            return False
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            return False
+        target = generate_instance_hash(plugin_id, params)
+        owners = 0
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            try:
+                sm = self.model.state_manager
+            except Exception:
+                sm = None
+        if sm is not None:
+            try:
+                for p in sm.list_plugin_presets(plugin_id) or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if generate_instance_hash(
+                            plugin_id, p.get("params") or {}) == target:
+                        owners += 1
+            except Exception:
+                pass
+        try:
+            for set_id in (self.set_repo.list_sets()
+                           if self.set_repo is not None else []):
+                defn = self.set_repo.get_set(set_id)
+                if not isinstance(defn, dict):
+                    continue
+                for cfg in (defn.get("services") or {}).values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    cpid = str(cfg.get("plugin_id") or "")
+                    if cpid.lower() == plugin_id.lower() and \
+                            generate_instance_hash(
+                                cpid, cfg.get("params") or {}) == target:
+                        owners += 1
+        except Exception:
+            pass
+        # owners == 1: nur diese eine Variante belegt den Pool. owners == 0
+        # (z. B. Standalone-Service): kein Legacy-Pool-Szenario - False.
+        return owners == 1
+
     @Slot(str, str, str, str)
     def _on_duplicate_variant(self, set_id: str, service_id: str,
                               plugin_id: str, instance_hash: str) -> None:
@@ -38881,7 +41960,9 @@ class ServiceSelectorDialog(QDialog):
         try:
             from analytics.features.feature_builder import FeatureBuilder
             FeatureBuilder().purge_instance_data(
-                instance_hash, plugin_id, params)
+                instance_hash, plugin_id, params,
+                purge_legacy=self._purge_legacy_allowed(
+                    plugin_id, params))
         except Exception:
             pass
         event_bus.service_set_changed.emit()
@@ -38959,7 +42040,9 @@ class ServiceSelectorDialog(QDialog):
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
                     FeatureBuilder().purge_instance_data(
-                        instance_hash, plugin_id, preset.get("params") or {})
+                        instance_hash, plugin_id, preset.get("params") or {},
+                        purge_legacy=self._purge_legacy_allowed(
+                            plugin_id, preset.get("params") or {}))
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()
@@ -39377,9 +42460,9 @@ class ServiceSelectorDialog(QDialog):
             self._entries_for_scope(node_type, set_id, service_id, plugin_id),
             editable_plugin=editable)
         # 21.01b: Pill-Strip dem geklickten Service nachziehen.
-        self._refresh_badge_bar(
-            self._resolve_badge_plugin(node_type, set_id,
-                                       service_id, plugin_id))
+        pid_badge, hash_badge = self._resolve_badge_scope(
+            node_type, set_id, service_id, plugin_id)
+        self._refresh_badge_bar(pid_badge, hash_badge)
 
     def _resolve_selection_ids(self, node_type: str, set_id: str,
                                service_id: str, plugin_id: str) -> List[str]:
@@ -39530,6 +42613,9 @@ class ServiceSelectorDialog(QDialog):
         # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
         self._run_worker.tf_started.connect(self._on_tf_started)
         self._run_worker.tf_finished.connect(self._on_tf_finished)
+        # 12.08.2026 (User-Meldung 2): Per-Service-Fortschritt -> Progress-Bar.
+        self._run_worker.service_progress.connect(self._on_service_progress)
+        self._reset_run_progress("Starte Ausfuehrung ...")
         self._run_worker.start()
 
     def _on_run_log(self, message: str) -> None:
@@ -39701,14 +42787,49 @@ class ServiceSelectorDialog(QDialog):
         """Run abgeschlossen: Pill-Strip zuruecksetzen + Status neu laden."""
         self._on_run_log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) "
                          f"im feature_store gespeichert ({scope_id}).")
+        self._reset_run_progress()
         self.badge_bar.set_running(None)
         self._refresh_badge_bar()
 
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         """Run fehlgeschlagen: Pill-Strip zuruecksetzen + Status neu laden."""
         self._on_run_log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        self._reset_run_progress()
         self.badge_bar.set_running(None)
         self._refresh_badge_bar()
+
+    @Slot(str, str, int, int)
+    def _on_service_progress(self, tf: str, iid: str, done: int,
+                             total: int) -> None:
+        """12.08.2026 (User-Meldung 2): Per-Service-Fortschritt anzeigen."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(max(total, 1))
+            bar.setValue(done)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(f"{tf}: {iid} ({done}/{total})")
+
+    def _reset_run_progress(self, label: str = "") -> None:
+        """Setzt den Fortschrittsbalken zurueck (Default: leeres Label)."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            # 12.08.2026: setMaximum(0) waere eine endlose Busy-Animation
+            # (indeterminate) - determinate leere Range (0..1) verwenden.
+            bar.setRange(0, 1)
+            bar.setValue(0)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(label)
+
+    def closeEvent(self, event) -> None:
+        """12.08.2026 (WAL-Korruption beim App-Exit): Laufenden
+        ServiceRunWorker sauber stoppen, bevor der Dialog schliesst."""
+        worker = getattr(self, "_run_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(5000)
+        super().closeEvent(event)
 
     def _on_tf_started(self, tf: str) -> None:
         """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""
@@ -39723,17 +42844,34 @@ class ServiceSelectorDialog(QDialog):
             self.badge_bar.set_error(tf)
         self.badge_bar.set_running(None)
 
-    def _resolve_badge_plugin(self, node_type: str, set_id: str,
-                              service_id: str,
-                              plugin_id: str) -> Optional[str]:
-        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+    def _resolve_badge_scope(self, node_type: str, set_id: str,
+                             service_id: str,
+                             plugin_id: str) -> Tuple[Optional[str],
+                                                      Optional[str]]:
+        """Ermittelt (plugin_id, instance_hash) fuer den Pill-Strip.
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Der Pill-Strip wird
+        VARIANTEN-GENAU geladen. Clone-Knoten tragen den instance_hash im
+        service_id-Slot (MasterTree._emit_selection_details, 20.04 Q7);
+        Set-/Service-Zeilen liefern den Hash der ersten Instanz aus der
+        Set-Definition (cfg['instance_hash'], sonst Params-only-Hash).
+        """
         if plugin_id:
-            return str(plugin_id)
+            h = str(service_id) if node_type == TYPE_CLONE else None
+            return str(plugin_id), (h or None)
         if node_type == TYPE_SERVICE:
             if set_id and service_id:
                 cfg = self.model.find_service(set_id, service_id) or {}
-                return str(cfg.get("plugin_id") or service_id)
-            return str(service_id) if service_id else None
+                pid = str(cfg.get("plugin_id") or service_id)
+                h = str(cfg.get("instance_hash") or "") or None
+                if not h and pid:
+                    try:
+                        h = generate_instance_hash(
+                            pid, cfg.get("params") or {})
+                    except Exception:
+                        h = None
+                return pid, h
+            return (str(service_id) if service_id else None), None
         if node_type == TYPE_SET and set_id:
             definition = self.model.find_set(set_id) or {}
             order = list(definition.get("execution_order") or [])
@@ -39742,20 +42880,35 @@ class ServiceSelectorDialog(QDialog):
                 cfg = services.get(iid) or {}
                 pid = str(cfg.get("plugin_id") or iid)
                 if pid:
-                    return pid
-        return None
+                    h = str(cfg.get("instance_hash") or "") or None
+                    if not h:
+                        try:
+                            h = generate_instance_hash(
+                                pid, cfg.get("params") or {})
+                        except Exception:
+                            h = None
+                    return pid, h
+        return None, None
 
-    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None,
+                           instance_hash: Optional[str] = None) -> None:
         """Laedt die TF-Status-Pills fuer den angegebenen Service neu
-        (FeatureStoreReader.fetch_service_tf_status)."""
+        (FeatureStoreReader.fetch_service_tf_status).
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Mit `instance_hash`
+        wird der Pill-Strip VARIANTEN-GENAU geladen (nur die TFs dieser
+        Variante); ohne Hash bleibt das service-weite Verhalten erhalten."""
         if plugin_id:
             self._badge_plugin_id = plugin_id
+        if instance_hash:
+            self._badge_instance_hash = instance_hash
         pid = self._badge_plugin_id
         if not pid:
             self.badge_bar.clear()
             return
+        h = self._badge_instance_hash or None
         try:
-            status = FeatureStoreReader().fetch_service_tf_status(pid)
+            status = FeatureStoreReader().fetch_service_tf_status(pid, h)
         except Exception:
             status = {}
         self.badge_bar.update_status(status)
@@ -40916,14 +44069,14 @@ Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from PySide6.QtCore import QFile, QIODevice, QSize, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout,
-    QInputDialog, QMenu,
-    QMessageBox, QPushButton, QSplitter, QTextEdit,
+    QInputDialog, QLabel, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QSplitter, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -41023,6 +44176,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker: Optional[ServiceRunWorker] = None
         # 21.01b: Plugin-ID des aktuell im Pill-Strip angezeigten Services.
         self._badge_plugin_id: Optional[str] = None
+        # 12.08.2026 (User-Meldung 'Data only loeschen'): Optionaler
+        # instance_hash der angezeigten Variante - der Pill-Strip wird
+        # damit VARIANTEN-GENAU geladen (nach Purge verschwinden ihre TFs).
+        self._badge_instance_hash: Optional[str] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
         # 17.01.04 (Bugfix): Standalone-Plugin-Editierung – ist eine
@@ -41140,6 +44297,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
+            # 12.08.2026 (User-Meldung 2): Fortschrittsbalken fuer
+            # Service-Runs unter dem MasterTree (ueber dem Log) - zeigt
+            # je Service den Fortschritt ueber alle Services des
+            # aktuellen Timeframes (ServiceRunWorker.service_progress).
+            self.progress_label = QLabel("")
+            self.progress_bar = QProgressBar()
+            # 12.08.2026 (User-Meldung 'Fortschrittsbalken laeuft dauerhaft'):
+            # setMaximum(0) startet eine INDETERMINATE Busy-Animation, die nie
+            # endet. Determinate leere Range (0..1, Wert 0) statt Busy-Loop;
+            # _on_service_progress setzt beim Run die echte Range (max(total,1)).
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFixedHeight(16)
+            self.progress_bar.setTextVisible(False)
+            progress_row = QHBoxLayout()
+            progress_row.setSpacing(6)
+            progress_row.addWidget(self.progress_label, 3)
+            progress_row.addWidget(self.progress_bar, 2)
+            progress_widget = QWidget()
+            progress_widget.setLayout(progress_row)
+            right_layout.addWidget(progress_widget, 0)
             # 05.08.2026 (Kleinere Einstellungen, Punkt 5): Das Log wandert
             # UNTER den MasterTree in dieselbe Spalte – seine Breite entspricht
             # damit exakt der Tree-Breite, und das Fenster endet unten exakt
@@ -41732,7 +44910,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """
         if node_type in ("plugin", "clone") and plugin_id:
             # 21.01b: Pill-Strip fuer den geklickten Service laden.
-            self._refresh_badge_bar(str(plugin_id))
+            # 12.08.2026: Clone-Knoten tragen den instance_hash im
+            # service_id-Slot -> Pills VARIANTEN-GENAU anzeigen.
+            self._refresh_badge_bar(
+                str(plugin_id),
+                str(service_id) if node_type == "clone" else None)
             if node_type == "clone":
                 # 10.08.2026 (Bugfix, Varianten-Params): Eine Variante/Clone
                 # hat EIGENE Parameter in indicator_presets (20.04, Q7) -
@@ -41752,9 +44934,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self._current_preset_editing = None
         # 21.01b: Pill-Strip fuer Set-/Service-Zeilen nachziehen (erster
         # Service des Sets bzw. der Service selbst).
-        self._refresh_badge_bar(
-            self._resolve_badge_plugin(node_type, set_id,
-                                       service_id, plugin_id))
+        pid_badge, hash_badge = self._resolve_badge_scope(
+            node_type, set_id, service_id, plugin_id)
+        self._refresh_badge_bar(pid_badge, hash_badge)
 
     def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
         """ServiceInstanceConfig eines Standalone-Plugins.
@@ -42007,9 +45189,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker.log_message.connect(self.log)
         self._run_worker.run_finished.connect(self._on_run_worker_finished)
         self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # 12.08.2026 (User-Meldung 2): Per-Service-Fortschrittsbalken.
+        self._run_worker.service_progress.connect(self._on_service_progress)
         # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
         self._run_worker.tf_started.connect(self._on_tf_started)
         self._run_worker.tf_finished.connect(self._on_tf_finished)
+        # 12.08.2026: Progress-Reset beim Start (Busy-Modus).
+        self._reset_run_progress("Starte Ausführung ...")
         # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
         self._begin_sync_guard()
         self._run_worker.start()
@@ -42386,6 +45572,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """
         # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
         self._end_sync_guard()
+        self._reset_run_progress()
         self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
                  f"feature_store gespeichert ({scope_id}).")
         # 21.01b: Pill-Strip nach dem Run neu laden (neue Counts/last_run).
@@ -42398,12 +45585,37 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
         self._end_sync_guard()
+        self._reset_run_progress()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
         # 21.01b: Pill-Strip nach Fehler zuruecksetzen + Status neu laden.
         bar = getattr(self, "badge_bar", None)
         if bar is not None:
             bar.set_running(None)
         self._refresh_badge_bar()
+
+    @Slot(str, str, int, int)
+    def _on_service_progress(self, tf: str, iid: str, done: int,
+                             total: int) -> None:
+        """12.08.2026 (User-Meldung 2): Per-Service-Fortschritt anzeigen."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(max(total, 1))
+            bar.setValue(done)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(f"{tf}: {iid} ({done}/{total})")
+
+    def _reset_run_progress(self, label: str = "") -> None:
+        """Setzt den Fortschrittsbalken zurueck (Default: leeres Label)."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            # 12.08.2026: setMaximum(0) waere eine endlose Busy-Animation
+            # (indeterminate) - determinate leere Range (0..1) verwenden.
+            bar.setRange(0, 1)
+            bar.setValue(0)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(label)
 
     # -------------------------------------------------------------------------
     # 21.01b (11.08.2026): TF-Status-Pills (Pill-Strip)
@@ -42427,12 +45639,21 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             bar.set_error(tf)
         bar.set_running(None)
 
-    def _resolve_badge_plugin(self, node_type: str, set_id: str,
-                              service_id: str,
-                              plugin_id: str) -> Optional[str]:
-        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+    def _resolve_badge_scope(self, node_type: str, set_id: str,
+                             service_id: str,
+                             plugin_id: str) -> Tuple[Optional[str],
+                                                      Optional[str]]:
+        """Ermittelt (plugin_id, instance_hash) fuer den Pill-Strip.
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Der Pill-Strip wird
+        VARIANTEN-GENAU geladen. Clone-Knoten tragen den instance_hash im
+        service_id-Slot (MasterTree._emit_selection_details, 20.04 Q7);
+        Set-/Service-Zeilen liefern den Hash der ersten Instanz aus der
+        Set-Definition (cfg['instance_hash'], sonst Params-only-Hash).
+        """
         if plugin_id:
-            return str(plugin_id)
+            h = str(service_id) if node_type == "clone" else None
+            return str(plugin_id), (h or None)
         if set_id:
             try:
                 definition = self.set_repo.get_set(set_id)
@@ -42445,26 +45666,41 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                     cfg = services.get(iid) or {}
                     pid = str(cfg.get("plugin_id") or iid)
                     if pid:
-                        return pid
-        return str(service_id) if service_id else None
+                        h = str(cfg.get("instance_hash") or "") or None
+                        if not h:
+                            try:
+                                h = generate_instance_hash(
+                                    pid, cfg.get("params") or {})
+                            except Exception:
+                                h = None
+                        return pid, h
+        return (str(service_id) if service_id else None), None
 
-    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None,
+                           instance_hash: Optional[str] = None) -> None:
         """Laedt die TF-Status-Pills fuer den angegebenen Service neu.
 
         Quelle: FeatureStoreReader.fetch_service_tf_status() – je Timeframe
         die Anzahl der feature_store-Eintraege und der letzte Lauf.
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Mit `instance_hash`
+        wird der Pill-Strip VARIANTEN-GENAU geladen (nur die TFs dieser
+        Variante); ohne Hash bleibt das service-weite Verhalten erhalten.
         """
         bar = getattr(self, "badge_bar", None)
         if bar is None:
             return
         if plugin_id:
             self._badge_plugin_id = plugin_id
+        if instance_hash:
+            self._badge_instance_hash = instance_hash
         pid = self._badge_plugin_id
         if not pid:
             bar.clear()
             return
+        h = self._badge_instance_hash or None
         try:
-            status = FeatureStoreReader().fetch_service_tf_status(pid)
+            status = FeatureStoreReader().fetch_service_tf_status(pid, h)
         except Exception:
             status = {}
         bar.update_status(status)
@@ -43475,6 +46711,61 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Preset-Suche fehlgeschlagen: {e}")
         return None
 
+    def _purge_legacy_allowed(self, plugin_id: str,
+                              params: Optional[Dict[str, Any]]) -> bool:
+        """True, wenn der Params-only-Legacy-Pool der Variante EINDEUTIG
+        dieser Variante gehoert (12.08.2026, Bugfix Runde 6).
+
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung (11.08.2026) liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name). Dieser Pool ist mehreren Varianten mit
+        IDENTISCHEN Params gemeinsam - er darf beim 'Data Only Loeschen'
+        einer einzelnen Variante nur entfernt werden, wenn KEINE andere
+        aktive Variante (Preset/Clone ODER Set-Instanz) denselben
+        Params-only-Hash besitzt.
+
+        Returns:
+            True = Pool eindeutig dieser Variante zugeordnet (Legacy-Purge
+            erlaubt); False = Pool wird geteilt oder nicht bestimmbar.
+        """
+        if not plugin_id or params is None:
+            return False
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            return False
+        target = generate_instance_hash(plugin_id, params)
+        owners = 0
+        sm = getattr(self, "_state_manager", None)
+        if sm is not None:
+            try:
+                for p in sm.list_plugin_presets(plugin_id) or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if generate_instance_hash(
+                            plugin_id, p.get("params") or {}) == target:
+                        owners += 1
+            except Exception:
+                pass
+        try:
+            for set_id in self.set_repo.list_sets():
+                defn = self.set_repo.get_set(set_id)
+                if not isinstance(defn, dict):
+                    continue
+                for cfg in (defn.get("services") or {}).values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    cpid = str(cfg.get("plugin_id") or "")
+                    if cpid.lower() == plugin_id.lower() and \
+                            generate_instance_hash(
+                                cpid, cfg.get("params") or {}) == target:
+                        owners += 1
+        except Exception:
+            pass
+        # owners == 1: nur diese eine Variante belegt den Pool. owners == 0
+        # (z. B. Standalone-Service): kein Legacy-Pool-Szenario - False.
+        return owners == 1
+
     def _next_preset_copy_name(self, sm, plugin_id: str,
                                base: str) -> str:
         """Naechster freier Preset-Name fuer eine Varianten-Kopie (Q8).
@@ -43540,7 +46831,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self, "Data Only Löschen",
             f"Berechnete Feature-Daten der Instanz '{label}' "
             f"(#{instance_hash}) dauerhaft löschen?\n\n"
-            "Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
+            "Gelöscht werden ALLE Timeframes (M1-MN1) dieser "
+            "Variante. Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
             "beim nächsten Scan neu berechnet.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
@@ -43548,12 +46840,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         try:
             from analytics.features.feature_builder import FeatureBuilder
             n = FeatureBuilder().purge_instance_data(
-                instance_hash, plugin_id, params)
+                instance_hash, plugin_id, params,
+                purge_legacy=self._purge_legacy_allowed(
+                    plugin_id, params))
         except Exception as e:
             self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
             return
         self.log(f"Feature-Daten gelöscht: {n} Zeilen "
-                 f"(Instanz #{instance_hash}).")
+                 f"(Instanz #{instance_hash}, alle Timeframes).")
+        self._reset_run_progress()
         event_bus.service_set_changed.emit()
 
     @Slot(str, str, str, str)
@@ -43606,7 +46901,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self, "Vollständig Löschen",
             f"Instanz '{label}' vollständig löschen?\n\n"
             "Die Instanz wird aus dem Set entfernt UND die berechneten "
-            "Feature-Daten dieser Parameter-Variante werden gelöscht.",
+            "Feature-Daten dieser Parameter-Variante werden gelöscht "
+            "(ALLE Timeframes M1-MN1).",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -43641,6 +46937,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
             self.log(f"Variante #{hash_} purged ({n} Zeilen).")
+            self._reset_run_progress()
         self.log(f"Instanz vollständig gelöscht: {label}")
         event_bus.service_set_changed.emit()
         if self._current_set_id == set_id:
@@ -43660,7 +46957,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             f"Preset '{preset_name}' von '{plugin_id}' vollständig löschen?"
             f"\n\nDas Preset wird aus indicator_presets entfernt UND die "
             "berechneten Feature-Daten dieser Parameter-Variante werden "
-            "gelöscht.",
+            "gelöscht (ALLE Timeframes M1-MN1).",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -43682,11 +46979,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             try:
                 from analytics.features.feature_builder import FeatureBuilder
                 n = FeatureBuilder().purge_instance_data(
-                    instance_hash, plugin_id, preset.get("params") or {})
+                    instance_hash, plugin_id, preset.get("params") or {},
+                    purge_legacy=self._purge_legacy_allowed(
+                        plugin_id, preset.get("params") or {}))
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
             self.log(f"Variante #{instance_hash} purged ({n} Zeilen).")
+            self._reset_run_progress()
         self.log(f"Preset vollständig gelöscht: '{preset_name}'.")
         event_bus.service_set_changed.emit()
 
@@ -44126,7 +47426,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # PersistentWindow.save_state() wird in super().closeEvent gerufen
         # 05.08.2026: Gezielter Kontextmenue-Run-Worker sauber beenden.
         if self._run_worker and self._run_worker.isRunning():
-            self._run_worker.wait(2000)
+            # 12.08.2026 (WAL-Korruption beim App-Exit): Worker VOR dem
+            # Fenster-Close sauber stoppen - sonst stirbt der Thread mitten
+            # im DB-Write, wenn die App den Prozess beendet (korrupte WAL
+            # beim naechsten Start). stop() setzt nur das Abbruch-Flag; der
+            # Worker beendet sich an der naechsten Service-Grenze.
+            self._run_worker.stop()
+            self._run_worker.wait(5000)
         super().closeEvent(event)
 
 ```

@@ -108,6 +108,7 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
+    QLabel,
     QMainWindow,
     QPushButton,
     QTableWidget,
@@ -808,6 +809,8 @@ from PySide6.QtWidgets import (
 )
 
 from config.app_settings import AppSettings
+from config.event_bus import event_bus
+from db.db_utils import compact_database
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 

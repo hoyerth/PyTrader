@@ -1109,7 +1109,7 @@ entfernt – es gibt keine Signal-Engine mehr.
 """
 
 from dataclasses import replace
-from typing import Any, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 import threading
 import time
 import traceback
@@ -1331,6 +1331,7 @@ class ServiceSetEvaluator:
         set_definition: Dict[str, Any],
         df: pd.DataFrame,
         context: Optional[PluginContext] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """Führt die Service-Pipeline elastisch aus (P14-03) – Ablösung des
         strikten Fail-Fast-Prinzips (A.3/A.4 des Kapitels):
@@ -1394,12 +1395,14 @@ class ServiceSetEvaluator:
         with self._execution_lock:
             self.last_skipped.clear()
             self.last_errors.clear()
-            for iid in execution_order:
+            for idx, iid in enumerate(execution_order):
                 # Quarantäne-Skip (Session-Scope, RAM only)
                 if self._is_quarantined(iid):
                     self.last_skipped[iid] = "quarantined"
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"uebersprungen (quarantined)")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 cfg = services[iid]
@@ -1418,6 +1421,8 @@ class ServiceSetEvaluator:
                         dep_failed = True
                         break
                 if dep_failed:
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Exakter Zuschnitt auf den Service-lookback
@@ -1451,6 +1456,8 @@ class ServiceSetEvaluator:
                               f"die Session quarantaenisiert (RAM only)")
                     # State-Fallback: alter shared_state-Eintrag (vorherige
                     # Kerze) bleibt unangetastet erhalten.
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
                 except Exception as e:
                     # Sicherheitsnetz: PluginExecutor kapselt eigentlich alle
@@ -1474,6 +1481,8 @@ class ServiceSetEvaluator:
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
                           f"(plugin '{log2['plugin_id']}') fehlgeschlagen: "
                           f"{log2['exception']}")
+                    if progress_callback:
+                        progress_callback(iid, idx + 1, len(execution_order))
                     continue
 
                 # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.
@@ -1486,6 +1495,8 @@ class ServiceSetEvaluator:
                 if iid not in context.shared_state:
                     context.shared_state[iid] = result
                 results[iid] = result
+                if progress_callback:
+                    progress_callback(iid, idx + 1, len(execution_order))
 
         return results
 
@@ -2857,7 +2868,8 @@ class FeatureBuilder:
                 con.close()
 
     def purge_instance_data(self, instance_hash: str, plugin_id: str = "",
-                            params: Optional[Dict[str, Any]] = None) -> int:
+                            params: Optional[Dict[str, Any]] = None,
+                            purge_legacy: bool = False) -> int:
         """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
 
         `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
@@ -2868,17 +2880,24 @@ class FeatureBuilder:
         und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
         unangetastet).
 
-        11.08.2026 (Bugfix Runde 5): Zusaetzlich werden bei uebergebenem
-        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht.
-        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen unter dem
-        reinen Params-only-Hash `generate_instance_hash(plugin_id, params)`
-        (ohne preset_name) und sind keiner Variante eindeutig zuordenbar
-        (Kollisions-Pool). Sie wurden ueber den (inzwischen entfernten)
-        Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten angezeigt
-        und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen' nicht
-        zuruecksetzen. Mit plugin_id + params werden diese Alt-Rows jetzt
-        zusammen mit den Varianten-Rows geloescht, damit das Datum im
-        MasterTree wirklich auf 'nie' zurueckgesetzt wird.
+        11.08.2026 (Bugfix Runde 5): Zusaetzlich koennen bei uebergebenem
+        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht
+        werden. Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name) und sind keiner Variante EINDEUTIG
+        zuordenbar (Kollisions-Pool). Sie wurden ueber den (inzwischen
+        entfernten) Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten
+        angezeigt und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen'
+        nicht zuruecksetzen.
+
+        12.08.2026 (Bugfix Runde 6, 'Data only loeschen loescht alle
+        Varianten'): Der Legacy-Purge laeuft seither NUR noch auf explizite
+        Anforderung (`purge_legacy=True`). Teilen sich mehrere aktive
+        Varianten dieselben Params (identischer Params-only-Hash), gehoert
+        der Legacy-Pool ALLEN – ihn beim 'Data Only Loeschen' einer einzelnen
+        Variante zu loeschen wuerde die Daten der uebrigen Varianten
+        entfernen. Der Aufrufer (service_win) entscheidet ueber die aktive
+        Varianten-Liste, ob der Pool EINDEUTIG dieser einen Variante gehoert.
 
         Args:
             instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash,
@@ -2886,6 +2905,10 @@ class FeatureBuilder:
             plugin_id: Plugin-ID (optional) – noetig fuer den Legacy-Purge.
             params: Parameter-Dict der Variante (optional) – Grundlage des
                 Params-only-Legacy-Hashes fuer den Legacy-Purge.
+            purge_legacy: True = auch den Params-only-Legacy-Pool loeschen
+                (nur wenn der Aufrufer die Eindeutigkeit geprueft hat).
+                Default False – der Legacy-Purge ist bewusst eine
+                Sonder-Aktion (sonst Kollisions-Gefahr).
 
         Returns:
             Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
@@ -2907,10 +2930,13 @@ class FeatureBuilder:
             rows = result.fetchall() if result is not None else []
             deleted += len(rows or [])
             # 2) Legacy-Pool-Rows (Params-only-Hash aus Runs vor der
-            #    Preset-Hash-Umstellung, 11.08.2026). Der Params-only-Hash
-            #    ist aus dem Preset-Hash (inkl. preset_name) nicht umkehrbar
-            #    – er wird hier aus plugin_id + params neu berechnet.
-            if plugin_id and params is not None:
+            #    Preset-Hash-Umstellung, 11.08.2026) – NUR auf explizite
+            #    Anforderung (purge_legacy=True), sonst Kollisions-Gefahr
+            #    zwischen Varianten mit identischen Params (Bugfix Runde 6).
+            #    Der Params-only-Hash ist aus dem Preset-Hash (inkl.
+            #    preset_name) nicht umkehrbar – er wird hier aus plugin_id
+            #    + params neu berechnet.
+            if purge_legacy and plugin_id and params is not None:
                 try:
                     from analytics.engine.service_models import (
                         generate_instance_hash)

@@ -3949,7 +3949,7 @@ class FeatureStoreReader:
         return out
 
     def fetch_service_tf_status(
-        self, plugin_id: str
+        self, plugin_id: str, instance_hash: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """Timeframe-Verfuegbarkeit eines Services (21.01b, Schritt 1).
 
@@ -3957,9 +3957,17 @@ class FeatureStoreReader:
         Services die Anzahl der Feature-Store-Eintraege und den letzten
         Schreib-Zeitpunkt direkt aus der feature_store-Tabelle.
 
+        Bugfix 12.08.2026 (User-Meldung 'Data only loeschen'): Ohne
+        `instance_hash` ist die Abfrage service-weit (alle Varianten der
+        plugin_id). Wird ein `instance_hash` uebergeben, werden NUR die
+        Rows GENAU dieser Variante gezaehlt – nach dem Purge einer
+        Variante verschwinden ihre TF-Pills damit korrekt (vorher zeigten
+        die Pill-Badges die TFs aller Varianten des Services gemeinsam).
+
         SQL: SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
              FROM feature_store
              WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+               [AND LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))]
              GROUP BY LOWER(timeframe)
 
         Robustheit wie `fetch_last_execution_dates`: Case-insensitiv
@@ -3968,6 +3976,9 @@ class FeatureStoreReader:
 
         Args:
             plugin_id: Plugin-ID des Services (z.B. 'srv_proximity').
+            instance_hash: Optionaler Varianten-Hash – werden nur gesetzt,
+                zeigt der Status ausschliesslich diese Variante (Clone/
+                Preset/Set-Instanz). None/leer = service-weit.
 
         Returns:
             Dict Timeframe (upper, z.B. 'M1') -> {'count': int, 'last_run': str}
@@ -3976,16 +3987,26 @@ class FeatureStoreReader:
         """
         if not plugin_id or not str(plugin_id).strip():
             return {}
+        conditions = [
+            "feature_id IS NOT NULL AND TRIM(feature_id) != ''",
+            "LOWER(TRIM(feature_id)) = LOWER(TRIM(?))",
+        ]
+        params: List[Any] = [str(plugin_id)]
+        # Varianten-Scope (Bugfix 12.08.2026): exakter Hash-Match (nur diese
+        # Variante, keine service-weiten Alt-Rows anderer Instanzen).
+        h_s = str(instance_hash or "").strip()
+        if h_s:
+            conditions.append("LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))")
+            params.append(h_s)
         con = self._get_connection()
         try:
-            rows = con.execute("""
+            rows = con.execute(f"""
                 SELECT LOWER(TRIM(timeframe)) AS tf, COUNT(*) AS cnt,
                        MAX(created_at) AS last_run
                 FROM feature_store
-                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
-                  AND LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+                WHERE {' AND '.join(conditions)}
                 GROUP BY LOWER(TRIM(timeframe))
-            """, [str(plugin_id)]).fetchall()
+            """, params).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_service_tf_status "
                   f"fehlgeschlagen: {e}")
@@ -5331,20 +5352,45 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
-        # 06.08.2026 (Punkt 5): Limit-Textfeld -> ViewModel. Der Default
-        # (App-Optionen 'Statistik-Signale') wird beim Start gesetzt, damit
-        # Feld und VM-Parameter konsistent sind.
-        self.edit_limit.textChanged.connect(self._on_limit_text_changed)
-        self._vm.set_limit(self._default_limit)
-        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
-        self.btn_profile_new.clicked.connect(self._on_profile_new)
-        self.btn_profile_save.clicked.connect(self._on_profile_save)
-        self.btn_profile_delete.clicked.connect(self._on_profile_delete)
-        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
-        self.sidebar.currentRowChanged.connect(self._on_page_changed)
-        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
-        self._refresh_symbol_combo()
-        self._refresh_timeframe_combo()
+        # 21.03.11 (Bug 3): Nach abgeschlossenem Service-Run (der Worker
+        # emittiert `service_set_changed` einmalig nach der ALLE-TFs-/
+        # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
+        # automatisch neu laden. `refresh_all` ist im VM debounced.
+        event_bus.service_set_changed.connect(self._on_service_set_changed)
+        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
+        event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+
+    @Slot()
+    def _on_service_set_changed(self) -> None:
+        """21.03.11 (Bug 3): Nach abgeschlossenem Service-Run neu laden.
+
+        Der `ServiceRunWorker` emittiert `event_bus.service_set_changed`
+        genau einmal nach Abschluss der Ausfuehrung (auch bei Teilerfolg).
+        `refresh_all()` ist im ViewModel debounced (kein SQL-Feuer) und
+        stösst die aktiven Seiten-Queries (Tabelle/Heatmap) neu an.
+        """
+        if getattr(self, "_vm", None) is None:
+            return
+        try:
+            self._vm.refresh_all()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] service_set_changed-Refresh: {e}")
+
+    @Slot(str)
+    def _on_mtf_fc_sort_changed(self, mode: str) -> None:
+        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+
+        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
+        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
+        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        """
+        if getattr(self, "table_page", None) is None:
+            return
+        try:
+            self.table_page.set_external_sort_mode(str(mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:
@@ -7171,6 +7217,27 @@ def _nice_int_step(span: float, max_ticks: int) -> float:
     return float(math.ceil(raw))
 
 
+def _format_heatmap_value(val: Any) -> str:
+    """Formatiert einen Heatmap-Zahlenwert OHNE Exponential-Notation.
+
+    Bugfix 12.08.2026 (User-Meldung 'EXP-Wert in der Legende'):
+    `f'{val:.2g}'` wechselt ab 100 in wissenschaftliche Notation
+    ('1.2e+02'); `f'{v:g}'` ab 1e6 ('1e+06'). Ganzzahlige Werte
+    (z. B. COUNT-Zaehler je Zelle/Bucket) werden in deutscher
+    Tausender-Schreibweise ausgegeben ('4.380'), Bruchwerte (z. B.
+    AVG/SUM/MIN/MAX) als Dezimalzahl ohne Nullen ('0.25', '62.5').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if fval == int(fval) and abs(fval) < 1e15:
+        return f"{int(fval):,}".replace(",", ".")
+    return f"{fval:.2f}".rstrip("0").rstrip(".")
+
+
 class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
@@ -7515,6 +7582,15 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
+        # 12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'):
+        # TF-Anzeige des Kerzen-Overlays - der Nutzer sieht, welcher
+        # Timeframe die Kerzenbreite bestimmt (z. B. 'D1' -> 16,8h-Kerzen).
+        self._label_overlay_tf = QLabel("")
+        self._label_overlay_tf.setStyleSheet(
+            "color: #808080; font-size: 11px;")
+        self._label_overlay_tf.setToolTip(
+            "Timeframe des Kerzen-Overlays - bestimmt die Kerzenbreite "
+            "(bar_sec * 0.7). Wird aus den OHLCV-Overlay-Daten gelesen.")
         self._slider_zoom_x = QSlider(Qt.Horizontal)
         self._slider_zoom_y = QSlider(Qt.Horizontal)
         self._label_info = QLabel("")
@@ -7531,6 +7607,7 @@ class HeatmapWidget(QWidget):
 
         ctrl2 = QHBoxLayout()
         ctrl2.addWidget(self._chk_candle)
+        ctrl2.addWidget(self._label_overlay_tf)
         ctrl2.addWidget(QLabel("Zoom X:"))
         ctrl2.addWidget(self._slider_zoom_x)
         ctrl2.addWidget(QLabel("Zoom Y:"))
@@ -7594,6 +7671,16 @@ class HeatmapWidget(QWidget):
         self._plot_hm.addItem(self._cross_x, ignoreBounds=True)
         self._plot_hm.addItem(self._cross_y, ignoreBounds=True)
         self._plot_hm.scene().sigMouseMoved.connect(self._on_mouse_moved)
+
+        # 21.03.11 (Bug 5): Zwei-Wege-Sync der Zoom-Slider - Maus-Zoom
+        # (Mausrad/Drag) auf der Heatmap-ViewBox muss die X-/Y-Slider
+        # mitbewegen (bisher nur einseitig Slider -> Range). Die Handler
+        # aktualisieren Slider + VM-Params (blockSignals/_syncing-Guard
+        # verhindern Endlos-Schleifen).
+        self._plot_hm.plotItem.vb.sigXRangeChanged.connect(
+            self._on_heatmap_x_range_changed)
+        self._plot_hm.plotItem.vb.sigYRangeChanged.connect(
+            self._on_heatmap_y_range_changed)
 
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a, 11.08.2026): Senkrechte
         # Teiler je Dateneinheit (Bar-Intervall des TFs, z. B. H1 -> jede
@@ -8896,7 +8983,16 @@ class HeatmapWidget(QWidget):
         # (Wick + Bull-Koerper + Bear-Koerper) fuer ALLE Bars (vorher bei
         # 5000 Bars = 10.000 Einzel-Items -> Pan/Zoom rueckelte). Die
         # Daten werden als numpy-Arrays an BarGraphItem uebergeben.
-        bar_sec = self._bar_interval_seconds()
+        # 12.08.2026 (User-Meldung 4): Kerzenbreite an den DATEN-TF der
+        # OHLCV-Bars koppeln + TF im UI-Label anzeigen.
+        data_tf = str(data.get("timeframe") or "").strip().upper()
+        bar_sec = self._bar_interval_seconds(data_tf or None)
+        lbl_tf = getattr(self, "_label_overlay_tf", None)
+        if lbl_tf is not None:
+            if data_tf:
+                lbl_tf.setText(f"Overlay: {data_tf}")
+            else:
+                lbl_tf.setText("Overlay: ?")
         times = np.asarray([c[0] for c in candles], dtype=np.float64)
         opens = np.asarray([c[1] for c in candles], dtype=np.float64)
         highs = np.asarray([c[2] for c in candles], dtype=np.float64)
@@ -9009,16 +9105,80 @@ class HeatmapWidget(QWidget):
     # ------------------------------------------------------------------
     # 21.01 Bugfix 5: Adaptives Overlay (OHLCV im Heatmap-Timeframe)
     # ------------------------------------------------------------------
-    def _bar_interval_seconds(self) -> float:
-        """Bar-Intervall des Heatmap-Timeframes in Sekunden (Bugfix 5).
+    def _bar_interval_seconds(self,
+                             data_tf: Optional[str] = None) -> float:
+        """Bar-Intervall des Overlay-Timeframes in Sekunden (Bugfix 5).
 
-        Liest `params["timeframe"]` des ViewModels (z. B. 'H1' -> 3600) und
-        liefert einen Fallback (3600s), falls der TF unbekannt/leer ist.
+        12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'): Der
+        TF wird zunaechst aus den OHLCV-Overlay-DATEN gelesen (diejenige
+        Zeitebene, deren Kerzen tatsaechlich gerendert werden) und erst
+        dann aus `params["timeframe"]` des ViewModels - die Breite folgt
+        damit IMMER der angezeigten Datenbasis (Race-/Divergenz-sicher).
+        Fallback 3600s, falls beide TF unbekannt/leer sind.
         """
         tf = ""
-        if self._view_model is not None:
+        if data_tf:
+            tf = str(data_tf)
+        elif self._view_model is not None:
             tf = str(self._view_model.params.get("timeframe") or "")
         return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
+
+    # ------------------------------------------------------------------
+    # 21.03.11 (Bug 5): Zoom-Slider Zwei-Wege-Sync (Maus-Zoom -> Slider)
+    # ------------------------------------------------------------------
+    def _on_heatmap_x_range_changed(self, _vb, xrange) -> None:
+        """Aktualisiert den X-Zoom-Slider nach Maus-Zoom auf der X-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_x, xrange,
+            self._x_min, self._x_max, "zoom_x_range")
+
+    def _on_heatmap_y_range_changed(self, _vb, yrange) -> None:
+        """Aktualisiert den Y-Zoom-Slider nach Maus-Zoom auf der Y-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_y, yrange,
+            self._y_min, self._y_max, "zoom_y_range")
+
+    def _sync_slider_from_range(self, slider, vrange, vmin, vmax, key) -> None:
+        """Setzt Slider + VM-Params aus einem ViewBox-Range (Bug 5).
+
+        Rechnet den sichtbaren Achsen-Anteil [lo, hi] aus dem Range in den
+        normalisierten [0,1]-Bereich um und stellt den Slider invers ein.
+        Kein DB-Requery (set_heatmap_zoom ist rein client-seitig).
+        """
+        span = float(vmax) - float(vmin)
+        if span <= 0:
+            return
+        try:
+            lo = (float(vrange[0]) - float(vmin)) / span
+            hi = (float(vrange[1]) - float(vmin)) / span
+        except (TypeError, ValueError, IndexError):
+            return
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+        if hi <= lo:
+            return
+        self._set_zoom_slider(slider, [lo, hi])
+        # VM-Params aktualisieren (Persistenz) - Endlos-Schleifen-Guard via
+        # _syncing (set_heatmap_zoom emittiert kein ViewBox-Range-Event).
+        try:
+            if getattr(self, "_syncing", False) or self._view_model is None:
+                return
+            self._syncing = True
+            zx = list(self._view_model.params.get("zoom_x_range") or [0.0, 1.0])
+            zy = list(self._view_model.params.get("zoom_y_range") or [0.0, 1.0])
+            if key == "zoom_x_range":
+                zx = [lo, hi]
+            else:
+                zy = [lo, hi]
+            self._view_model.set_heatmap_zoom(zx, zy)
+        except Exception:
+            pass
+        finally:
+            self._syncing = False
 
     # ------------------------------------------------------------------
     # 21.01 Bugfix 3: Fadenkreuz + Zellwert-Info
@@ -9092,7 +9252,7 @@ class HeatmapWidget(QWidget):
         except (TypeError, ValueError, IndexError):
             self._label_info.setText(f"{time_txt}Zelle({row},{col}) = n/a")
             return
-        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
+        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {_format_heatmap_value(v)}")
 
     # ------------------------------------------------------------------
     # 21.01 Bugfix 2: Diskrete Schwellwert-Legende (oben rechts)
@@ -9123,13 +9283,27 @@ class HeatmapWidget(QWidget):
                 frac = (c - vmin) / (vmax - vmin)
                 frac = max(0.0, min(1.0, frac))
                 color = cmap.map(frac, mode="qcolor")
-                label = str(c) if c < 5 else "5+"
+                # 21.03.11 (Bug 1): Operator-korrekte Beschriftung
+                # (= Treffer-Wert, >=" fuer alles darueber).
+                label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-                val = vmin + frac * (vmax - vmin)
-                color = cmap.map(frac, mode="qcolor")
-                self._add_legend_swatch(color, f"{val:.2g}")
+            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            span = vmax - vmin
+            v25 = vmin + 0.25 * span
+            v50 = vmin + 0.50 * span
+            v75 = vmin + 0.75 * span
+            fmt = _format_heatmap_value
+            self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
+                                    "<= {}".format(fmt(v25)))
+            self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
+                                    "{} - {}".format(fmt(v25), fmt(v50)))
+            self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
+                                    "{} - {}".format(fmt(v50), fmt(v75)))
+            self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
+                                    "{} - {}".format(fmt(v75), fmt(vmax)))
+            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
+                                    ">= {}".format(fmt(v75)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:
@@ -9465,6 +9639,27 @@ class _SortableTimeItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class _SortableValueItem(QTableWidgetItem):
+    """JSON-Union-Item mit numerischem Vergleich (21.03.11, Bug 6).
+
+    Die dynamischen Feature-Werte (z. B. `signal_strength`) sind im Text
+    auf 4 signifikante Stellen gekuerzt ('9.5' > '10.2' lexikografisch falsch).
+    Diese Subklasse vergleicht den Rohwert aus dem UserRole numerisch,
+    damit die 'Signal-Staerke'-Sortierung der MTF-FC-Filterleiste korrekt ist.
+    """
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, QTableWidgetItem):
+            try:
+                a = self.data(Qt.UserRole)
+                b = other.data(Qt.UserRole)
+                if a is not None and b is not None:
+                    return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
+
+
 class TablePage(QWidget):
     """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
 
@@ -9491,6 +9686,12 @@ class TablePage(QWidget):
         self._page_size: int = 100
         self._current_page: int = 0
         self._total_pages: int = 1
+        # 21.03.11 (Bug 6): Externe Sortierung aus der MTF-FC-Filterleiste
+        # ('date' | 'signal' | 'tf'). None = keine externe Vorgabe (die
+        # TablePage sortiert wie bisher nach Profil/User-Klick). Ein gesetzter
+        # Modus hat VORRANG vor der Profil-Sortierung (wird nach jedem
+        # Befuellen erneut angewendet) und persistiert NICHT als User-Setting.
+        self._external_sort_mode: Optional[str] = None
 
         self._header = QLabel("Feature-Store-Tabelle")
         self._table = QTableWidget(0, len(_BASE_COLUMNS))
@@ -9619,6 +9820,77 @@ class TablePage(QWidget):
             self._render_current_page()
 
     # ------------------------------------------------------------------
+    # 21.03.11 (Bug 6): Externe Sortierung (MTF-FC-Filterleiste via EventBus)
+    # ------------------------------------------------------------------
+    def set_external_sort_mode(self, mode: str) -> None:
+        """Setzt die externe Sortierung ('date' | 'signal' | 'tf').
+
+        Wird vom AnalyticsWindow aufgerufen, wenn die MTF-FC-Filterleiste
+        des ChartWindows eine neue Sortierung emittiert (EventBus). Der Modus
+        hat VORRANG vor der Profil-/User-Sortierung, wird nach jedem
+        Befuellen erneut angewendet und persistiert NICHT als User-Setting.
+        Ein leerer/ungueltiger Modus deaktiviert die externe Vorgabe.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = ""
+        if mode == (self._external_sort_mode or ""):
+            return
+        self._external_sort_mode = mode or None
+        if self._table.rowCount() > 0:
+            self._apply_external_sort()
+
+    def _apply_external_sort(self) -> None:
+        """Wendet die externe Sortierung auf die Tabelle an (Bug 6).
+
+        Spalten-Mapping: 'date' -> Zeit (absteigend, UserRole-Epoch),
+        'signal' -> Header-Substring (signal/stärke/score/conf/wert) auf den
+        dynamischen JSON-Union-Spalten (absteigend, numerisch via
+        `_SortableValueItem`), 'tf' -> Header-Substring (timeframe/tf)
+        aufsteigend. Fallback (keine passende Spalte): Zeit absteigend.
+        Die QTableWidget-Sortierung (setSortingEnabled + sortItems) betrifft
+        nur die ANZEIGE – `_current_rows` und das Jump-to-Chart-Mapping
+        (UserRole+1) bleiben unveraendert.
+        """
+        mode = self._external_sort_mode or "date"
+        column: int = _COL_TIME
+        order: Qt.SortOrder = Qt.DescendingOrder
+        if mode == "signal":
+            col = self._find_dynamic_header(
+                ("signal", "stärke", "staerke", "score", "conf", "wert"))
+            if col is not None:
+                column, order = col, Qt.DescendingOrder
+        elif mode == "tf":
+            col = self._find_dynamic_header(("timeframe", "tf"))
+            if col is not None:
+                column, order = col, Qt.AscendingOrder
+        # Signale blockieren: externe Sortierung ist KEINE User-Aktion und
+        # darf nicht `table_settings_changed` (Profil-Persistenz) ausloesen.
+        header = self._table.horizontalHeader()
+        header.blockSignals(True)
+        try:
+            self._table.setSortingEnabled(True)
+            self._table.sortItems(column, order)
+        finally:
+            header.blockSignals(False)
+
+    def _find_dynamic_header(self, needles: tuple) -> Optional[int]:
+        """Findet eine dynamische JSON-Union-Spalte per Header-Substring.
+
+        Sucht NUR die Spalten ab `_COL_SERVICE + 1` (die dynamischen
+        Feature-Keys) – Basis-Spalten 'Zeit (Wanduhr)'/'Service' werden nie
+        getroffen (ein 'tf'-Substring in 'Zeit' waere falsch).
+        """
+        for col in range(_COL_SERVICE + 1, self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            text = str(item.text()).lower()
+            if any(n in text for n in needles):
+                return col
+        return None
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -9740,6 +10012,11 @@ class TablePage(QWidget):
         finally:
             for w in blocked:
                 w.blockSignals(False)
+        # 21.03.11 (Bug 6): Externe MTF-FC-Sortierung hat Vorrang vor der
+        # Profil-Sortierung und wird nach JEDEM Befuellen erneut angewendet
+        # (nur Anzeige, kein User-Setting, kein Dirty-Flag).
+        if self._external_sort_mode:
+            self._apply_external_sort()
         self._update_page_controls()
 
     def _populate_rows(
@@ -9772,6 +10049,10 @@ class TablePage(QWidget):
             self._table.setItem(r, _COL_SERVICE,
                                 QTableWidgetItem(service_names[r] or "-"))
             # JSON-Union-Spalten: Wert aus feature_data, sonst "-".
+            # 21.03.11 (Bug 6): Numerische Werte als `_SortableValueItem` mit
+            # Rohwert im UserRole – die 'Signal-Staerke'-Sortierung der
+            # MTF-FC-Filterleiste vergleicht dann numerisch statt lexiko-
+            # grafisch ('9.5' < '10.2' korrekt).
             fd = row.get("feature_data")
             if not isinstance(fd, dict):
                 fd = {}
@@ -9780,7 +10061,9 @@ class TablePage(QWidget):
                 if v is None:
                     self._table.setItem(r, ci, QTableWidgetItem("-"))
                 elif isinstance(v, (int, float)):
-                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
+                    item = _SortableValueItem(f"{v:.4g}")
+                    item.setData(Qt.UserRole, float(v))
+                    self._table.setItem(r, ci, item)
                 else:
                     self._table.setItem(r, ci, QTableWidgetItem(str(v)))
 
