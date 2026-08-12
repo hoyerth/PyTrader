@@ -25,42 +25,25 @@
 
 ---
 
-# 21.02 – Multi-TF Execution, Status Pill-Strip & DB Maintenance
+# 21.02 – DB Bloat Analysis & Maintenance (VACUUM)
 
-## 🎯 1. Ziel & Fachliche Kern-Anforderungen
+## 🎯 1. Kern-Anforderungen
 
-1. **Multi-TF Execution im Service Picker / Window:**
-* Action-Button / Combo in Toolbar: `[ Aktueller TF ]` vs. `[ 🌐 Alle Timeframes (6 TFs) ]`.
-* Klick führt den `HistoricalScanner` schrittweise über alle 6 Timeframes (`M1`, `M5`, `M15`, `H1`, `H4`, `D1`) aus.
-
-2. **Kompaktes Status-Widget (`TfStatusBadgeBar` / Pill-Strip):**
-* Extrem platzsparend ($170 \times 16\text{ px}$) in `ServiceWindow` / `MasterTree` sowie `AnalyticsWindow` eingebettet.
-* Visuelle 6-TF Badges (`M1`–`D1`): Grau (`⚪` = No Data), Grün (`✅` = Berechnet/Rows vorhanden), Rot (`❌` = Fehler), Blau Blinken (`🔄` = Scan läuft).
-* Detail-Tooltip beim Hover: Zeigt exakte Zeilenzahl und Datum/Uhrzeit der letzten Ausführung (`DD.MM.JJ HH:MM`).
-
-3. **DB-Bloat & Maintenance (VACUUM):**
-* Status-Ermittlung via `PRAGMA database_size` beim App-Start: Zeigt Fragmentierung auf `MainWindow` unter dem Optionen-Button an (z. B. `DB Status: 28% fragmentiert (85 MB frei)`).
-* `[ 🧹 DB Service (VACUUM) ]`-Button im `PropertiesWindow` (`properties_win.py`).
-* Concurrency-Guard: `VACUUM` ist gesperrt, solange Scans/Worker laufen (`_sync_pause_count > 0`).
+1. **Bloat-Analyse:** Startup-Anzeige auf `MainWindow` unter Optionen-Button via `PRAGMA database_size`.
+2. **Vacuum Execution:** Button `[ 🧹 DB Service (VACUUM) ]` in `PropertiesWindow` führt `VACUUM;` aus.
+3. **Concurrency-Guard:** `VACUUM` sperren, solange `_sync_pause_count > 0` (laufende Scans/Worker).
 
 ---
 
-## 🚀 2. Übersicht UI-Komponenten & Status-Logik
+## 🛠️ 2. Schritt-für-Schritt Umsetzungsanleitung
 
-| Komponente | Ort / Trigger | Logik / Auswirkung |
-| --- | --- | --- |
-| **Pill-Strip Bar** | `ServiceWindow` / `MasterTree` / `AnalyticsWindow` | Zeigt $6$ Micro-Badges (`M1`..`D1`). Tooltip zeigt `count` + `last_run`. |
-| **Multi-TF Run** | Toolbar `ServiceWindow` | Führt Batch-Run sequentiell für alle 6 TFs aus. Updates auf Badges via `scan_finished`. |
-| **DB-Status Label** | `MainWindow` (unter Optionen-Button) | Zeigt Fragmentierung in % und Bloat in MB an (via `PRAGMA database_size`). |
-| **DB Service Button** | `PropertiesWindow` | Führt `VACUUM;` auf `analytics.duckdb` & `market_data.duckdb` aus (sofern keine Scans laufen). |
+### Schritt 1: Core Engine (`db/db_utils.py`)
 
----
+Füge folgende Funktionen in `db/db_utils.py` ein:
 
-## 🛠️ 3. Schritt-für-Schritt Umsetzungsanleitung für die IDE
-
-### Schritt 1: DB-Utilities & Maintenance-Engine (`db/db_utils.py` & `analytics/engine/feature_store_reader.py`)
-
-* **1.1 Bloat-Analysis & Vacuum-Funktion (`db/db_utils.py`):**
+# db/db_utils.py
+import os
+from db.db_pool import DbPool
 
 def get_db_fragmentation_info(db_path: str) -> dict:
     if not os.path.exists(db_path):
@@ -84,40 +67,122 @@ def execute_db_vacuum(db_path: str) -> None:
     con = DbPool.get(db_path)
     con.execute("VACUUM;")
 
+---
 
-* **1.2 TF-Status-Query (`analytics/engine/feature_store_reader.py`):**
-Implementiere `fetch_service_tf_status(plugin_id: str) -> Dict[str, dict]`:
-Liefert `SELECT LOWER(timeframe), COUNT(*), MAX(created_at) FROM feature_store WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?)) GROUP BY 1`.
+### Schritt 2: Startup Status (`main.py`)[cite: 1]
+Beim App-Start in `main.py` aufrufen und UI-Label unter Optionen-Button befüllen:
 
-### Schritt 2: Status-Pill-Strip Widget (`serviceui/common_widgets.py` / `master_tree.py`)
 
-* **2.1 `TfStatusBadgeBar`-Widget erstellen:**
-* Kompaktes `QWidget` ($170 \times 16\text{ px}$) mit 6 `QLabel`-Badges für `M1`, `M5`, `M15`, `H1`, `H4`, `D1`.
-* Method `update_status(tf_map)`: Führt Color-Mapping durch (Grün `#1e4620`/`#26a69a` bei Daten; Grau `#2a2a2a` ohne Daten) und setzt `setToolTip()` mit `count` und `last_run`.
+# main.py
+from db.db_utils import get_db_fragmentation_info
 
-### Schritt 3: Multi-TF Ausführung (`serviceui/service_win.py`)
-
-* **3.1 Toolbar-Combo & Execution Loop:**
-* Füge ComboBox `combo_run_tf` ein (`[ Aktueller TF ]`, `[ 🌐 Alle Timeframes (6 TFs) ]`).
-* Bei Auswahl *"Alle Timeframes"* führt der `ServiceRunWorker` / `HistoricalScanner` die Iteration über `["M1", "M5", "M15", "H1", "H4", "D1"]` durch.
-* Nach jedem TF-Abschluss Signal zur Aktualisierung der `TfStatusBadgeBar` senden.
-
-### Schritt 4: UI-Integration Main-Window & Properties-Window
-
-* **4.1 `MainWindow` (`main.py`):**
-* Beim Startup `get_db_fragmentation_info("data/analytics.duckdb")` aufrufen und `label_db_status` unter dem Optionen-Button befüllen (z. B. `DB Status: 18% fragmentiert`).
-
-* **4.2 `PropertiesWindow` (`properties_win.py`):**
-* Button `[ 🧹 DB Service (VACUUM) ]` einbauen.
-* Guard-Prüfung: Falls `_sync_pause_count > 0`, Button sperren / Hinweis ausgeben.
-* Führt `execute_db_vacuum()` für `analytics.duckdb` und `market_data.duckdb` aus und aktualisiert die Status-Anzeige.
+info = get_db_fragmentation_info("data/analytics.duckdb")
+# UI-Label setzen (z. B. label_db_status)
+self.label_db_status.setText(f"DB Status: {info['pct']}% fragmentiert ({info['bloat_mb']} MB frei)")
 
 ---
 
-## 📊 4. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
+### Schritt 3: UI & Concurrency Guard (`properties_win.py`)[cite: 1]
+Button `[ 🧹 DB Service (VACUUM) ]` einbauen und mit Concurrency Guard schützen:
 
-1. **Bloat-Check-Test:** `get_db_fragmentation_info()` liefert gültige Prozent- und MB-Werte für bestehende `.duckdb`-Dateien.
-2. **Vacuum-Execution-Test:** `execute_db_vacuum()` schließt ohne Exception ab und verringert/konsolidiert die Dateiblöcke.
-3. **TF-Status-Test:** `fetch_service_tf_status()` gibt für existierende Plugins ein valides Dict mit `count` und `last_run` je Timeframe zurück.
-4. **Badge-Widget-Test:** `TfStatusBadgeBar` aktualisiert Farben und Tooltips fehlerfrei bei Übergabe eines Status-Dicts.
+
+# properties_win.py
+from db.db_utils import execute_db_vacuum, get_db_fragmentation_info
+
+def _on_btn_vacuum_clicked(self) -> None:
+    # Concurrency-Guard
+    if getattr(self.parent(), "_sync_pause_count", 0) > 0:
+        print("⚠️ VACUUM gesperrt: Scans/Worker laufen aktuell.")
+        return
+
+    execute_db_vacuum("data/analytics.duckdb")
+    execute_db_vacuum("data/market_data.duckdb")
+    print("✅ DB Vacuum erfolgreich ausgeführt.")
+
+---
+
+## 📊 3. Akzeptanzkriterien (`test/test.py`)[cite: 1]
+1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück[cite: 1].
+2. `execute_db_vacuum()` schließt fehlerfrei ab[cite: 1].
+
+---
+
+## 📝 4. Prüfung & Entscheidungen (12.08.2026)
+
+> Implementierungs-Log: Konsistenz-/Korrektheits-/Vollständigkeits-Prüfung von Kap. 21.02 gegen den Code-Stand (Commit `bfaf971`). **Kein Coding** – reine Doku der Befunde und getroffenen Entscheidungen.
+
+### 4.1 Status
+- Kap. 21.02 ist eine **Spezifikation/Umsetzungsanleitung** – die Umsetzung ist **offen** (kein Code vorhanden).
+- **Beschluss (12.08.2026):** Kein Coding jetzt; Umsetzung erst nach expliziter Anweisung. Die Prüf-/Arbeitsmethode (headless-Verifikation + Doku-Log) wird weiterhin ausgearbeitet.
+
+### 4.2 Vollständigkeit (Code-Befund)
+| Schritt | Doku-Vorgabe | Stand |
+|---|---|---|
+| Schritt 1 | `get_db_fragmentation_info()` / `execute_db_vacuum()` in `db/db_utils.py` | ❌ nicht vorhanden (`db_utils.py`: nur `_ensure_epoch`/`_parse_json_field`) |
+| Schritt 2 | Startup-Aufruf `main.py` + `label_db_status` | ❌ nicht vorhanden; Label existiert auch nicht in `ui/main_win.ui` |
+| Schritt 3 | VACUUM-Button in `properties_win.py` + Guard | ❌ nicht vorhanden |
+| AK 1–2 | Headless-Tests | ❌ nicht verifizierbar (Code fehlt) |
+
+✅ Vorhanden als Grundlage: `_sync_pause_count` in `main.py:166` (Phase-16-EventBus-Guard, Signale `service_run_started`/`service_run_finished`).
+
+### 4.3 Befunde der Konsistenz-/Korrektheits-Prüfung
+- **K1 (Guard wirkungslos):** `PersistentWindow.__init__` übergibt **kein Qt-Parent** (`super().__init__()` ohne parent, Logik-Parent nur für `state_manager`) → `self.parent()` ist `None` → `getattr(self.parent(), "_sync_pause_count", 0)` greift **nie** (immer Default 0).
+- **K2 (Label fehlt):** `label_db_status` existiert nicht in `ui/main_win.ui` (dort nur `status_label`); kein dedizierter Platz „unter dem Optionen-Button".
+- **F1 (falscher PRAGMA-Spalten-Index):** `PRAGMA database_size` (DuckDB 1.5.5) liefert: `0 database_name, 1 database_size (VARCHAR), 2 block_size, 3 total_blocks, 4 used_blocks, 5 free_blocks, 6 wal_size, 7 memory_usage, 8 memory_limit`. Der Snippet nutzt `res[1], res[3]` = **`database_size` (String!)** + **`total_blocks`** → falsch.
+- **F2 (VACUUM wirkungslos, empirisch belegt):** `INSERT 500k → DELETE → VACUUM;` sowie `CHECKPOINT;` ändern die Dateigröße **nicht** (0 % Reduktion); `PRAGMA database_size` vor/nach identisch. DuckDB 1.5.5 besitzt **kein echtes VACUUM** wie SQLite – das Ziel „Bloat reduzieren" ist mit `VACUUM;` nicht erreichbar. AK2 („verringert/konsolidiert Blöcke") ist damit nicht erfüllbar.
+
+### 4.4 Entscheidungen (12.08.2026)
+| Punkt | Entscheidung |
+|---|---|
+| **F1** (PRAGMA-Index) | ✅ **Bestätigt:** Korrektur auf `block_size, used_blocks = res[2], res[4]` |
+| **K1** (Concurrency-Guard) | ✅ **Bestätigt:** Guard über `EventBus`-Zähler (konsistent zu Phase 16) statt `self.parent()` |
+| **K2** (Status-Label) | ✅ **Bestätigt:** `label_db_status` wird ergänzt (in `ui/main_win.ui` oder per Code – Detail bei Umsetzung) |
+| **F2** (VACUUM-Ziel) | ✅ **Entschieden:** Zweistufige Lösung – **CHECKPOINT + VACUUM beim App-Exit** (reguläre Pflege) + **COPY FROM DATABASE-Methode** (echte Kompaktierung). Siehe 4.6 |
+| Umsetzung allgemein | ⏸️ **Zurückgestellt:** Kein Coding jetzt |
+
+### 4.5 Ergänzungen (bei späterer Umsetzung zu beachten)
+- `db/db_utils.py`: fehlendes `import os` im Snippet beachten; `DbPool`-Import ist innerhalb des `db`-Pakets zulässig (Basis-Schicht E4 bleibt sonst ohne Projekt-Import).
+- Markdown-Artefakte `[cite: 1]` im Kapitel bereinigen.
+- AK2-Formulierung folgt der F2-Lösung (siehe 4.6): `CHECKPOINT`/`VACUUM` allein verkleinern die Datei nicht – die **Kompaktierung** leistet `COPY FROM DATABASE`.
+
+### 4.6 Lösungsweg F2: DB-Pflege beim App-Exit + Kompaktierung per COPY FROM DATABASE
+
+**Beschluss (12.08.2026):** Die DB-Pflege wird zweistufig umgesetzt. Empirisch belegt (DuckDB 1.5.5): `VACUUM;` und `CHECKPOINT;` verkleinern die Datei **nicht** (0 % Reduktion, `PRAGMA database_size` unverändert). Die tatsächliche Kompaktierung leistet die **`COPY FROM DATABASE`-Methode**.
+
+#### Stufe 1 – Beim Verlassen der App (regulär, `main.py` `closeEvent`)
+Beim App-Exit wird für jede DuckDB-Datei ausgeführt:
+```sql
+CHECKPOINT;   -- WAL in Hauptdatei flushen (konsistenter Zustand)
+VACUUM;       -- formale Defragmentierung (in DuckDB 1.5.5 ohne Dateigrößen-Effekt)
+```
+* Zweck: WAL wird aufgeräumt, die Datei in einen sauberen Zustand versetzt (kein WAL-Replay beim nächsten Start).
+* Aufruf über `execute_db_vacuum(db_path)`-Erweiterung in `db/db_utils.py` (führt `CHECKPOINT;` **gefolgt von** `VACUUM;` aus).
+* Gilt für `analytics.duckdb` und `market_data.duckdb` (bei Bedarf auch `app_data.duckdb`).
+* **Keine UI-Blockade:** App-Exit läuft, wenn keine Scans/Worker mehr aktiv sind (Referenzzähler `_sync_pause_count == 0`).
+
+#### Stufe 2 – Kompaktierung (Variante A: `COPY FROM DATABASE`, DuckDB ≥ 0.9.0)
+Für eine echte Verkleinerung (Bloat entfernen) wird die Datenbank in eine frische, minimale Datei übertragen:
+
+```sql
+-- 1. Neue, leere Datenbank-Datei anheften
+ATTACH 'data/analytics_compacted.duckdb' AS new_db;
+
+-- 2. Alle Daten/Schema/Indizes in die neue DB kopieren (lückenlose Datei)
+--    WICHTIG: korrekte DuckDB-Syntax = COPY FROM DATABASE <src> TO <dst>
+COPY FROM DATABASE analytics TO new_db;
+
+-- 3. Neue DB wieder trennen
+DETACH new_db;
+```
+
+* Danach wird im Dateisystem die alte `analytics.duckdb` durch die kompakte `analytics_compacted.duckdb` ersetzt (Löschen/Umbenennen).
+* **Katalogname:** entspricht dem Datei-Basename ohne `.duckdb` (z. B. `analytics` für `analytics.duckdb`, `market_data` für `market_data.duckdb`). Bei Sonderzeichen (führender Unterstrich o. Ä.) ist der Katalogname in doppelte Anführungszeichen zu setzen: `COPY FROM DATABASE "_copy_src" TO new_db`.
+* **Empirisch verifiziert** (headless, `test/check_copy_database.py`, nur Test-Dateien): Reduktion **85,4 %** gegen Bloat; Schema, Tabellen, Constraints und Daten werden **vollständig** übertragen (PASS).
+* **Guard:** Kompaktierung nur bei `_sync_pause_count == 0` (keine laufenden Scans/Worker); sinnvoller Einstieg: der `[ 🧹 DB Service ]`-Button in `PropertiesWindow`.
+
+#### Akzeptanzkriterien (angepasst an F2-Lösung)
+1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück.
+2. `execute_db_vacuum()` (CHECKPOINT + VACUUM) schließt fehlerfrei ab und erzeugt eine konsistente Datei (kein WAL-Replay beim nächsten Öffnen).
+3. `copy_database(src, dst)`-Helper (Kompaktierung): Kopie ist kleiner als die Bloat-Datei und enthält Schema + Daten vollständig (headless-Test wie `test/check_copy_database.py`).
+
 
