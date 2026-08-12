@@ -1325,7 +1325,7 @@ class FeatureStoreReader:
         return out
 
     def fetch_service_tf_status(
-        self, plugin_id: str
+        self, plugin_id: str, instance_hash: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """Timeframe-Verfuegbarkeit eines Services (21.01b, Schritt 1).
 
@@ -1333,9 +1333,17 @@ class FeatureStoreReader:
         Services die Anzahl der Feature-Store-Eintraege und den letzten
         Schreib-Zeitpunkt direkt aus der feature_store-Tabelle.
 
+        Bugfix 12.08.2026 (User-Meldung 'Data only loeschen'): Ohne
+        `instance_hash` ist die Abfrage service-weit (alle Varianten der
+        plugin_id). Wird ein `instance_hash` uebergeben, werden NUR die
+        Rows GENAU dieser Variante gezaehlt – nach dem Purge einer
+        Variante verschwinden ihre TF-Pills damit korrekt (vorher zeigten
+        die Pill-Badges die TFs aller Varianten des Services gemeinsam).
+
         SQL: SELECT LOWER(timeframe), COUNT(*), MAX(created_at)
              FROM feature_store
              WHERE LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+               [AND LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))]
              GROUP BY LOWER(timeframe)
 
         Robustheit wie `fetch_last_execution_dates`: Case-insensitiv
@@ -1344,6 +1352,9 @@ class FeatureStoreReader:
 
         Args:
             plugin_id: Plugin-ID des Services (z.B. 'srv_proximity').
+            instance_hash: Optionaler Varianten-Hash – werden nur gesetzt,
+                zeigt der Status ausschliesslich diese Variante (Clone/
+                Preset/Set-Instanz). None/leer = service-weit.
 
         Returns:
             Dict Timeframe (upper, z.B. 'M1') -> {'count': int, 'last_run': str}
@@ -1352,16 +1363,26 @@ class FeatureStoreReader:
         """
         if not plugin_id or not str(plugin_id).strip():
             return {}
+        conditions = [
+            "feature_id IS NOT NULL AND TRIM(feature_id) != ''",
+            "LOWER(TRIM(feature_id)) = LOWER(TRIM(?))",
+        ]
+        params: List[Any] = [str(plugin_id)]
+        # Varianten-Scope (Bugfix 12.08.2026): exakter Hash-Match (nur diese
+        # Variante, keine service-weiten Alt-Rows anderer Instanzen).
+        h_s = str(instance_hash or "").strip()
+        if h_s:
+            conditions.append("LOWER(TRIM(instance_hash)) = LOWER(TRIM(?))")
+            params.append(h_s)
         con = self._get_connection()
         try:
-            rows = con.execute("""
+            rows = con.execute(f"""
                 SELECT LOWER(TRIM(timeframe)) AS tf, COUNT(*) AS cnt,
                        MAX(created_at) AS last_run
                 FROM feature_store
-                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
-                  AND LOWER(TRIM(feature_id)) = LOWER(TRIM(?))
+                WHERE {' AND '.join(conditions)}
                 GROUP BY LOWER(TRIM(timeframe))
-            """, [str(plugin_id)]).fetchall()
+            """, params).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_service_tf_status "
                   f"fehlgeschlagen: {e}")

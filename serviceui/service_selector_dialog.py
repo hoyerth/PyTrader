@@ -66,7 +66,7 @@ Bugfix-Runde 06.08.2026 (User-Anweisung, Punkte 1-4):
      naechsten Oeffnen wiederhergestellt (Muster IndicatorSettingsDialog).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -379,6 +379,10 @@ class ServiceSelectorDialog(QDialog):
         self._run_worker: Optional[ServiceRunWorker] = None
         #: Plugin-ID des Services, dessen TF-Pills aktuell angezeigt werden.
         self._badge_plugin_id: Optional[str] = None
+        # 12.08.2026 (User-Meldung 'Data only loeschen'): Optionaler
+        # instance_hash der angezeigten Variante - der Pill-Strip wird
+        # damit VARIANTEN-GENAU geladen (nach Purge verschwinden ihre TFs).
+        self._badge_instance_hash: Optional[str] = None
         # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
         # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
         # des Panels (analog service_win). Bleibt nach Modell-Refreshes
@@ -450,7 +454,12 @@ class ServiceSelectorDialog(QDialog):
         # Services des aktuellen Timeframes (ServiceRunWorker.service_progress).
         self.progress_label = QLabel("")
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximum(0)   # Busy bis zum 1. Wert
+        # 12.08.2026 (User-Meldung 'Fortschrittsbalken laeuft dauerhaft'):
+        # setMaximum(0) startet eine INDETERMINATE Busy-Animation, die nie
+        # endet. Determinate leere Range (0..1, Wert 0) statt Busy-Loop;
+        # _on_service_progress setzt beim Run die echte Range (max(total,1)).
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(16)
         self.progress_bar.setTextVisible(False)
         progress_row = QHBoxLayout()
@@ -1579,9 +1588,9 @@ class ServiceSelectorDialog(QDialog):
             self._entries_for_scope(node_type, set_id, service_id, plugin_id),
             editable_plugin=editable)
         # 21.01b: Pill-Strip dem geklickten Service nachziehen.
-        self._refresh_badge_bar(
-            self._resolve_badge_plugin(node_type, set_id,
-                                       service_id, plugin_id))
+        pid_badge, hash_badge = self._resolve_badge_scope(
+            node_type, set_id, service_id, plugin_id)
+        self._refresh_badge_bar(pid_badge, hash_badge)
 
     def _resolve_selection_ids(self, node_type: str, set_id: str,
                                service_id: str, plugin_id: str) -> List[str]:
@@ -1933,7 +1942,9 @@ class ServiceSelectorDialog(QDialog):
         """Setzt den Fortschrittsbalken zurueck (Default: leeres Label)."""
         bar = getattr(self, "progress_bar", None)
         if bar is not None:
-            bar.setMaximum(0)
+            # 12.08.2026: setMaximum(0) waere eine endlose Busy-Animation
+            # (indeterminate) - determinate leere Range (0..1) verwenden.
+            bar.setRange(0, 1)
             bar.setValue(0)
         lbl = getattr(self, "progress_label", None)
         if lbl is not None:
@@ -1961,17 +1972,34 @@ class ServiceSelectorDialog(QDialog):
             self.badge_bar.set_error(tf)
         self.badge_bar.set_running(None)
 
-    def _resolve_badge_plugin(self, node_type: str, set_id: str,
-                              service_id: str,
-                              plugin_id: str) -> Optional[str]:
-        """Ermittelt die plugin_id fuer den Pill-Strip einer Baum-Zeile."""
+    def _resolve_badge_scope(self, node_type: str, set_id: str,
+                             service_id: str,
+                             plugin_id: str) -> Tuple[Optional[str],
+                                                      Optional[str]]:
+        """Ermittelt (plugin_id, instance_hash) fuer den Pill-Strip.
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Der Pill-Strip wird
+        VARIANTEN-GENAU geladen. Clone-Knoten tragen den instance_hash im
+        service_id-Slot (MasterTree._emit_selection_details, 20.04 Q7);
+        Set-/Service-Zeilen liefern den Hash der ersten Instanz aus der
+        Set-Definition (cfg['instance_hash'], sonst Params-only-Hash).
+        """
         if plugin_id:
-            return str(plugin_id)
+            h = str(service_id) if node_type == TYPE_CLONE else None
+            return str(plugin_id), (h or None)
         if node_type == TYPE_SERVICE:
             if set_id and service_id:
                 cfg = self.model.find_service(set_id, service_id) or {}
-                return str(cfg.get("plugin_id") or service_id)
-            return str(service_id) if service_id else None
+                pid = str(cfg.get("plugin_id") or service_id)
+                h = str(cfg.get("instance_hash") or "") or None
+                if not h and pid:
+                    try:
+                        h = generate_instance_hash(
+                            pid, cfg.get("params") or {})
+                    except Exception:
+                        h = None
+                return pid, h
+            return (str(service_id) if service_id else None), None
         if node_type == TYPE_SET and set_id:
             definition = self.model.find_set(set_id) or {}
             order = list(definition.get("execution_order") or [])
@@ -1980,20 +2008,35 @@ class ServiceSelectorDialog(QDialog):
                 cfg = services.get(iid) or {}
                 pid = str(cfg.get("plugin_id") or iid)
                 if pid:
-                    return pid
-        return None
+                    h = str(cfg.get("instance_hash") or "") or None
+                    if not h:
+                        try:
+                            h = generate_instance_hash(
+                                pid, cfg.get("params") or {})
+                        except Exception:
+                            h = None
+                    return pid, h
+        return None, None
 
-    def _refresh_badge_bar(self, plugin_id: Optional[str] = None) -> None:
+    def _refresh_badge_bar(self, plugin_id: Optional[str] = None,
+                           instance_hash: Optional[str] = None) -> None:
         """Laedt die TF-Status-Pills fuer den angegebenen Service neu
-        (FeatureStoreReader.fetch_service_tf_status)."""
+        (FeatureStoreReader.fetch_service_tf_status).
+
+        12.08.2026 (User-Meldung 'Data only loeschen'): Mit `instance_hash`
+        wird der Pill-Strip VARIANTEN-GENAU geladen (nur die TFs dieser
+        Variante); ohne Hash bleibt das service-weite Verhalten erhalten."""
         if plugin_id:
             self._badge_plugin_id = plugin_id
+        if instance_hash:
+            self._badge_instance_hash = instance_hash
         pid = self._badge_plugin_id
         if not pid:
             self.badge_bar.clear()
             return
+        h = self._badge_instance_hash or None
         try:
-            status = FeatureStoreReader().fetch_service_tf_status(pid)
+            status = FeatureStoreReader().fetch_service_tf_status(pid, h)
         except Exception:
             status = {}
         self.badge_bar.update_status(status)
