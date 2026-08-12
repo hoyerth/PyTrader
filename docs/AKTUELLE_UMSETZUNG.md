@@ -820,4 +820,4 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   DPI-Artefakt geklärt: `devicePixelRatio` = 1.0, aber `mapTo`-global-x ≈ 2× intern
   (offscreen-Render-Artefakt) - logische Koordinaten maßgeblich.
 
-- **Commit:** nach diesem Doku-Eintrag
+- **Commit:** `5194107`
