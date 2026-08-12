@@ -1034,4 +1034,4 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 
 - **Status:** Analyse + Entscheidungs-Doku abgeschlossen. KEIN Coding (wird nicht
   angefasst). Umsetzung der Schritte (1) und (2) erst nach explizitem Startschuss.
-- **Commit:** `(nachgetragen)`
+- **Commit:** `b00fd60`
