@@ -1209,3 +1209,98 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   YTD-Code); die MTF-FC-Kette bleibt unveraendert.
 
 - **Commit:** 22e2b66
+
+## 21.03.16 - Option A Feld-Dropdown (Parameter-Ebene, Bug 1/2) + Viridis-Legende (Bug 5) (12.08.2026 23:20, FERTIG)
+
+> Nach dem Anwender-Startschuss wurde Option A (echte Parameter-Filterung) umgesetzt.
+> Der User hatte die 3 Bugs (Feld-Dropdown wirkt nicht / wird nicht restored,
+> falsche Vorbelegung bei Aggregations-Wechsel, unsinnige Legenden-Wertebereiche)
+> als zu 100% weiterbestehend gemeldet. Entscheidung: Bug 1/2 = Parameter-Ebene
+> wirklich filtern (Option A), Bug 5 = Operator-Labels + adaptive Genauigkeit.
+
+### Kern-Architektur (Option A): (Service|Parameter)-Paare statt Service-IDs
+- Die Checkboxen im 'Feld'-Dropdown repr?sentieren `{service_id}|{key}`-Paare
+  (bisher wurden daraus NUR Service-IDs abgeleitet und auf Service-Ebene
+  gefiltert - Abw?hlen eines Parameters bei 2 Parametern eines Services
+  ?nderte nichts, weil die Service-Menge gleich blieb; Bug 1).
+- **Neu:** `field_selection` (Liste `"{service_id}|{key}"`) wird als
+  effektive Paar-Auswahl persistiert (Profil/Workspace) und beim
+  Aggregations-/Restore-Wechsel EXAKT wieder hergestellt (Bug 2: keine
+  'alle Parameter'-Vorbelegung mehr).
+- **Reader-Filter:** `_apply_field_pair_filter()` erweitert die WHERE-Clause
+  der generischen Heatmap um eine OR-Bedingung je Paar
+  (`LOWER(TRIM(feature_id)) = ? AND json_extract_string(feature_data,
+  '$.key') IS NOT NULL`) - An/Abw?hlen eines Parameters ?ndert die Grafik
+  wirklich (nur Rows, deren feature_data den gew?hlten JSON-Key des
+  jeweiligen Services tr?gt). Identifier-unsichere Keys werden defensiv
+  ?bersprungen (kein SQL-Injection-Risiko, Muster `_is_json_key_identifier`).
+- **DuckDB-Arrow-Bug (v1.5.5):** `feature_data->>'key'` kollidiert in
+  Kombination mit `LOWER(TRIM(feature_id))`-Equalities mit einem
+  Optimizer-Bug (versucht die JSON-Spalte auf numerisch/BOOL zu casten und
+  wirft f?r nicht-matchende Zeilen). `json_extract_string(feature_data,
+  '$.key')` liefert identische NULL-Semantik und ist auf JSON- UND
+  VARCHAR-Spalten stabil.
+
+### Bug 1 - Feld-Dropdown: An/Abw?hlen wirkt auf Grafik + wird restored (FIX)
+- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - `_on_field_selection_changed`
+  ruft jetzt `set_field_selection(pairs)` (statt nur `set_feature_ids(ids)`).
+  Neue Helfer `_checked_field_pairs()` (ALL|key-Expansion ?ber
+  `_field_sources`) und `_sync_field_selection_to_vm()` (materialisiert die
+  effektive Paar-Auswahl am Ende jedes Rebuilds).
+- **Ge?ndert:** `analytics/engine/analytics_view_model.py` - neue Methode
+  `set_field_selection(field_pairs, update_ids=True)`:
+  * `update_ids=True` (User-Interaktion): `feature_ids` werden aus den
+    Paaren abgeleitet (Dropdown/Picker konsistent; Abw?hlen des letzten
+    Parameters entfernt den Service aus dem Picker).
+  * `update_ids=False` (programmatischer Sync): `feature_ids` bleiben
+    UNANGETASTET - der ServicePicker ist die Service-Quelle; Services ohne
+    numerische Feld-Keys fallen dadurch nie aus der Auswahl.
+  * Refresh auch bei UNVER?NDERTER Service-Menge, wenn sich die
+    Parameter-Auswahl ge?ndert hat (Bug 1).
+- **Persistenz:** `field_selection` wird in `_current_payload`/Restore-Pfaden
+  via `_normalize_field_pairs` normalisiert (Alt-Payloads ohne Key = leer =
+  kein Paar-Filter, Verhalten wie bisher).
+- **Ge?ndert:** `analytics/engine/analytics_worker.py` /
+  `analytics/engine/analytics_repository.py` /
+  `analytics/engine/feature_store_reader.py` - `field_pairs`-Param
+  durchgereicht bis `fetch_generic_heatmap` + Filter-Anwendung.
+
+### Bug 2 - Aggregations-Wechsel: EXAKTE Vorbelegung statt 'alle Parameter' (FIX)
+- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`:
+  EXPLIZITE `field_selection` gewinnt (sel_map; Rebuild stellt die
+  gew?hlten Paare exakt wieder her). Ohne explizite Auswahl greift die
+  DEFAULT-Vorbelegung: je AKTIVEM Service genau der ERSTE Parameter
+  (sortierte Key-Reihenfolge), bei leerem Filter (alle Features) nur der
+  erste Eintrag insgesamt (Verhalten wie bisher). Der fr?here 21.03.15-Fix
+  (`_chk` im no_filter-Modus) wurde durch die generalisierte Logik ersetzt.
+- Explizit-Pfad-Guard: Paare INAKTIVER Services (nicht in feature_ids)
+  werden nicht angehakt und beim Sync beschnitten.
+
+### Bug 5 - Viridis-Legende: Operator-Labels + adaptive Genauigkeit (FIX)
+- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - neuer Helper
+  `_format_legend_value(val, span)`: Nachkommastellen-Zahl wird aus der
+  Spanne abgeleitet (25-%-Schritte `span/4` GARANTIERT unterscheidbar;
+  kleine Spannen vmin=0.01/vmax=0.02 -> 0.0125/0.015/0.0175/0.02 statt
+  kollabierter '0.01 - 0.01'). `_update_legend` (Viridis-Zweig) nutzt
+  eindeutige Operator-Labels: `< v25`, `v25 ? x < v50`, `v50 ? x < v75`,
+  `v75 ? x ? vmax`, `? vmax` (statt Bindestrich-Intervallen).
+
+### Verifikation (headless, Grundsatz 2 - keine UI-/Regressionstests)
+- `py_compile` aller 5 ge?nderten Dateien EXIT 0 (analytics_view_model.py,
+  analytics_worker.py, analytics_repository.py, feature_store_reader.py,
+  heatmap_widget.py).
+- **Neu:** `test/check_field_selection.py` (permanent, 19/19 PASS):
+  Default-Vorbelegung (leerer Filter / erster Parameter je aktivem
+  Service), EXPLIZITE Restaurierung nach Aggregations-Wechsel, ALL-
+  Expansion in `_checked_field_pairs`, `set_field_selection`-Pfade
+  (update_ids=True/False), Sync-Guards (inaktive Paare, Services ohne
+  Keys bleiben in feature_ids), `_format_legend_value`.
+- **Neu:** `test/check_field_pairs_db.py` (permanent, 5/5 PASS, temp.
+  duckdb in test/ und danach gel?scht): Paar-Filter greift in echter
+  DuckDB-Query (COUNT/AVG, feature_ids orthogonal, unsichere Keys
+  defensiv).
+- Bestehende Tests unver?ndert gr?n (Spot-Check): `test/check_heatmap_field_checks.py`
+  (4/4, Service-Pfad bleibt ?ber den Fallback `hasattr(set_field_selection)`
+  kompatibel), `test/check_custom_range_sortmode.py` (47/47).
+
+- **Commit:** `33c33ce`
