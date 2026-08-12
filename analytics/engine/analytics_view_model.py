@@ -176,6 +176,12 @@ class AnalyticsViewModel(QObject):
             # Timeframes in EINER Query (data_tf='multi'), False = fixierter
             # TF. Separates Flag von heatmap_all_timeframes (21.01-Preset).
             "all_timeframes": False,
+            # 21.03.14 (Wunsch 2): Tabellen-Sortierung des MtfFilterBarWidget
+            # ('date' | 'signal' | 'tf'). Reiner UI-Zustand (kein SQL-Filter);
+            # wird im Profil-Payload (Sektion sources) persistiert und beim
+            # Profil-/Workspace-Restore ueber die Filterleiste restauriert
+            # (nach dem Rueckbau der View-Template-Buttons).
+            "sort_mode": "date",
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -333,6 +339,23 @@ class AnalyticsViewModel(QObject):
         """
         agg_tf = str(agg_tf or "").strip().lower() or "auto"
         self._set_param("agg_tf", agg_tf, (QUERY_HEATMAP_GENERIC,))
+
+    def set_sort_mode(self, mode: str) -> None:
+        """21.03.14 (Wunsch 2): Speichert die Tabellen-Sortierung.
+
+        `sort_mode` ist 'date' | 'signal' | 'tf' und wird fuer die
+        Profil-Persistenz gemerkt (Sektion sources). Reiner UI-Zustand
+        (die TablePage wendet die Sortierung ueber den EventBus an) -
+        KEIN Query-Refresh, nur Dirty-Markierung (Option B - Explicit
+        Save). Idempotent ohne Aenderung.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = "date"
+        if mode == self._params.get("sort_mode"):
+            return
+        self._params["sort_mode"] = mode
+        self._mark_dirty()
 
     def set_range(self, from_ts, to_ts, preset: Optional[str] = None) -> None:
         """Setzt den Zeitraum-Filter (optional, bar_time BETWEEN).
@@ -1194,12 +1217,15 @@ class AnalyticsViewModel(QObject):
                 # (data_tf/agg_tf/range) im Profil persistieren - die
                 # Analysequelle, die Aggregations-TF und der Zeitraum des
                 # MtfFilterBarWidget werden beim Profilwechsel restauriert.
+                # 21.03.14 (Wunsch 2): `sort_mode` kommt additiv hinzu
+                # (nach dem Rueckbau der View-Template-Buttons).
                 "data_tf": p.get("data_tf"),
                 "agg_tf": p.get("agg_tf"),
                 "range_preset": p.get("range_preset"),
                 "range_from": p.get("range_from"),
                 "range_to": p.get("range_to"),
                 "all_timeframes": p.get("all_timeframes"),
+                "sort_mode": p.get("sort_mode"),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),

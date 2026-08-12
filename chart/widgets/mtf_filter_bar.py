@@ -2,9 +2,12 @@
 """
 MTF-FC v4 (Kapitel 21.03.07) – MtfFilterBarWidget & Control-Panel.
 
-Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Range-Picker,
-View-Templates (über SchemaMigrator), Tabellen-Sortierung und
-Session-Filter (§4 Säule 1).
+Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Aggregations-TF,
+Range-Picker (Presets + benutzerdefinierter Zeitraum mit Von-/Bis-
+Date/Time-Pickern, 21.03.14), Tabellen-Sortierung und Session-Filter
+(§4 Säule 1). 21.03.14 (Wunsch 2): Die zusaetzlichen View-Template-
+Buttons wurden rueckgebaut – die Filter-Konfiguration laeuft ueber das
+vorhandene Profil-Management (`sort_mode` wird ebenfalls persistiert).
 
 MVVM (Grundsatz 4): KEINE SQL-Queries, KEINE DB-Connects in der UI.
 Der Zustand wird ausschliesslich über den `MtfFcProvider` im isolierten
@@ -19,26 +22,18 @@ liegt in den Engine-Modulen (21.03.02-21.03.05).
 
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QDateTime, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDateTimeEdit,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from analytics.engine.mtf_fc_confluence import WEIGHTS
 from analytics.engine.mtf_fc_provider import MtfFcProvider
-from analytics.engine.mtf_fc_templates import (
-    MtfFcTemplateStore,
-    TemplateError,
-    create_template,
-    migrate_template,
-)
 
 #: Data-TF-Auswahl (Multi + fixierte Timeframes). 21.03.11 (Bug 6):
 #: Labels kompakt, damit die Leiste in 1200-px-Fenster passt (sizeHint war
@@ -100,7 +95,6 @@ class MtfFilterBarWidget(QWidget):
       * `range_changed(str, int, int)` – Preset-Name, from_ts, to_ts.
       * `sort_mode_changed(str)`   – 'date' | 'signal' | 'tf'.
       * `sessions_changed(list)`   – aktive Sessions (z. B. ['london']).
-      * `template_applied(dict)`   – geladenes View-Template.
       * `guard_override_requested(str, str)` – target_tf, reason (21.03.05).
     """
 
@@ -110,13 +104,11 @@ class MtfFilterBarWidget(QWidget):
     range_changed = Signal(str, int, int)
     sort_mode_changed = Signal(str)
     sessions_changed = Signal(list)
-    template_applied = Signal(dict)
     guard_override_requested = Signal(str, str)
 
     def __init__(
         self,
         provider: Optional[MtfFcProvider] = None,
-        template_store: Optional[MtfFcTemplateStore] = None,
         parent: Optional[QWidget] = None,
         # 21.03.12 (Analytics-Integration): Die TF-Listen sind konfigurierbar
         # (Analytics hat 11 TFs M1..MN1 statt der 6 Chart-Defaults) und der
@@ -129,13 +121,19 @@ class MtfFilterBarWidget(QWidget):
         super().__init__(parent)
         # Provider ist die EINZIGE Brücke zum shared_state-Namespace (MVVM).
         self._provider = provider or MtfFcProvider()
-        self._store = template_store or MtfFcTemplateStore()
         self._sessions: List[str] = []
         self._data_tf_options = (
             list(data_tf_options) if data_tf_options else list(DATA_TF_OPTIONS))
         self._agg_tf_options = (
             list(agg_tf_options) if agg_tf_options else list(AGG_TF_OPTIONS))
         self._now_provider = now_provider or _now_epoch
+        # 21.03.14 (Wunsch 1): Zuletzt emittierter Range (Preset oder
+        # benutzerdefiniert) fuer die Vorbelegung der Von-/Bis-Picker sowie
+        # der zuletzt benutzte benutzerdefinierte Zeitraum (ueberlebt das
+        # Umschalten zwischen Preset und "Benutzerdefiniert").
+        self._last_range: Optional[tuple] = None
+        self._custom_from: Optional[int] = None
+        self._custom_to: Optional[int] = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -213,7 +211,11 @@ class MtfFilterBarWidget(QWidget):
         row1.addStretch(1)
         outer.addLayout(row1)
 
-        # --- Zeile 2: Session-Filter + View-Templates -------------------
+        # --- Zeile 2: Session-Filter + benutzerdefinierter Range ---------
+        # 21.03.14 (Wunsch 1): Die View-Template-Steuerelemente wurden
+        # rueckgebaut (Wunsch 2, Profil-Management traegt die Filter-Config);
+        # stattdessen liegt hier der benutzerdefinierte Von-/Bis-Zeitraum
+        # (nur sichtbar, wenn der Range-Combo auf "Benutzerdefiniert" steht).
         row2 = QHBoxLayout()
         row2.setSpacing(4)
 
@@ -226,30 +228,30 @@ class MtfFilterBarWidget(QWidget):
             row2.addWidget(cb)
 
         row2.addSpacing(6)
-        self._template_name = QLineEdit()
-        self._template_name.setPlaceholderText("Preset")
-        self._template_name.setMaximumWidth(90)
-        self._template_name.setToolTip("Name des View-Templates")
-        row2.addWidget(self._template_name)
-
-        self._btn_save_template = QPushButton("💾")
-        self._btn_save_template.setToolTip(
-            "Aktuelle Filter-Konfiguration als View-Template speichern")
-        self._btn_save_template.setMaximumWidth(34)
-        self._btn_save_template.clicked.connect(self._save_template)
-        row2.addWidget(self._btn_save_template)
-
-        self._btn_load_template = QPushButton("📂")
-        self._btn_load_template.setToolTip("Gespeichertes View-Template laden")
-        self._btn_load_template.setMaximumWidth(34)
-        self._btn_load_template.clicked.connect(self._load_template)
-        row2.addWidget(self._btn_load_template)
-
-        self._template_combo = QComboBox()
-        self._template_combo.setToolTip("Verfügbare View-Templates")
-        self._template_combo.setMaximumWidth(110)
-        self._template_combo.currentIndexChanged.connect(self._on_template_selected)
-        row2.addWidget(self._template_combo)
+        self._custom_panel = QWidget()
+        custom_lay = QHBoxLayout(self._custom_panel)
+        custom_lay.setContentsMargins(0, 0, 0, 0)
+        custom_lay.setSpacing(2)
+        custom_lay.addWidget(QLabel("Von:"))
+        self._dt_from = QDateTimeEdit()
+        self._dt_from.setCalendarPopup(True)
+        self._dt_from.setDisplayFormat("dd.MM.yyyy HH:mm")
+        self._dt_from.setMaximumWidth(150)
+        self._dt_from.setToolTip(
+            "Startzeitpunkt (Berlin-Wanduhr) des benutzerdefinierten Zeitraums")
+        custom_lay.addWidget(self._dt_from)
+        custom_lay.addWidget(QLabel("Bis:"))
+        self._dt_to = QDateTimeEdit()
+        self._dt_to.setCalendarPopup(True)
+        self._dt_to.setDisplayFormat("dd.MM.yyyy HH:mm")
+        self._dt_to.setMaximumWidth(150)
+        self._dt_to.setToolTip(
+            "Endzeitpunkt (Berlin-Wanduhr) des benutzerdefinierten Zeitraums")
+        custom_lay.addWidget(self._dt_to)
+        self._dt_from.dateTimeChanged.connect(self._on_custom_range_changed)
+        self._dt_to.dateTimeChanged.connect(self._on_custom_range_changed)
+        self._custom_panel.setVisible(False)
+        row2.addWidget(self._custom_panel)
 
         row2.addStretch(1)
         outer.addLayout(row2)
@@ -307,15 +309,22 @@ class MtfFilterBarWidget(QWidget):
 
     # 21.03.12 (Analytics-Integration): Externe Filterwerte anwenden (z. B.
     # Profil-/Workspace-Restore des AnalyticsWindow). Setzt die Combos mit
-    # blockSignals und emittiert die Signale danach EXPLIZIT (Muster
-    # _apply_template). None = Eintrag unveraendert lassen.
+    # blockSignals und emittiert die Signale danach EXPLIZIT. None = Eintrag
+    # unveraendert lassen.
+    # 21.03.14 (Wunsch 1/2): `range_from`/`range_to` stellen einen gespeicherten
+    # benutzerdefinierten Zeitraum in den Von-/Bis-Pickern wieder her;
+    # `sort_mode` stellt die Tabellen-Sortierung nach Profil-/Workspace-Restore
+    # wieder her (die View-Template-Buttons wurden rueckgebaut).
     def apply_external_state(
         self,
         data_tf: Optional[str] = None,
         agg_tf: Optional[str] = None,
         range_preset: Optional[str] = None,
+        range_from: Optional[int] = None,
+        range_to: Optional[int] = None,
+        sort_mode: Optional[str] = None,
     ) -> None:
-        """Wendet externe Filterwerte auf die Combos an (in-memory)."""
+        """Wendet externe Filterwerte auf die Combos/Picker an (in-memory)."""
         if data_tf is not None:
             self._data_tf_combo.blockSignals(True)
             self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
@@ -329,11 +338,23 @@ class MtfFilterBarWidget(QWidget):
                 self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
             self._agg_tf_combo.blockSignals(False)
             self.agg_tf_changed.emit(self.current_agg_tf())
+        if sort_mode is not None:
+            self._sort_combo.blockSignals(True)
+            self._sort_combo.setCurrentText(
+                {"date": SORT_MODES[0], "signal": SORT_MODES[1],
+                 "tf": SORT_MODES[2]}.get(str(sort_mode), SORT_MODES[0]))
+            self._sort_combo.blockSignals(False)
+            self.sort_mode_changed.emit(self.current_sort_mode())
         if range_preset is not None:
             self._range_combo.blockSignals(True)
             self._range_combo.setCurrentText(str(range_preset))
             self._range_combo.blockSignals(False)
-            if range_preset and range_preset != "Benutzerdefiniert":
+            if str(range_preset) == "Benutzerdefiniert":
+                # Restore eines benutzerdefinierten Zeitraums (21.03.14):
+                # Picker mit den gespeicherten Wanduhr-Epochs vorbelegen und
+                # den Range explizit emittieren (VM dedupliziert gleiche Werte).
+                self._apply_custom_range_state(range_from, range_to)
+            elif range_preset:
                 self._on_range_changed(str(range_preset))
 
     def set_chart_mode(self, mode: str) -> None:
@@ -352,13 +373,6 @@ class MtfFilterBarWidget(QWidget):
     def active_sessions(self) -> List[str]:
         """Aktive Session-Filter (klein geschrieben)."""
         return [s for s, cb in self._session_checks.items() if cb.isChecked()]
-
-    def refresh_templates(self) -> None:
-        """Aktualisiert die Template-Dropdown-Liste aus dem Store."""
-        self._template_combo.blockSignals(True)
-        self._template_combo.clear()
-        self._template_combo.addItems(self._store.names())
-        self._template_combo.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Slots
@@ -395,8 +409,23 @@ class MtfFilterBarWidget(QWidget):
         self.agg_tf_changed.emit(self.current_agg_tf())
 
     def _on_range_changed(self, preset: str) -> None:
+        """Range-Combo-Wechsel: Preset-Zeitraum oder benutzerdefinierter Range.
+
+        21.03.14 (Wunsch 1): Bei "Benutzerdefiniert" werden die Von-/Bis-
+        Picker eingeblendet und mit dem zuletzt genutzten Zeitraum vorbelegt
+        (Basis = letzter emittierter Range bzw. `now_provider` = letzter
+        Datenpunkt statt time.time()). Die Validierung from_ts <= to_ts
+        uebernimmt `_emit_custom_range` (Swap).
+        """
         if preset == "Benutzerdefiniert":
+            self._show_custom_pickers()
+            if self._custom_from is None or self._custom_to is None:
+                f, t = self._default_custom_range()
+                self._custom_from, self._custom_to = f, t
+            self._set_custom_pickers(self._custom_from, self._custom_to)
+            self._emit_custom_range()
             return
+        self._hide_custom_pickers()
         # 21.03.12 (Analytics): Referenzpunkt injizierbar – im Analytics der
         # letzte Datenpunkt (MAX(bar_time)) statt time.time(), damit Presets
         # relativ zum letzten Signal und nicht zur Wanduhr rechnen. Defensiv:
@@ -407,7 +436,110 @@ class MtfFilterBarWidget(QWidget):
             now = int(_now_epoch())
         seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
                    "YTD": _ytd_epoch_offset(now)}.get(preset, 86400)
-        self.range_changed.emit(preset, now - seconds, now)
+        f, t = now - seconds, now
+        self._last_range = (f, t)
+        self.range_changed.emit(preset, f, t)
+
+    # ------------------------------------------------------------------
+    # 21.03.14 (Wunsch 1): Benutzerdefinierter Range (Von-/Bis-Picker)
+    # ------------------------------------------------------------------
+    def _apply_custom_range_state(
+        self, from_ts: Optional[int], to_ts: Optional[int]
+    ) -> None:
+        """Setzt die Von-/Bis-Picker aus einem gespeicherten Custom-Range.
+
+        Wird vom Profil-/Workspace-Restore (`apply_external_state`) gerufen:
+        fehlende Werte werden aus dem letzten Range bzw. `now_provider`
+        abgeleitet (Vorbelegung statt leerer Picker).
+        """
+        self._custom_from = int(from_ts) if from_ts is not None else None
+        self._custom_to = int(to_ts) if to_ts is not None else None
+        if self._custom_from is None or self._custom_to is None:
+            f, t = self._default_custom_range()
+            self._custom_from, self._custom_to = f, t
+        self._set_custom_pickers(self._custom_from, self._custom_to)
+        self._show_custom_pickers()
+        self._emit_custom_range()
+
+    def _default_custom_range(self) -> tuple:
+        """Default-Zeitraum fuer die Vorbelegung (letzter Range/Preset)."""
+        if self._last_range is not None:
+            return self._last_range
+        try:
+            now = int(self._now_provider())
+        except (TypeError, ValueError):
+            now = int(_now_epoch())
+        return now - 7 * 86400, now
+
+    def _set_custom_pickers(self, from_ts: int, to_ts: int) -> None:
+        """Setzt beide Picker ohne Signal-Loop (blockSignals)."""
+        self._dt_from.blockSignals(True)
+        self._dt_to.blockSignals(True)
+        self._dt_from.setDateTime(self._epoch_to_qdt(from_ts))
+        self._dt_to.setDateTime(self._epoch_to_qdt(to_ts))
+        self._dt_from.blockSignals(False)
+        self._dt_to.blockSignals(False)
+
+    def _show_custom_pickers(self) -> None:
+        self._custom_panel.setVisible(True)
+
+    def _hide_custom_pickers(self) -> None:
+        self._custom_panel.setVisible(False)
+
+    def _on_custom_range_changed(self, _dt) -> None:
+        """Picker-Aenderung: neuen benutzerdefinierten Zeitraum emittieren.
+
+        Kein Programmatic-Setup-Loop noetig: Alle Vorbelegungen/Restores
+        laufen ueber `_set_custom_pickers`/`_emit_custom_range` mit
+        blockSignals - ein `isVisible()`-Guard ist dadurch ueberfluessig
+        und wuerde User-Edits verpassen, solange der Widget-Baum (noch)
+        nicht sichtbar ist (z. B. Restore vor dem Fenster-Shown).
+        """
+        self._emit_custom_range()
+
+    def _emit_custom_range(self) -> None:
+        """Emittiert den benutzerdefinierten Zeitraum (from <= to, Swap)."""
+        f = self._qdt_to_epoch(self._dt_from.dateTime())
+        t = self._qdt_to_epoch(self._dt_to.dateTime())
+        if f > t:
+            # Validierung from <= to (21.03.14): Werte vertauschen und die
+            # Picker konsistent nachziehen (blockSignals gegen Signal-Loop).
+            f, t = t, f
+            self._dt_from.blockSignals(True)
+            self._dt_to.blockSignals(True)
+            self._dt_from.setDateTime(self._epoch_to_qdt(f))
+            self._dt_to.setDateTime(self._epoch_to_qdt(t))
+            self._dt_from.blockSignals(False)
+            self._dt_to.blockSignals(False)
+        self._custom_from, self._custom_to = f, t
+        self._last_range = (f, t)
+        self.range_changed.emit("Benutzerdefiniert", f, t)
+
+    @staticmethod
+    def _epoch_to_qdt(epoch: int) -> QDateTime:
+        """Wandelt eine Wanduhr-Epoch in QDateTime (Felder = Berlin-Wanduhr).
+
+        Invariante 7: MT5-Epochs sind Berlin-Wanduhr-encoded – die UTC-
+        Darstellung der Epoch IST die Wanduhr-Zeit. Die Feldwerte des
+        QDateTime werden aus dieser UTC-Darstellung uebernommen, damit der
+        Picker die Wanduhr-Zeit anzeigt (kein stiller OS-TZ-Offset).
+        """
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+        return QDateTime(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                         dt.second)
+
+    @staticmethod
+    def _qdt_to_epoch(qdt: QDateTime) -> int:
+        """Wandelt QDateTime (Wanduhr-Felder) in eine Wanduhr-Epoch.
+
+        Die im Picker angezeigten Feldwerte sind die Berlin-Wanduhr-Zeit;
+        sie werden als UTC-encoded Epoch interpretiert (Invariante 7) –
+        unabhaengig von der System-Zeitzone.
+        """
+        from datetime import timezone
+        dt = qdt.toPython()  # naive datetime, Felder = Wanduhr
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
     def _on_sort_changed(self, _text: str) -> None:
         self.sort_mode_changed.emit(self.current_sort_mode())
@@ -415,94 +547,6 @@ class MtfFilterBarWidget(QWidget):
     def _on_sessions_changed(self, _state: int) -> None:
         self._sessions = self.active_sessions()
         self.sessions_changed.emit(list(self._sessions))
-
-    def _save_template(self) -> None:
-        name = self._template_name.text().strip() or "Unbenannt"
-        template = create_template(
-            name=name,
-            data_tf=self.current_data_tf(),
-            chart_tf=self.current_chart_tf(),
-            agg_tf=self.current_agg_tf(),
-            range_preset=self._range_combo.currentText(),
-            sort_mode=self.current_sort_mode(),
-            session_filters=list(self._sessions),
-        )
-        self._store.save(template)
-        self.refresh_templates()
-        self._template_combo.setCurrentText(name)
-
-    def _load_template(self) -> None:
-        name = self._template_combo.currentText()
-        if not name:
-            return
-        template = self._store.load(name)
-        if template is None:
-            return
-        self._apply_template(template)
-        self.template_applied.emit(template)
-
-    def _on_template_selected(self, index: int) -> None:
-        if index < 0:
-            return
-        self._load_template()
-
-    def _apply_template(self, template: Dict[str, Any]) -> None:
-        """Wendet ein geladenes Template auf die Widgets an (in-memory).
-
-        21.03.11 (Bug 6): Nach der Widget-Anwendung werden die Signale
-        EXPLIZIT emittiert, damit der Orchestrator (chart_win) die Werte
-        übernimmt (blockSignals unterbindet sonst die Signal-Verdrahtung).
-        """
-        data_tf = str(template.get("data_tf") or "multi")
-        self._data_tf_combo.blockSignals(True)
-        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
-        self._data_tf_combo.blockSignals(False)
-
-        # 21.03.12 (Entscheidung 6a): Chart-Modus + Aggregations-TF aus dem
-        # Template anwenden (inkl. Enable/Disable der Agg-Combo).
-        chart_tf = str(template.get("chart_tf") or "auto")
-        self._chart_tf_combo.blockSignals(True)
-        self._chart_tf_combo.setCurrentText(
-            CHART_TF_OPTIONS[1] if chart_tf == "fix" else CHART_TF_OPTIONS[0])
-        self._chart_tf_combo.blockSignals(False)
-
-        agg_tf = str(template.get("agg_tf") or "auto")
-        self._agg_tf_combo.blockSignals(True)
-        if agg_tf == "auto":
-            self._agg_tf_combo.setCurrentText("⚡ Auto")
-            self._agg_tf_combo.setEnabled(False)
-        else:
-            self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
-            self._agg_tf_combo.setEnabled(True)
-        self._agg_tf_combo.blockSignals(False)
-
-        range_preset = str(template.get("range_preset") or "7d")
-        self._range_combo.blockSignals(True)
-        self._range_combo.setCurrentText(range_preset)
-        self._range_combo.blockSignals(False)
-
-        sort_mode = str(template.get("sort_mode") or "date")
-        self._sort_combo.blockSignals(True)
-        self._sort_combo.setCurrentText(
-            {"date": SORT_MODES[0], "signal": SORT_MODES[1],
-             "tf": SORT_MODES[2]}.get(sort_mode, SORT_MODES[0]))
-        self._sort_combo.blockSignals(False)
-
-        sessions = template.get("session_filters") or []
-        for key, cb in self._session_checks.items():
-            cb.blockSignals(True)
-            cb.setChecked(key in sessions)
-            cb.blockSignals(False)
-        self._sessions = [s for s in sessions if s in self._session_checks]
-
-        # Explizite Signal-Emission nach der Anwendung (Bug 6).
-        self.data_tf_changed.emit(self.current_data_tf())
-        self.chart_tf_changed.emit(self.current_chart_tf())
-        self.agg_tf_changed.emit(self.current_agg_tf())
-        self.sort_mode_changed.emit(self.current_sort_mode())
-        self.sessions_changed.emit(list(self._sessions))
-        if range_preset and range_preset != "Benutzerdefiniert":
-            self._on_range_changed(range_preset)
 
     # ------------------------------------------------------------------
     # Guard-Override (Ebene 2, 21.03.05) – Klick auf Reset-Badge

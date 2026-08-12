@@ -678,8 +678,10 @@ class AnalyticsWindow(PersistentWindow):
         self.mtf_bar.data_tf_changed.connect(self._on_mtf_data_tf_changed)
         self.mtf_bar.agg_tf_changed.connect(self._vm.set_agg_tf)
         self.mtf_bar.range_changed.connect(self._on_mtf_range_changed)
-        # Sortierung der MTF-FC-Filterleiste ueber den bestehenden EventBus
-        # an die TablePage (set_external_sort_mode, IoC).
+        # 21.03.14 (Wunsch 2): Sortier-Aenderung an den ViewModel
+        # (Profil-Persistenz, Sektion sources) UND ueber den bestehenden
+        # EventBus an die TablePage (set_external_sort_mode, IoC).
+        self.mtf_bar.sort_mode_changed.connect(self._vm.set_sort_mode)
         self.mtf_bar.sort_mode_changed.connect(
             event_bus.mtf_fc_sort_changed.emit)
         # Filterleisten-Zustand aus den VM-Params initial synchronisieren
@@ -748,10 +750,16 @@ class AnalyticsWindow(PersistentWindow):
             return
         p = self._vm.params
         try:
+            # 21.03.14 (Wunsch 1/2): range_from/range_to stellen einen
+            # gespeicherten benutzerdefinierten Zeitraum wieder her;
+            # sort_mode stellt die Tabellen-Sortierung wieder her.
             bar.apply_external_state(
                 data_tf=str(p.get("data_tf") or "multi"),
                 agg_tf=str(p.get("agg_tf") or "auto"),
                 range_preset=p.get("range_preset"),
+                range_from=p.get("range_from"),
+                range_to=p.get("range_to"),
+                sort_mode=p.get("sort_mode"),
             )
         except (RuntimeError, AttributeError):
             pass

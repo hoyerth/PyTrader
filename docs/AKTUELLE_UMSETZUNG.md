@@ -1035,3 +1035,86 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 - **Status:** Analyse + Entscheidungs-Doku abgeschlossen. KEIN Coding (wird nicht
   angefasst). Umsetzung der Schritte (1) und (2) erst nach explizitem Startschuss.
 - **Commit:** `b00fd60`
+
+---
+
+# 21.03.14 - Umsetzung: Benutzerdefinierter Range + Preset-Rueckbau + sort_mode-Profilsierung (12.08.2026, nach Anwender-Startschuss)
+
+> Nach dem Startschuss des Anwenders ("umsetzung 1. und 2.") wurden die
+> Entscheidungen aus dem 21.03.14-Entscheidungs-Kapitel umgesetzt. Wunsch 3
+> (durchgehende Kerzen-/Signalchart) bleibt - wie entschieden - unumgesetzt
+> und undokumentiert.
+
+## Umsetzung Wunsch 1 - Benutzerdefinierter Range mit Von-/Bis-Date/Time-Pickern (FERTIG)
+
+- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - In Zeile 2 (Session-Filter-Zeile)
+  ersetzt ein `_custom_panel` (QWidget) die rueckgebauten View-Template-Controls:
+  * Zwei `QDateTimeEdit`-Picker "Von:" / "Bis:" mit `setCalendarPopup(True)` und
+    Anzeigeformat `dd.MM.yyyy HH:mm` (max. 150 px breit, platzsparend, sizeHint
+    der Leiste bleibt klein).
+  * Panel nur sichtbar, wenn der Range-Combo auf "Benutzerdefiniert" steht
+    (`_show_custom_pickers`/`_hide_custom_pickers`).
+  * **Wanduhr-Konvention (Invariante 7):** `_epoch_to_qdt`/`_qdt_to_epoch` bilden
+    die (bereits Berlin-Wanduhr-encoded) Epochs direkt auf die QDateTime-FELDER ab
+    (UTC-Darstellung der Epoch = Wanduhr, kein stiller OS-TZ-Offset).
+  * **Vorbelegung:** Beim Wechsel auf "Benutzerdefiniert" werden die Picker mit dem
+    letzten emittierten Zeitraum vorbelegt (`_last_range`); Basis = `now_provider`
+    (letzter Datenpunkt `MAX(bar_time)` statt `time.time()`), Fallback 7 Tage.
+  * **Validierung:** `_emit_custom_range` stellt `from_ts <= to_ts` sicher (Swap der
+    Werte + Picker-Nachziehen, blockSignals gegen Signal-Loop).
+  * `apply_external_state` um `range_from`/`range_to` erweitert: Restore eines
+    gespeicherten benutzerdefinierten Zeitraums (Profil-/Workspace-Restore).
+  * `_on_custom_range_changed` ohne `isVisible()`-Guard: Alle programmatischen
+    Picker-Sets laufen ueber `_set_custom_pickers` (blockSignals) - der Guard war
+    redundant und verpasste User-Edits, solange der Widget-Baum noch nicht sichtbar
+    war (Restore vor Fenster-Shown).
+
+## Umsetzung Wunsch 2 - Preset-Buttons rueckgebaut + `sort_mode` im Profil (FERTIG)
+
+- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - View-Template-Steuerelemente
+  entfernt (Namens-`QLineEdit`, 💾/📂-Buttons, Template-`QComboBox`, Signal
+  `template_applied`, Methoden `refresh_templates`/`_save_template`/`_load_template`/
+  `_on_template_selected`/`_apply_template`); `template_store`-Parameter aus
+  `__init__` entfernt; ungenutzter `QPushButton`-Import entfernt.
+  `analytics/engine/mtf_fc_templates.py` bleibt gemaess Code-Preserving-Regel
+  erhalten, wird aber nicht mehr aufgerufen (toter Code).
+- **Geaendert:** `analytics/engine/analytics_view_model.py` - Default-Param
+  `"sort_mode": "date"`; neue Methode `set_sort_mode(mode)` ('date'|'signal'|'tf',
+  validiert, nur Dirty-Markierung - reiner UI-Zustand ohne Query-Refresh);
+  `_current_payload` persistiert `sort_mode` additiv in der Sektion `sources`.
+- **Geaendert:** `analytics/ui/analytics_win.py` - `_wire_controls` verbindet
+  `mtf_bar.sort_mode_changed` zusaetzlich mit `_vm.set_sort_mode` (Profil-Persistenz;
+  die EventBus-Kette zur TablePage bleibt); `_sync_mtf_bar_from_params` reicht
+  `range_from`/`range_to`/`sort_mode` an `apply_external_state` weiter.
+- **Sessions:** bleiben erhalten (unverdrahtet angezeigt), wie entschieden.
+
+## Verifikation (headless, Grundsatz 2 - keine UI-/Regressionstests)
+
+- `py_compile` aller 3 geaenderten Dateien EXIT 0.
+- **Neu:** `test/check_custom_range_sortmode.py` (permanent, 42/42 PASS):
+  * Teil A: Wanduhr-Konvertierung - QDateTime-Felder = UTC-Darstellung der Epoch,
+    12:00-Epoch zeigt Stunde 12 (kein +2h-Shift), Round-Trip exakt.
+  * Teil B: Custom-Panel - Combo-Wechsel blendet Picker ein, Vorbelegung aus
+    letztem Range, Picker-Aenderung emittiert neu, Swap-Validierung (from<=to,
+    Picker nachgezogen), Preset-Wechsel versteckt Panel, Custom-Werte ueberleben
+    den Wechsel.
+  * Teil C: Restore via `apply_external_state(range_preset="Benutzerdefiniert",
+    range_from, range_to)` - Picker + Signal + Combo korrekt; None-Fallback ohne
+    Crash (Default now-7d..now).
+  * Teil D: `set_sort_mode` - Persistenz, Case-Normalisierung, Ungueltig->'date',
+    Payload sources.sort_mode, `_restore_params_from_payload`.
+  * Teil E: `apply_external_state(sort_mode=...)` setzt Combo + emittiert Signal.
+  * Teil F: Integrationspfad Filterleiste -> VM - Custom-Range und sort_mode via
+    Signale im VM, Payload-Roundtrip, Restore in ein neues Widget.
+  * Teil G: AnalyticsWindow-Quelltext-Inspektion - sort_mode-Verdrahtung,
+    EventBus-Kette, `_sync_mtf_bar_from_params` reicht range_from/to/sort_mode,
+    keine View-Template-Reste im Widget.
+- `test/check_analytics_mtffc_win.py` 22/22 PASS, `test/check_analytics_mtffc.py`
+  13/13 PASS, `test/check_mtf_sort_binding.py` 21/21 PASS,
+  `test/check_filterbar_visible.py` (sizeHint/sizeHint-Layout) PASS.
+- `test/test.py`: Baseline-Vergleich per `git stash` - dieselben 26 vorbestehenden
+  FAILs (Fenster-/Reflow-Geometrie, JSON-Feld-Aufloesung, instance_hash-Binder der
+  20.03-Tests, Qt-offscreen-Artefakte) mit und ohne die Aenderung; die 21.03.14-
+  Aenderung fuegt KEINE neuen FAILs hinzu.
+
+- **Commit:** folgt im naechsten Schritt
