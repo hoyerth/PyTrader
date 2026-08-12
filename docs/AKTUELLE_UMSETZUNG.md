@@ -876,22 +876,22 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 - **TF-Liste:** `DATA_TF_OPTIONS` (6 Eintraege: Multi/M1/M5/M15/H1/H4) vs. Analytics-`TIMEFRAMES`
   (11: M1..MN1) - fuer Analytics konfigurierbar erweitern.
 
-## ?? 3. Umsetzungsplan (wartet auf Startschuss)
+## ?? 3. Umsetzungsplan (abgeschlossen)
 
-1. **Chart-Revert (1 Vorgang):**
+1. **[x] Chart-Revert (1 Vorgang):** (umgesetzt, Commit `85a0c7c`)
    ```
    git checkout 4217e71 -- chart/chart_win.py chart/chart_basics.py chart/js/04_live_updates.js
    git rm chart/js/07_mtf_fc.js chart/js/08_mtf_layers.js chart/js/09_mtf_axis.js
    ```
    Nicht anfassen: `mtf_filter_bar.py`, `mtf_fc_*`, `event_bus.py`, `analytics_win.py`,
    `table_page.py`, `heatmap_widget.py`.
-2. **Analytics-Integration:** `MtfFilterBarWidget` in `analytics_win._build_ui()` (Filter-Zeile),
+2. **[x] Analytics-Integration:** (umgesetzt, Commit `eae1d7b`) `MtfFilterBarWidget` in `analytics_win._build_ui()` (Filter-Zeile),
    Signal-Verdrahtung (data_tf/chart_tf/range/template -> VM), `AnalyticsViewModel`-Parameter
    (`data_tf`, `chart_tf`/`agg_tf`, `range_from`, `range_to`), `analytics_repository`-Option
    `from_ts`/`to_ts`, Aggregations-TF-Dropdown fuer `Fix` (6a).
-3. **service_win (eigener Schritt, reduziert):** nur `data_tf` (Multi <-> `ALLE Timeframes`-Sentinel,
+3. **[-] service_win (eigener Schritt, reduziert):** (entfaellt - `service_win.py` enthaelt keine MTF-FC-Integration) nur `data_tf` (Multi <-> `ALLE Timeframes`-Sentinel,
    U15-E) + optional Range; keine Sort/Sessions/Templates.
-4. **Doku:** 21.03-Kapitel in `docs/AKTUELLE_UMSETZUNG.md` auf Analytics-Ziel ausrichten.
+4. **[x] Doku:** (dieses Kapitel) 21.03-Kapitel in `docs/AKTUELLE_UMSETZUNG.md` auf Analytics-Ziel ausrichten.
 
 ## ?? 4. Verifikation (headless, Grundsatz 2)
 
@@ -899,4 +899,78 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   `node --check` fuer die JS-Ruecknahme; Logik-/DB-Tests in `test/test.py`.
 - Keine UI-/Regressionstests (harte Regel).
 
-- **Commit:** `-` (nur Doku; Coding erst nach Startschuss)
+## ?? 5. Umsetzung durchgefuehrt (12.08.2026, abgeschlossen)
+
+> Nach dem Startschuss des Anwenders wurde die Architektur-Korrektur umgesetzt:
+> Kapitel 21.03 ist vollstaendig auf das Analytics-Ziel ausgerichtet (der
+> Chart-Revert lief in 21.03.11-Fix als Commit `85a0c7c`).
+
+1. **Chart-Revert (Commit `85a0c7c`):** `chart/chart_win.py`, `chart/chart_basics.py`
+   und `chart/js/04_live_updates.js` wurden auf `4217e71` zurueckgesetzt; die JS-Layer
+   `07_mtf_fc.js`/`08_mtf_layers.js`/`09_mtf_axis.js` wurden entfernt (`git rm`). Damit
+   sind die fehlenden Imports (NameError beim Chart-Oeffnen) und alle 21.03-Hooks aus
+   dem Chart entfernt.
+2. **Analytics-Integration (Commit `eae1d7b`):** `MtfFilterBarWidget` in
+   `analytics_win._build_ui()` (Filter-Zeile, 11 Analytics-TFs statt 6 Chart-Defaults),
+   Signal-Verdrahtung (data_tf/agg_tf/range/sort -> VM bzw. EventBus),
+   `AnalyticsViewModel`-Parameter (`data_tf`, `agg_tf`, `range_from`, `range_to`,
+   `all_timeframes`), Zeitfilter `from_ts`/`to_ts` in `FeatureStoreReader`/
+   `AnalyticsRepository`/`AnalyticsWorker`, Aggregations-TF-Dropdown mit `bucket_tf`
+   fuer die generische Heatmap (Entscheidung 6a), `now_provider` = `MAX(bar_time)`
+   statt `time.time()`.
+3. **service_win:** entfaellt - das `ServiceWindow` enthaelt keine MTF-FC-Integration
+   (kein `MtfFilterBarWidget`, keine MTF-FC-Signale); es gibt nichts zu reduzieren.
+4. **Doku:** 21.03-Kapitel auf das Analytics-Ziel ausgerichtet (dieses Kapitel).
+
+- **Commit:** `85a0c7c` (Chart-Revert), `eae1d7b` (Analytics-Integration)
+
+---
+
+# Implementierungs-Log 21.03 (MTF-FC v4) - 12.08.2026 (Fortsetzung)
+
+## 21.03.12 - Chart-Revert: MTF-FC aus dem Chart entfernt (12.08.2026)
+
+- **Umgesetzt:** `git checkout 4217e71 -- chart/chart_win.py chart/chart_basics.py chart/js/04_live_updates.js`
+  + `git rm chart/js/07_mtf_fc.js chart/js/08_mtf_layers.js chart/js/09_mtf_axis.js`.
+  Damit sind die fehlenden MTF-FC-Imports (`MtfFcProvider`, `MtfFcBoundary`,
+  `default_mtf_fc_state`, `MtfFilterBarWidget`, `evaluate_cascade`, `apply_transition`)
+  und alle 21.03-JS-Hooks vollstaendig aus dem Chart entfernt (Revert-Ziel `4217e71`,
+  fuer die 3 Ziel-Dateien identisch mit `69ae3a6`).
+- **Verifikation:** Code-Suche in `chart/chart_win.py`/`chart/chart_basics.py`:
+  keine `MtfFilterBarWidget`-/`mtf_fc`-Referenzen und keine Verweise auf die entfernten
+  JS-Dateien mehr; `git status` zeigt die geloeschten JS-Dateien.
+- **Commit:** `85a0c7c`
+
+## 21.03.13 - Analytics-Integration: Filterleiste + Zeitfilter + Aggregations-TF (12.08.2026 20:06)
+
+- **Umgesetzt:** Vollstaendige Umsetzung der Entscheidung 6a im Analytics-Fenster:
+  * `chart/widgets/mtf_filter_bar.py`: eigenes Aggregations-TF-Dropdown (`agg_tf`,
+    unabhaengig von `data_tf`), konfigurierbare TF-Listen (`data_tf_options`/
+    `agg_tf_options`), injizierbarer `now_provider`, `apply_external_state()` und
+    `set_chart_mode()` fuer den Profil-/Workspace-Restore, `_on_range_changed` nutzt
+    den `now_provider` (Fallback `time.time()`).
+  * `analytics/engine/analytics_view_model.py`: MTF-FC-Parameter `data_tf`/`agg_tf`/
+    `range_preset`/`range_from`/`range_to`/`all_timeframes`; `set_data_tf` (multi ->
+    `all_timeframes=True`, fixiert -> `timeframe`-Uebernahme), `set_agg_tf` -> `bucket_tf`
+    in `_current_params`, `set_range`/`clear_range`, `latest_data_epoch` (MAX(bar_time));
+    Persistenz ueber `_current_payload` (Sektion `sources`).
+  * `analytics/engine/feature_store_reader.py`: `from_ts`/`to_ts`-Zeitfilter
+    (`bar_time BETWEEN`, Wanduhr-Epochs) in fetch_rows/fetch_columns/fetch_heatmap/
+    fetch_generic_heatmap; `bucket_tf`-date-Bucketing (FLOOR(EXTRACT(epoch)/secs)*secs)
+    fuer die generische Heatmap; `_axis_coords`-/`_format_dim_value`-tz-Fixes.
+  * `analytics/engine/analytics_repository.py` + `analytics_worker.py`: `from_ts`/
+    `to_ts`/`bucket_tf` an alle Methoden durchgereicht.
+  * `analytics/ui/analytics_win.py`: `mtf_bar` in `_build_ui`, Signal-Verdrahtung
+    (data_tf/agg_tf/range/sort -> VM/EventBus), `_sync_mtf_bar_from_params` nach
+    Profil-/Workspace-Restore, TF-Listen `MTF_DATA_TF_OPTIONS`/`MTF_AGG_TF_OPTIONS`
+    (11 TFs M1..MN1).
+  * `analytics/engine/mtf_fc_templates.py`: `agg_tf` in `_TEMPLATE_KNOWN_KEYS` +
+    `_TEMPLATE_DEFAULTS` ergaenzt (View-Templates in-memory, wie im Chart).
+- **Verifikation:** `py_compile` aller 7 geaenderten Dateien EXIT 0;
+  `test/check_analytics_mtffc.py` (13 Checks: Zeitfilter, Bucketing, VM-Durchreichung)
+  13/13 PASS; `test/check_analytics_mtffc_win.py` (22 Checks: Widget-VM-Integration,
+  apply_external_state, Payload-Persistenz, Restore) 22/22 PASS; `test/test.py`
+  Teil 21.03.12 T1-T10 PASS (26 vorbestehende FAILs in Test-32/36/37/20.03/Geometrie
+  sind Bestandszustand: Test-DB-Fixtures ohne `instance_hash`-Spalte bzw. Qt-offscreen-
+  Geometrie - nicht durch MTF-FC verursacht).
+- **Commit:** `eae1d7b`
