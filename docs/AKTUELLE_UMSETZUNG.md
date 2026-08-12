@@ -222,3 +222,122 @@ DETACH new_db;
 3. `copy_database(src, dst)`-Helper (Kompaktierung): Kopie ist kleiner als die Bloat-Datei und enthält Schema + Daten vollständig (headless-Test wie `test/check_copy_database.py`).
 
 
+
+
+---
+
+# 21.03 - Bugfix-Runde 12.08.2026 (Service-UI & Heatmap)
+
+> Implementierungs-Log (Commit `271a81b`, 12.08.2026): 5 neue User-Meldungen
+> aus dem Bugfixing-Modus (Fortschrittsbalken, Data-Only-Loeschen,
+> Heatmap-Legende, Overlay-Balken) + Crash `srv_trend_hma_pivot`.
+> Verifikation headless (keine UI): `test/check_hma_pivot_bug.py`,
+> `test/check_purge_legacy.py` (5/5), `test/check_heatmap_format.py`,
+> `test/check_overlay_tf_precedence.py` - alle PASS.
+
+## ?? 1. Punkt 0 - `srv_trend_hma_pivot` LiveAnalyzer-Crash (Broadcast-Fehler)
+
+**Meldung:** `ValueError: could not broadcast input array from shape (4,) into shape (0,)`
+bei `SILVER/M1` im LiveAnalyzer (`df_short = df_plugin.tail(2)` -> 1-2 Bars).
+
+**Ursache:** `chart/indicators/utils/ma_template.py`: `_sma_values`, `_wma_values`,
+`_alma_values`, `_vwma_values` nutzen `np.convolve(..., "valid")` + Zuweisung
+`result[period-1:] = conv`. Ist die Serie kuerzer als `period`, liefert convolve
+ein Array der Laenge `period-n+1` (z. B. 4), waehrend `result[period-1:]` leer
+ist -> Broadcast-Fehler.
+
+**Fix:** Guard `if len(values) < period: return np.full(len(values), np.nan)`
+in allen 4 Funktionen (Warmup-Vertrag: kurze Serien = NaN, kein Crash).
+
+**Verifikation:** `py_compile` OK; `test/check_hma_pivot_bug.py` - n=2/3/4/5/10
+OK; alle 12 MA-Typen mit n=2 OK; EHMA n=100 finite ab Index 9.
+
+## ?? 2. Punkt 1 - "Data only loeschen" loeschte ALLE Varianten
+
+**Meldung:** "Data only loeschen" entfernte die Daten ALLER Varianten
+(DB-Befund: `srv_swing_volume_profile` mit 3 Presets; UI-Varianten-Hashes
+69141755/8c21542a/7341c563, Legacy-Pools 4eec2b02/7d636c36/074ec5bb).
+
+**Ursache:** `purge_instance_data` (feature_builder.py) loeschte IMMER auch den
+Params-only-Legacy-Pool (`generate_instance_hash(plugin_id, params)` ohne
+preset_name). Teilen sich Varianten denselben Params-only-Hash (identische
+Params), gehoert der Pool ALLEN - der Purge einer einzelnen Variante entfernte
+damit die Daten der uebrigen.
+
+**Fix (Runde 6):**
+1. `feature_builder.py`: Signatur `purge_instance_data(..., purge_legacy=False)`.
+   Legacy-Purge laeuft NUR noch auf explizite Anforderung.
+2. `service_win.py` + `service_selector_dialog.py`: neuer Helper
+   `_purge_legacy_allowed(plugin_id, params)` - zaehlt aktive Varianten
+   (Presets + Set-Instanzen) mit identischem Params-only-Hash. `owners == 1`
+   => Pool eindeutig => Legacy-Purge erlaubt; `owners > 1` => Pool geteilt
+   => bleibt unangetastet.
+
+**Teil 2 ("M1 wird immer noch angezeigt"):** Die Badge-Bar liest
+`fetch_service_tf_status` (feature_store_reader.py:1327) nach `feature_id`
+(SERVICE-weit, nicht varianten-scoped). Nach Purge einer Variante verbleiben
+die M1-Rows der uebrigen Varianten -> M1-Pill bleibt korrekt sichtbar. Erst
+wenn ALLE Varianten gepurged sind (jede mit eindeutigem Legacy-Pool), loescht
+sich M1. **Verifiziert** (test/_tmp_verify_badge.py, read-only): erwartetes
+Verhalten.
+
+**Verifikation:** `test/check_purge_legacy.py` (5/5): Default-False schuetzt
+geteilte Pools, purge_legacy=True loescht eindeutige Pools, Altsignatur
+kompatibel.
+
+## ?? 3. Punkt 2 - Fortschrittsbalken fehlt
+
+**2a ("nicht bei alle services ausfuehren"):** `ServiceSelectorDialog` (Picker)
+verband KEIN `service_progress`-Signal und hatte keinen QProgressBar.
+
+**Fix:** Progress-Zeile (progress_label + QProgressBar, Muster service_win)
+unter der badge_bar im Panel-Layout; `service_progress`-Verbindung im
+`_start_run_worker`; neue Slots `_on_service_progress` / `_reset_run_progress`;
+Reset bei Start/Ende/Fehler (finished + failed).
+
+**2b ("nicht loeschen"):** Nach 'Data Only Loeschen' / Voll-Loeschung blieb ein
+veralteter Balkenzustand stehen.
+
+**Fix:** `_reset_run_progress()` in service_win nach erfolgreichem Purge
+(`_on_data_only_purge`, `_delete_complete_set_instance`, `_delete_complete_preset`).
+
+## ?? 4. Punkt 3 - Heatmap-Legende auf 2 Nachkommastellen begrenzen
+
+**Fix:** `_format_heatmap_value` (heatmap_widget.py): Bruchwerte mit
+`f"{fval:.2f}"` statt `f"{fval:.6f}"` (gerundet, Nullen gestrippt).
+Ganzzahlen unveraendert (deutsche Tausender-Trennung '4.380').
+
+**Verifikation:** `test/check_heatmap_format.py` - 62.5567 -> '62.56',
+0.005 -> '0.01', 4380 -> '4.380', Nicht-Numerisch unveraendert (ALL PASS).
+
+## ?? 5. Punkt 4 - Anzeigebalken ca. 18 Stunden breit (Swing Momentum AVG)
+
+**Befund (empirisch):** Die "18h-Balken" sind die Candle-Overlay-Koerper im
+D1-Timeframe: `bar_sec * 0.7` = 86400 * 0.7 = 60480s = **16,8h** (~70 % der
+Tages-Spalte). `_bar_interval_seconds` las den TF nur aus
+`params["timeframe"]` - ohne sichtbare Anzeige, welcher TF die Breite
+bestimmt.
+
+**Fix:**
+1. `_bar_interval_seconds(data_tf)` bevorzugt den **Daten-TF des OHLCV-
+   Payloads** (Kerzenbreite folgt der Datenbasis, Race-/Divergenz-sicher).
+2. Neues Label `_label_overlay_tf` in der Steuerzeile zeigt den Overlay-TF
+   live an (z. B. 'Overlay: D1' / 'Overlay: H1') - beantwortet "welcher TF
+   wird angelegt / wo sehen".
+
+**Verifikation:** `test/check_overlay_tf_precedence.py` - data_tf hat Vorrang
+(D1->86400, M1->60), Fallback 3600s, D1-Koerper 16,80h (ALL PASS).
+
+## ?? 6. Geaenderte Dateien (Commit `271a81b`)
+
+| Datei | Aenderung |
+|---|---|
+| `chart/indicators/utils/ma_template.py` | 4x Warmup-Guard (Serie < period -> NaN) |
+| `analytics/features/feature_builder.py` | `purge_instance_data(..., purge_legacy=False)` |
+| `serviceui/service_win.py` | `_purge_legacy_allowed` + purge_legacy + Progress-Reset |
+| `serviceui/service_selector_dialog.py` | `_purge_legacy_allowed` + Progress-Bar + Reset |
+| `analytics/ui/heatmap_widget.py` | `_format_heatmap_value` (2 NK), `_bar_interval_seconds(data_tf)`, Overlay-TF-Label |
+| `test/` | `check_hma_pivot_bug.py`, `check_purge_legacy.py`, `check_heatmap_format.py`, `check_overlay_tf_precedence.py` |
+
+**Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
+`config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
