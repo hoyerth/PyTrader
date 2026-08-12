@@ -1208,4 +1208,4 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 - `test/test.py` referenziert keine entfernten APIs (kein Custom-Panel/
   YTD-Code); die MTF-FC-Kette bleibt unveraendert.
 
-- **Commit:** dd80a79
+- **Commit:** 22e2b66
