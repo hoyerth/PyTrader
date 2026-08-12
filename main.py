@@ -24,6 +24,7 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
+    QLabel,
     QMainWindow,
     QPushButton,
     QTableWidget,
@@ -41,6 +42,7 @@ from analytics.background_workers.live_analyzer import LiveAnalyzer
 # 18.01.02 (E7): db-Basisschicht, Sync-Service, Worker & WindowManager
 from db.db_pool import DbPool
 from db.schema_initializer import check_and_init_databases
+from db.db_utils import execute_db_vacuum, get_db_fragmentation_info
 from data_sync.mt5_sync_service import check_mt5_connection
 from workers.data_sync_worker import DataSyncWorker
 from workers.live_tick_worker import LiveTickWorker
@@ -121,6 +123,17 @@ class MainWindow(QMainWindow):
         check_and_init_databases()
 
         check_mt5_connection()
+
+        # Phase 21.02 (12.08.2026): DB-Bloat-Status beim App-Start anzeigen
+        # (Kap. 21.02 Schritt 2, label_db_status unter dem Optionen-Button).
+        self.label_db_status = self.ui.findChild(QLabel, "label_db_status")
+        if self.label_db_status:
+            _db_info = get_db_fragmentation_info(
+                str(BASE_DIR / "data" / "analytics.duckdb"))
+            self.label_db_status.setText(
+                f"DB Status: {_db_info['pct']}% fragmentiert "
+                f"({_db_info['bloat_mb']} MB frei)"
+            )
 
         # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
         # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
@@ -247,6 +260,9 @@ class MainWindow(QMainWindow):
     def _on_service_run_started(self) -> None:
         """Pausiert den sync_timer, sobald eine Service-Berechnung startet."""
         self._sync_pause_count += 1
+        # 21.02 (12.08.2026): EventBus-Zähler mitpflegen – PropertiesWindow
+        # nutzt ihn als Concurrency-Guard für die DB-Kompaktierung.
+        event_bus.sync_pause_count = self._sync_pause_count
         if self._sync_pause_count == 1 and self.sync_timer.isActive():
             self.sync_timer.stop()
 
@@ -256,6 +272,7 @@ class MainWindow(QMainWindow):
         abgeschlossen ist (Referenzzähler auf 0)."""
         if self._sync_pause_count > 0:
             self._sync_pause_count -= 1
+        event_bus.sync_pause_count = self._sync_pause_count  # 21.02
         if self._sync_pause_count != 0:
             return
         app = QApplication.instance()
@@ -365,6 +382,17 @@ class MainWindow(QMainWindow):
                 win.close()
             except Exception as e:
                 print(f"⚠️ Fehler beim Schliessen von Fenster {win.instance_id}: {e}")
+
+        # Phase 21.02 (12.08.2026): DB-Pflege beim App-Exit (Kap. 21.02
+        # Stufe 1) – CHECKPOINT gefolgt von VACUUM fuer alle DuckDB-Dateien.
+        # Zweck: WAL in Hauptdatei flushen (konsistenter Zustand, kein
+        # WAL-Replay beim nächsten Start). Keine Datei-Verkleinerung –
+        # echte Kompaktierung nur per DB-Service-Button (compact_database).
+        for _db_name in ("analytics", "market_data", "app_data"):
+            try:
+                execute_db_vacuum(str(BASE_DIR / "data" / f"{_db_name}.duckdb"))
+            except Exception as exc:
+                print(f"⚠️ [DB-Pflege] {_db_name}.duckdb: {exc}")
 
         event.accept()
 

@@ -1448,6 +1448,28 @@ class DbPool:
                         0, _db_pool_global.get(abs_path, 0) - 1)
             DbPool._local.conns = {}
 
+    @staticmethod
+    def release(abs_path: str) -> None:
+        """Schliesst die Connection des aktuellen Threads zu EINER DB-Datei.
+
+        Phase 21.02 (12.08.2026): Benoetigt fuer den Datei-Ersatz bei der
+        Kompaktierung (Windows File-Locking). Anders als `close_all()`
+        bleiben Connections zu anderen DB-Dateien (z. B. app_data.duckdb)
+        unangetastet. Die Connection wird beim naechsten `DbPool.get()`
+        lazy wieder geoeffnet (Referenzzaehler wird dekrementiert).
+        """
+        abs_path = os.path.abspath(abs_path)
+        if hasattr(DbPool._local, 'conns'):
+            con = DbPool._local.conns.pop(abs_path, None)
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
+
 
 class _LockedConnection:
     """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).

@@ -115,6 +115,22 @@
      <string>Anwendungs-Einstellungen (Candle-Limits, Seitengrößen, etc.)</string>
     </property>
    </widget>
+   <widget class="QLabel" name="label_db_status">
+    <property name="geometry">
+     <rect>
+      <x>540</x>
+      <y>140</y>
+      <width>141</width>
+      <height>28</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>DB Status: –</string>
+    </property>
+    <property name="toolTip">
+     <string>DB-Fragmentierung (via PRAGMA database_size) beim App-Start</string>
+    </property>
+   </widget>
   </widget>
   <widget class="QMenuBar" name="menubar">
    <property name="geometry">

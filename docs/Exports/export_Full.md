@@ -1037,6 +1037,7 @@ from analytics.background_workers.live_analyzer import LiveAnalyzer
 # 18.01.02 (E7): db-Basisschicht, Sync-Service, Worker & WindowManager
 from db.db_pool import DbPool
 from db.schema_initializer import check_and_init_databases
+from db.db_utils import execute_db_vacuum, get_db_fragmentation_info
 from data_sync.mt5_sync_service import check_mt5_connection
 from workers.data_sync_worker import DataSyncWorker
 from workers.live_tick_worker import LiveTickWorker
@@ -1117,6 +1118,17 @@ class MainWindow(QMainWindow):
         check_and_init_databases()
 
         check_mt5_connection()
+
+        # Phase 21.02 (12.08.2026): DB-Bloat-Status beim App-Start anzeigen
+        # (Kap. 21.02 Schritt 2, label_db_status unter dem Optionen-Button).
+        self.label_db_status = self.ui.findChild(QLabel, "label_db_status")
+        if self.label_db_status:
+            _db_info = get_db_fragmentation_info(
+                str(BASE_DIR / "data" / "analytics.duckdb"))
+            self.label_db_status.setText(
+                f"DB Status: {_db_info['pct']}% fragmentiert "
+                f"({_db_info['bloat_mb']} MB frei)"
+            )
 
         # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
         # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
@@ -1243,6 +1255,9 @@ class MainWindow(QMainWindow):
     def _on_service_run_started(self) -> None:
         """Pausiert den sync_timer, sobald eine Service-Berechnung startet."""
         self._sync_pause_count += 1
+        # 21.02 (12.08.2026): EventBus-Zähler mitpflegen – PropertiesWindow
+        # nutzt ihn als Concurrency-Guard für die DB-Kompaktierung.
+        event_bus.sync_pause_count = self._sync_pause_count
         if self._sync_pause_count == 1 and self.sync_timer.isActive():
             self.sync_timer.stop()
 
@@ -1252,6 +1267,7 @@ class MainWindow(QMainWindow):
         abgeschlossen ist (Referenzzähler auf 0)."""
         if self._sync_pause_count > 0:
             self._sync_pause_count -= 1
+        event_bus.sync_pause_count = self._sync_pause_count  # 21.02
         if self._sync_pause_count != 0:
             return
         app = QApplication.instance()
@@ -1361,6 +1377,17 @@ class MainWindow(QMainWindow):
                 win.close()
             except Exception as e:
                 print(f"⚠️ Fehler beim Schliessen von Fenster {win.instance_id}: {e}")
+
+        # Phase 21.02 (12.08.2026): DB-Pflege beim App-Exit (Kap. 21.02
+        # Stufe 1) – CHECKPOINT gefolgt von VACUUM fuer alle DuckDB-Dateien.
+        # Zweck: WAL in Hauptdatei flushen (konsistenter Zustand, kein
+        # WAL-Replay beim nächsten Start). Keine Datei-Verkleinerung –
+        # echte Kompaktierung nur per DB-Service-Button (compact_database).
+        for _db_name in ("analytics", "market_data", "app_data"):
+            try:
+                execute_db_vacuum(str(BASE_DIR / "data" / f"{_db_name}.duckdb"))
+            except Exception as exc:
+                print(f"⚠️ [DB-Pflege] {_db_name}.duckdb: {exc}")
 
         event.accept()
 
@@ -1764,6 +1791,17 @@ class PropertiesWindow(PersistentWindow):
         btn_save.clicked.connect(self._save_settings)
         btn_layout.addWidget(btn_save)
 
+        # Phase 21.02 (12.08.2026): DB-Service-Button für die Kompaktierung
+        # (COPY FROM DATABASE – echte Verkleinerung). NICHT VACUUM: Die
+        # reguläre DB-Pflege (CHECKPOINT+VACUUM) läuft beim App-Exit.
+        btn_db_service = QPushButton("🧹 DB Service")
+        btn_db_service.clicked.connect(self._on_btn_vacuum_clicked)
+        btn_db_service.setToolTip(
+            "Kompaktiert analytics.duckdb und market_data.duckdb "
+            "(COPY FROM DATABASE). Gesperrt, solange Scans/Worker laufen."
+        )
+        btn_layout.addWidget(btn_db_service)
+
         btn_close = QPushButton("Schließen")
         btn_close.clicked.connect(self.close)
         btn_layout.addWidget(btn_close)
@@ -1785,6 +1823,28 @@ class PropertiesWindow(PersistentWindow):
         )
         self._state_mgr.save_app_settings(self._settings)
         print(f"✅ Einstellungen gespeichert: {self._settings}")
+
+    # ------------------------------------------------------------------
+    # Phase 21.02 (12.08.2026): DB-Service / Kompaktierung
+    # ------------------------------------------------------------------
+    def _on_btn_vacuum_clicked(self) -> None:
+        """Kompaktiert analytics.duckdb & market_data.duckdb (COPY FROM DATABASE).
+
+        Concurrency-Guard über den EventBus-Zähler (Phase 21.02 K1): NICHT
+        `self.parent()` – PersistentWindow übergibt kein Qt-Parent. Der
+        Zähler wird von MainWindow in service_run_started/finished gepflegt.
+        """
+        if getattr(event_bus, "sync_pause_count", 0) > 0:
+            print("⚠️ DB-Service gesperrt: Scans/Worker laufen aktuell.")
+            return
+        for _db_name in ("analytics", "market_data"):
+            db_path = str(BASE_DIR / "data" / f"{_db_name}.duckdb")
+            try:
+                info = compact_database(db_path)
+                print(f"✅ DB-Service: {_db_name}.duckdb kompaktiert "
+                      f"({info['size_mb']} MB, {info['pct']}% fragmentiert)")
+            except Exception as exc:
+                print(f"❌ DB-Service: {_db_name}.duckdb fehlgeschlagen: {exc}")
 
     def get_settings(self) -> AppSettings:
         """Gibt die aktuell geladenen Einstellungen zurück."""
@@ -32723,6 +32783,12 @@ class EventBus(QObject):
         # QObject ohne Parent: Der Singleton lebt app-weit und wird nie
         # geloescht (gehoert keiner Fenster-Hierarchie an).
         super().__init__(None)
+        # Phase 21.02 (12.08.2026): Referenzzaehler fuer laufende Service-
+        # Berechnungen/Scans. Wird von MainWindow in service_run_started/
+        # finished mitgepflegt; PropertiesWindow nutzt ihn als
+        # Concurrency-Guard fuer die DB-Kompaktierung (getattr-Fallback 0,
+        # falls ein Modul ohne Initialisierung liest).
+        self.sync_pause_count: int = 0
 
     @classmethod
     def instance(cls) -> "EventBus":
@@ -33163,6 +33229,28 @@ class DbPool:
                         0, _db_pool_global.get(abs_path, 0) - 1)
             DbPool._local.conns = {}
 
+    @staticmethod
+    def release(abs_path: str) -> None:
+        """Schliesst die Connection des aktuellen Threads zu EINER DB-Datei.
+
+        Phase 21.02 (12.08.2026): Benoetigt fuer den Datei-Ersatz bei der
+        Kompaktierung (Windows File-Locking). Anders als `close_all()`
+        bleiben Connections zu anderen DB-Dateien (z. B. app_data.duckdb)
+        unangetastet. Die Connection wird beim naechsten `DbPool.get()`
+        lazy wieder geoeffnet (Referenzzaehler wird dekrementiert).
+        """
+        abs_path = os.path.abspath(abs_path)
+        if hasattr(DbPool._local, 'conns'):
+            con = DbPool._local.conns.pop(abs_path, None)
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
+
 
 class _LockedConnection:
     """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).
@@ -33204,12 +33292,24 @@ db/db_utils.py - Gemeinsame DB-Hilfsfunktionen.
 Ausgelagert aus db_service.py im Rahmen von 18.01.02 (E3): `_parse_json_field`
 (DuckDB liefert JSON teils als str, teils als dict) und `_ensure_epoch`
 (DEPRECATED, backward-compat). Basis-Schicht (E4) – kein Projekt-Import.
+
+Phase 21.02 (12.08.2026): DB-Bloat-Analyse & Maintenance (Kap. 21.02
+AKTUELLE_UMSETZUNG):
+  * get_db_fragmentation_info() – PRAGMA database_size (F1: res[2]/res[4])
+  * execute_db_vacuum()         – CHECKPOINT gefolgt von VACUUM (App-Exit)
+  * copy_database()             – COPY FROM DATABASE (echte Kompaktierung)
+  * compact_database()          – Kompaktierung inkl. Datei-Ersatz
+                                 (Windows File-Locking-sicher, F2)
 """
 
 import calendar
 import json
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+from db.db_pool import DbPool
 
 
 def _ensure_epoch(val: Any) -> int:
@@ -33226,6 +33326,99 @@ def _parse_json_field(val: Any) -> Any:
     if isinstance(val, str):
         return json.loads(val) if val else None
     return val
+
+
+# ---------------------------------------------------------------------------
+# Phase 21.02 (12.08.2026): DB-Bloat-Analyse & Maintenance
+# ---------------------------------------------------------------------------
+def get_db_fragmentation_info(db_path: str) -> dict:
+    """Liefert Fragmentierung/Bloat einer DuckDB-Datei (21.02, Schritt 1).
+
+    Basis: `PRAGMA database_size` (DuckDB 1.5.5). Spaltenreihenfolge:
+        0 database_name, 1 database_size (VARCHAR), 2 block_size,
+        3 total_blocks, 4 used_blocks, 5 free_blocks, ...
+    Bloat = Dateigröße - (used_blocks * block_size). Bei nicht vorhandener
+    Datei oder Fehler werden Null-Werte geliefert (defensiv).
+
+    Returns:
+        {"pct": float, "bloat_mb": float, "size_mb": float}
+    """
+    if not os.path.exists(db_path):
+        return {"pct": 0, "bloat_mb": 0, "size_mb": 0}
+    file_bytes = os.path.getsize(db_path)
+    try:
+        con = DbPool.get(db_path)
+        res = con.execute("PRAGMA database_size;").fetchone()
+        # F1 (12.08.2026): korrekte Indizes res[2]/res[4] statt res[1]/res[3]
+        block_size, used_blocks = (res[2], res[4]) if res else (262144, 0)
+        netto_bytes = used_blocks * block_size
+        bloat_bytes = max(0, file_bytes - netto_bytes)
+        return {
+            "pct": round((bloat_bytes / file_bytes * 100), 1) if file_bytes else 0,
+            "bloat_mb": round(bloat_bytes / (1024 * 1024), 1),
+            "size_mb": round(file_bytes / (1024 * 1024), 1)
+        }
+    except Exception:
+        return {"pct": 0, "bloat_mb": 0, "size_mb": round(file_bytes / (1024 * 1024), 1)}
+
+
+def execute_db_vacuum(db_path: str) -> None:
+    """DB-Pflege beim App-Exit (21.02, Stufe 1): CHECKPOINT gefolgt von VACUUM.
+
+    CHECKPOINT flusht die WAL in die Hauptdatei (konsistenter Zustand, kein
+    WAL-Replay beim nächsten Start); VACUUM ist in DuckDB ohne
+    Dateigrößen-Effekt (echte Kompaktierung siehe compact_database).
+    """
+    con = DbPool.get(db_path)
+    con.execute("CHECKPOINT;")
+    con.execute("VACUUM;")
+
+
+def copy_database(src_db_path: str, dst_db_path: str) -> None:
+    """Kompaktierung (21.02, Stufe 2): COPY FROM DATABASE in frische Datei.
+
+    Erzeugt eine 100 % lückenlose Kopie inkl. Schema/Constraints/Indizes.
+    Katalogname der Quelle = Datei-Basename ohne .duckdb (ggf. gequotet).
+    dst_db_path sollte ein absoluter Pfad sein (BASE_DIR-basiert).
+    """
+    src_db_path = os.path.abspath(src_db_path)
+    dst_db_path = os.path.abspath(dst_db_path)
+    if not os.path.exists(src_db_path):
+        raise FileNotFoundError(f"Quell-DB nicht gefunden: {src_db_path}")
+    # Alte Ziel-Datei entfernen, falls vorhanden (sonst ATTACH auf bestehende Datei)
+    if os.path.exists(dst_db_path):
+        os.remove(dst_db_path)
+    con = DbPool.get(src_db_path)
+    src_catalog = Path(src_db_path).stem  # z. B. 'analytics'
+    dst_sql = dst_db_path.replace("\\", "/")
+    con.execute(f"ATTACH '{dst_sql}' AS new_db")
+    con.execute(f'COPY FROM DATABASE "{src_catalog}" TO new_db')
+    con.execute("DETACH new_db")
+
+
+def compact_database(db_path: str) -> dict:
+    """Kompaktiert eine DuckDB-Datei inkl. Datei-Ersatz (21.02, Stufe 2).
+
+    Windows File-Locking: Vor dem Löschen/Umbenennen wird die DbPool-
+    Verbindung des aktuellen Threads zur DB geschlossen (DbPool.release).
+    Andere Threads (Scans/Worker) müssen beendet sein – der Aufrufer stellt
+    das über den Concurrency-Guard sicher (_sync_pause_count == 0).
+
+    Returns:
+        dict von get_db_fragmentation_info() NACH der Kompaktierung.
+    """
+    db_path = os.path.abspath(db_path)
+    if not os.path.exists(db_path):
+        return {"pct": 0, "bloat_mb": 0, "size_mb": 0}
+    tmp_path = f"{db_path}.compacted.duckdb"
+    # 1) Kopieren (COPY FROM DATABASE)
+    copy_database(db_path, tmp_path)
+    # 2) Verbindung(en) des aktuellen Threads zur DB schliessen (File-Lock)
+    DbPool.release(db_path)
+    # 3) Alte Datei ersetzen
+    os.remove(db_path)
+    os.replace(tmp_path, db_path)
+    return get_db_fragmentation_info(db_path)
 
 ```
 
@@ -44902,6 +45095,22 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
     </property>
     <property name="toolTip">
      <string>Anwendungs-Einstellungen (Candle-Limits, Seitengrößen, etc.)</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="label_db_status">
+    <property name="geometry">
+     <rect>
+      <x>540</x>
+      <y>140</y>
+      <width>141</width>
+      <height>28</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>DB Status: –</string>
+    </property>
+    <property name="toolTip">
+     <string>DB-Fragmentierung (via PRAGMA database_size) beim App-Start</string>
     </property>
    </widget>
   </widget>

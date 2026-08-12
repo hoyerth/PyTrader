@@ -807,6 +807,12 @@ class EventBus(QObject):
         # QObject ohne Parent: Der Singleton lebt app-weit und wird nie
         # geloescht (gehoert keiner Fenster-Hierarchie an).
         super().__init__(None)
+        # Phase 21.02 (12.08.2026): Referenzzaehler fuer laufende Service-
+        # Berechnungen/Scans. Wird von MainWindow in service_run_started/
+        # finished mitgepflegt; PropertiesWindow nutzt ihn als
+        # Concurrency-Guard fuer die DB-Kompaktierung (getattr-Fallback 0,
+        # falls ein Modul ohne Initialisierung liest).
+        self.sync_pause_count: int = 0
 
     @classmethod
     def instance(cls) -> "EventBus":
@@ -1277,6 +1283,22 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
     </property>
     <property name="toolTip">
      <string>Anwendungs-Einstellungen (Candle-Limits, Seitengrößen, etc.)</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="label_db_status">
+    <property name="geometry">
+     <rect>
+      <x>540</x>
+      <y>140</y>
+      <width>141</width>
+      <height>28</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>DB Status: –</string>
+    </property>
+    <property name="toolTip">
+     <string>DB-Fragmentierung (via PRAGMA database_size) beim App-Start</string>
     </property>
    </widget>
   </widget>

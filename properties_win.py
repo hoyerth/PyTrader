@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
 )
 
 from config.app_settings import AppSettings
+from config.event_bus import event_bus
+from db.db_utils import compact_database
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 
@@ -85,6 +87,17 @@ class PropertiesWindow(PersistentWindow):
         btn_save.clicked.connect(self._save_settings)
         btn_layout.addWidget(btn_save)
 
+        # Phase 21.02 (12.08.2026): DB-Service-Button für die Kompaktierung
+        # (COPY FROM DATABASE – echte Verkleinerung). NICHT VACUUM: Die
+        # reguläre DB-Pflege (CHECKPOINT+VACUUM) läuft beim App-Exit.
+        btn_db_service = QPushButton("🧹 DB Service")
+        btn_db_service.clicked.connect(self._on_btn_vacuum_clicked)
+        btn_db_service.setToolTip(
+            "Kompaktiert analytics.duckdb und market_data.duckdb "
+            "(COPY FROM DATABASE). Gesperrt, solange Scans/Worker laufen."
+        )
+        btn_layout.addWidget(btn_db_service)
+
         btn_close = QPushButton("Schließen")
         btn_close.clicked.connect(self.close)
         btn_layout.addWidget(btn_close)
@@ -106,6 +119,28 @@ class PropertiesWindow(PersistentWindow):
         )
         self._state_mgr.save_app_settings(self._settings)
         print(f"✅ Einstellungen gespeichert: {self._settings}")
+
+    # ------------------------------------------------------------------
+    # Phase 21.02 (12.08.2026): DB-Service / Kompaktierung
+    # ------------------------------------------------------------------
+    def _on_btn_vacuum_clicked(self) -> None:
+        """Kompaktiert analytics.duckdb & market_data.duckdb (COPY FROM DATABASE).
+
+        Concurrency-Guard über den EventBus-Zähler (Phase 21.02 K1): NICHT
+        `self.parent()` – PersistentWindow übergibt kein Qt-Parent. Der
+        Zähler wird von MainWindow in service_run_started/finished gepflegt.
+        """
+        if getattr(event_bus, "sync_pause_count", 0) > 0:
+            print("⚠️ DB-Service gesperrt: Scans/Worker laufen aktuell.")
+            return
+        for _db_name in ("analytics", "market_data"):
+            db_path = str(BASE_DIR / "data" / f"{_db_name}.duckdb")
+            try:
+                info = compact_database(db_path)
+                print(f"✅ DB-Service: {_db_name}.duckdb kompaktiert "
+                      f"({info['size_mb']} MB, {info['pct']}% fragmentiert)")
+            except Exception as exc:
+                print(f"❌ DB-Service: {_db_name}.duckdb fehlgeschlagen: {exc}")
 
     def get_settings(self) -> AppSettings:
         """Gibt die aktuell geladenen Einstellungen zurück."""
