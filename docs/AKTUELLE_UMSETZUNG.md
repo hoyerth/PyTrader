@@ -571,6 +571,112 @@ Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller
 
 ---
 
+# 21.03.11 – Buglist-Auswertung & Fix-Plan (12.08.2026, Stand: Analyse)
+
+> Vom Anwender gemeldete Buglist (6 Punkte). Analyse-Ergebnisse gegen den Code,
+> **noch keine Umsetzung** (nur Doku, kein Coding). Verifikation teilweise headless
+> (Strukturcheck der Filterleiste), UI-Nachprüfung durch den Anwender.
+
+## 📋 Bug 1 – Heatmap-Legende: korrekte Operator-Beschriftung
+
+**Meldung:** Legende muss korrekt mit `=`, `>`, `<`, `>=` oder `<=` beschriftet sein.
+**Klarstellung:** Die **Heatmap-Legende** (`analytics/ui/heatmap_widget.py`, `_update_legend`).
+
+**Befund (Code):** Die diskrete Confluence-Legende beschriftet die Farbfelder aktuell
+nur mit Zahlen (`0`, `1`, …, `4`, `5+`); die kontinuierliche Viridis-Legende mit
+Rohwerten. Keine Operator-Semantik.
+
+**Fix-Plan:** Confluence-Modus je ganzzahligem Treffer-Wert `c` → Label `= 0`, `= 1`,
+…, `= 4`; letztes Feld `≥ 5`. Viridis-Modus: Intervall-Labels (z. B. `≤ min+0.25span`,
+`min+0.25span … min+0.5span`, …, `≥ min+0.75span`) – Formatierung über
+`_format_heatmap_value`. Keine Logik-Änderung, nur Labels.
+
+## 📋 Bug 2 – H1 + Zoom-In: kein Wechsel in kleinere Timeframes
+
+**Meldung:** Bei H1-Auswahl wird beim Zoom-In nicht in kleinere TFs gebohrt, obwohl sie vorhanden sind.
+
+**Befund (Code):** `analytics/engine/mtf_fc_cascade.py` (Band 2): `range_days < 2.0 d`
+→ Kandidat `M5` (Zoom-In), darunter M1. Die Hysterese hält zwischen 2.0 d und 3.5 d
+stabil. Zusätzlich greift der Transition Guard (`CROSSFADE_DURATION_MS = 250`), nach
+einer Schaltung ist 250 ms lang keine weitere erlaubt. Logik headless verifiziert
+(Tests 1+2 PASS).
+
+**Fix-Plan (verifizieren im UI-Test):** Prüfen, ob der Wechsel unterhalb 2.0 d im
+laufenden Chart wirklich ausbleibt. Mögliche Ursachen: `tf_combo`-Sync/Refresh-Race
+nach `_mtf_fc_switch_tf`, Debounce (150 ms JS) oder Guard-Fenster. Falls reproduzierbar:
+Flow nachziehen (kein Kaskaden-Logik-Fix nötig, da Engine headless grün).
+
+## 📋 Bug 3 – „Alle TF ausführen" aktualisiert das Analytics-Hauptfenster nicht
+
+**Meldung:** Wenn im Service „alle TF ausgeführt" wird, wird das Focus Widget nicht aktualisiert.
+**Klarstellung:** **Analytics-Hauptfenster** (`analytics/ui/analytics_win.py`, Heatmap/Tabelle).
+
+**Befund (Code):** `ServiceRunWorker` emittiert `event_bus.service_set_changed` genau
+**einmal** nach Abschluss des Runs (`serviceui/run_worker.py`, `_emit_service_changed`).
+Das `AnalyticsWindow` verbindet sich jedoch **nicht** auf `service_set_changed` (nur auf
+`profile_changed`, `favorites_changed`). Das `ServiceSelectorModel` refreshed sich, die
+Analytics-Queries aber nicht.
+
+**Fix-Plan:** `AnalyticsWindow.__init__`: `event_bus.service_set_changed.connect(...)` →
+debounced `self._vm.refresh_all()` (Bestehender VM-Pfad, kein neues SQL). Damit wird die
+Heatmap/Tabelle nach jedem abgeschlossenen Service-Run automatisch neu geladen.
+
+## 📋 Bug 4 – TF M15: X-Achse zeigt weiterhin 12h-Blöcke
+
+**Meldung:** Bei M15 (statt H1) ist je Block auf der Achse immer noch 12-Stunden-x-teiler; sollte angepasst werden.
+
+**Befund (Code):** `chart/js/04_live_updates.js` (`tickMarkFormatter`) ist **TF-unabhängig**
+– er formatiert nur (`TT.MM.JJ` vs. `HH:MM`). Die Tick-Dichte bestimmt LWC v5 aus der
+Viewport-Breite, nicht aus dem gewählten TF. Es gibt keine TF-spezifische Achsen-Granularität.
+
+**Fix-Plan:** TF-abhängige Achsen-Skalierung: je `currentTfInSeconds` Ziel-Abstand der
+Ticks (z. B. M15 → 15-min-Marken, H1 → 1h-Marken) im `tickMarkFormatter` bzw. via
+`timeScale().applyOptions()`; Format bleibt Wanduhr (Invariante 7). Reine JS-Erweiterung
+in `04_live_updates.js` (Additiv, kein Kern-Umbau).
+
+## 📋 Bug 5 – Heatmap-Zoom-Slider X/Y korrelieren nicht mit Maus-Zoom
+
+**Meldung:** Die Zoom-Slider an der Heatmap (einer für X, einer für Y) sollten mit dem Maus-Zoom korrelieren und verbunden sein.
+
+**Befund (Code):** `analytics/ui/heatmap_widget.py` hat X/Y-Slider
+(`_slider_zoom_x`/`_slider_zoom_y`, 5..100). Die Verdrahtung ist **einseitig**:
+Slider-Änderung → `_on_zoom_x/y_changed` → `_set_zoom_range` → `_apply_x/y_range`
+(`setXRange`/`setYRange`). Es gibt **keinen** `sigRangeChanged`-Hook der Plot-ViewBox
+→ Maus-Zoom (Mausrad) bewegt die Slider nicht.
+
+**Fix-Plan:** Zwei-Wege-Sync: `self._plot_hm.plotItem.vb.sigRangeChanged` → Slider via
+`_set_zoom_slider` aktualisieren (blockSignals + `_syncing`-Guard gegen Endlos-Schleife).
+Richtungskonvention (rechts = Zoom-In, links = Zoom-Out) beibehalten. ViewModel-Params
+`zoom_x_range`/`zoom_y_range` bleiben die Quelle.
+
+## 📋 Bug 6 – Filterleiste (Data-TF, Chart-TF, Range-Picker) nicht sichtbar
+
+**Meldung:** Source-Data-TF, Chart-Overlay-TF und Range-Picker sind definitiv NICHT
+sichtbar; weitere Elemente vermutlich ebenfalls nicht nutzbar. Der Range-Picker ist wichtig
+(nicht immer alle Jahre sehen).
+
+**Befund (Code + headless Strukturcheck):** Die `MtfFilterBarWidget` wird in
+`chart/chart_win.py` (Zeile ~486-490) an `verticalLayout_toolbar` angehängt – Strukturcheck
+offscreen bestätigt: Layout gefunden, 2→3 Items, Einfügen OK. **Ursache der Nicht-Sichtbarkeit:**
+`sizeHint` der Leiste = **w 2248 px** (bei 1200 px Fensterbreite) → die Zeile läuft über,
+wird abgeschnitten/geclippt, die Controls sind nicht erreichbar.
+
+Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
+- `sort_mode_changed` → **nicht verbunden**
+- `sessions_changed` → **nicht verbunden**
+- `template_applied` → **nicht verbunden**
+(nur `data_tf_changed`, `chart_tf_changed`, `range_changed`, `guard_override_requested`).
+
+**Fix-Plan:**
+1. `MtfFilterBarWidget` kompakt umbauen (kleinere Controls, kürzere Labels, ggf.
+   zwei Zeilen/Flow) – Ziel: `sizeHint`-Breite ≤ ~1100 px, sichtbar bei 1200 px Fenster.
+2. Fehlende Signal-Verdrahtung in `chart_win.py` nachrüsten (Sortierung an den
+   Analytics-/Tabellen-Kontext, Sessions an den Chart, Template-Anwendung).
+3. Range-Picker wirkt bereits (`_on_mtf_fc_range_changed` → `_mtfFcApplyRange`) –
+   nach Sichtbarkeits-Fix benutzbar.
+
+---
+
 # Implementierungs-Log 21.03 (MTF-FC v4) – 12.08.2026
 
 > Taxonomie 21.03, Format MD. Einträge je umgesetztem Schritt nach Anwender-Bestätigung. Headless-Validierung ohne UI-Ausführung (Grundsatz 2).
@@ -633,4 +739,17 @@ Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller
 
 - **Umgesetzt:** Test 7 (Service-Failure-Degradation) standalone verifiziert und als Tests 1–7 (inkl. T7v1/v2 Template-Migration) in `test/test.py` integriert; Gesamtlauf ausgeführt; Cleanup temporärer Skripte (`check_mtf_fc.py`, `check_mtf_fc_test7.py`, `check_mtf_fc_ui.py`, `test_output_stderr.txt`) – verbleibt nur der Harness `test/test.py` (Grundsatz 10).
 - **Verifikation:** `py_compile test/test.py` EXIT 0; Gesamtlauf: **alle 21.03 MTF-FC-Checks PASS** (T1a–T7.7, T7v1/v2). 26 vorbestehende FAILs (Fenster-/Reflow-, JSON-Feld-Auflösung, `instance_hash`-Binder in den 20.03-Analytics-Tests) sind Bestandszustand und nicht durch MTF-FC verursacht – der 21.03-Block ist vollständig grün. Keine neuen Quell-Commits nötig (Code bereits in `4217e71`/`4425bc9`, `test/` gitignored).
+- **Commit:** – (nur Doku)
+
+## 21.03.11 – Buglist-Auswertung & Fix-Plan (12.08.2026, Analyse)
+
+- **Umgesetzt:** **Nur Doku/Analyse (kein Coding).** Die vom Anwender gemeldete Buglist (6 Punkte) wurde gegen den Code ausgewertet; Fix-Pläne in `docs/AKTUELLE_UMSETZUNG.md` (Kapitel 21.03.11) dokumentiert. Zusätzlich eine beschädigte Zeile in der Doku (Zeile 107, „Steuerungselemente:6) definiti") bereinigt.
+- **Befunde (Kurzfassung):**
+  - **Bug 1:** Heatmap-Legende (`_update_legend`) ohne Operator-Labels (`0..5+`) → Fix: `= 0..= 4`, `≥ 5`; Viridis-Intervall-Labels.
+  - **Bug 2:** Kaskaden-Logik headless grün (Zoom-In < 2.0 d → M5); UI-Nachprüfung nötig (Flow-Race vermutet).
+  - **Bug 3:** `AnalyticsWindow` verbindet sich NICHT auf `event_bus.service_set_changed` (vom Worker einmalig nach Run emittiert) → Fix: EventBus-Anbindung + debounced `refresh_all()`.
+  - **Bug 4:** `tickMarkFormatter` TF-unabhängig → Fix: TF-spezifische Achsen-Ticks in `04_live_updates.js`.
+  - **Bug 5:** Heatmap-Zoom-Slider einseitig (Slider→Range); kein `sigRangeChanged`-Hook → Fix: Zwei-Wege-Sync mit `_syncing`-Guard.
+  - **Bug 6:** Filterleiste wird eingefügt, aber `sizeHint` w=2248 px (verifiziert, offscreen Strukturcheck) → Überlauf/Clipping; 3 Signale unverdrahtet → Fix: kompakter Umbau + Verdrahtung.
+- **Verifikation:** `test/check_filterbar_layout.py` (temporär, offscreen, danach gelöscht): `verticalLayout_toolbar` gefunden, Items 2→3, `MtfFilterBarWidget` sizeHint w=2248 px – Ursache für Bug 6 bestätigt. Keine Code-Änderungen.
 - **Commit:** – (nur Doku)
