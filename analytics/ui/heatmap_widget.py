@@ -223,6 +223,27 @@ def _nice_int_step(span: float, max_ticks: int) -> float:
     return float(math.ceil(raw))
 
 
+def _format_heatmap_value(val: Any) -> str:
+    """Formatiert einen Heatmap-Zahlenwert OHNE Exponential-Notation.
+
+    Bugfix 12.08.2026 (User-Meldung 'EXP-Wert in der Legende'):
+    `f'{val:.2g}'` wechselt ab 100 in wissenschaftliche Notation
+    ('1.2e+02'); `f'{v:g}'` ab 1e6 ('1e+06'). Ganzzahlige Werte
+    (z. B. COUNT-Zaehler je Zelle/Bucket) werden in deutscher
+    Tausender-Schreibweise ausgegeben ('4.380'), Bruchwerte (z. B.
+    AVG/SUM/MIN/MAX) als Dezimalzahl ohne Nullen ('0.25', '62.5').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if fval == int(fval) and abs(fval) < 1e15:
+        return f"{int(fval):,}".replace(",", ".")
+    return f"{fval:.6f}".rstrip("0").rstrip(".")
+
+
 class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
@@ -2144,7 +2165,7 @@ class HeatmapWidget(QWidget):
         except (TypeError, ValueError, IndexError):
             self._label_info.setText(f"{time_txt}Zelle({row},{col}) = n/a")
             return
-        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
+        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {_format_heatmap_value(v)}")
 
     # ------------------------------------------------------------------
     # 21.01 Bugfix 2: Diskrete Schwellwert-Legende (oben rechts)
@@ -2181,7 +2202,7 @@ class HeatmapWidget(QWidget):
             for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
                 val = vmin + frac * (vmax - vmin)
                 color = cmap.map(frac, mode="qcolor")
-                self._add_legend_swatch(color, f"{val:.2g}")
+                self._add_legend_swatch(color, _format_heatmap_value(val))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:
