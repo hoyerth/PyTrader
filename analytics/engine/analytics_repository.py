@@ -59,6 +59,10 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
 
@@ -67,7 +71,8 @@ class AnalyticsRepository:
         """
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes, limit=limit)
+            instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -82,6 +87,10 @@ class AnalyticsRepository:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -109,7 +118,8 @@ class AnalyticsRepository:
         use_metric = metric if metric in metrics else "count"
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
-            feature_ids=feature_ids, instance_hashes=instance_hashes
+            feature_ids=feature_ids, instance_hashes=instance_hashes,
+            from_ts=from_ts, to_ts=to_ts
         )
         result["metrics"] = metrics
         return result
@@ -212,6 +222,12 @@ class AnalyticsRepository:
         # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
         # (Preset `[📊 Service-Timeframe]`) – wird an den Reader gereicht.
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing) + optionaler Zeitfilter (Wanduhr-Epochs).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -259,6 +275,7 @@ class AnalyticsRepository:
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
                 instance_hashes=instance_hashes, limit=limit,
                 all_timeframes=all_timeframes,
+                bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -344,6 +361,10 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
@@ -374,6 +395,7 @@ class AnalyticsRepository:
             symbol, timeframe, [x_col, y_col],
             feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -408,6 +430,10 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
@@ -438,7 +464,7 @@ class AnalyticsRepository:
         rows = self.reader.fetch_columns(
             symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, instance_hashes=instance_hashes,
-            limit=limit,
+            limit=limit, from_ts=from_ts, to_ts=to_ts,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]

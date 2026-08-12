@@ -167,6 +167,10 @@ class AnalyticsAsyncWorker(QThread):
             feature_ids = [p["feature_id"]]
         # Runde 10 (Bug 1): Varianten-Einschraenkung an die Repo-Methoden.
         instance_hashes = p.get("instance_hashes") or []
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter + Bucket-TF.
+        from_ts = p.get("from_ts")
+        to_ts = p.get("to_ts")
+        bucket_tf = p.get("bucket_tf") or None
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
@@ -175,6 +179,7 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
             )
         if self._query_kind == QUERY_HEATMAP:
             return repo.get_heatmap(
@@ -183,6 +188,7 @@ class AnalyticsAsyncWorker(QThread):
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                from_ts=from_ts, to_ts=to_ts,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -204,6 +210,10 @@ class AnalyticsAsyncWorker(QThread):
                 # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
                 # (Preset `[📊 Service-Timeframe]`) – Bool aus den Params.
                 all_timeframes=bool(p.get("all_timeframes", False)),
+                # 21.03.12 (Entscheidung 6a): Aggregations-TF fuer das
+                # date-Raster + optionaler Zeitfilter (Wanduhr-Epochs).
+                bucket_tf=bucket_tf,
+                from_ts=from_ts, to_ts=to_ts,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -229,6 +239,7 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
             )
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
@@ -239,6 +250,7 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
             )
         if self._query_kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params

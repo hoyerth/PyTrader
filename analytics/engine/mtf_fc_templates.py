@@ -24,7 +24,7 @@ MTF_FC_SCHEMA_VERSION = "1.0.0"
 
 #: Bekannte Template-Keys (Whitelist für die Migration).
 _TEMPLATE_KNOWN_KEYS = (
-    "mtf_fc_schema_version", "name", "data_tf", "chart_tf",
+    "mtf_fc_schema_version", "name", "data_tf", "chart_tf", "agg_tf",
     "range_preset", "custom_range", "sort_mode", "session_filters",
     "confluence_weighting", "volatility_adaption", "view_templates_meta",
 )
@@ -33,6 +33,8 @@ _TEMPLATE_KNOWN_KEYS = (
 _TEMPLATE_DEFAULTS: Dict[str, Any] = {
     "data_tf": "multi",
     "chart_tf": "auto",
+    # 21.03.12 (Entscheidung 6a): Aggregations-TF ('auto' oder konkreter TF).
+    "agg_tf": "auto",
     "range_preset": "7d",
     "custom_range": {"from_ts": None, "to_ts": None},
     "sort_mode": "date",

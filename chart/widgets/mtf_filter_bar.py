@@ -17,7 +17,7 @@ emittiert Signale; die eigentliche Verarbeitung (Boundary, Kaskade, Guards)
 liegt in den Engine-Modulen (21.03.02-21.03.05).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -47,6 +47,11 @@ DATA_TF_OPTIONS = ["🌐 Multi", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "�
 
 #: Chart-Overlay-TF (Auto-Kaskade vs. manuell fix).
 CHART_TF_OPTIONS = ["⚡ Auto", "🔒 Fix"]
+
+#: Aggregations-TF (21.03.12, Entscheidung 6a): '⚡ Auto' = Granularitaet
+#: dynamisch an den Range anpassen; '🔒 [TF]' = Daten starr auf diesem
+#: TF-Raster zusammenfassen. Konfigurierbar via `agg_tf_options`.
+AGG_TF_OPTIONS = ["⚡ Auto", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4", "🔒 D1"]
 
 #: Range-Presets.
 RANGE_PRESETS = ["24h", "7d", "30d", "YTD", "Benutzerdefiniert"]
@@ -90,6 +95,8 @@ class MtfFilterBarWidget(QWidget):
     Signale (Entkopplung über den Aufrufer, kein Fenster-Know-how):
       * `data_tf_changed(str)`     – 'multi' oder fixierter TF (z. B. 'M15').
       * `chart_tf_changed(str)`    – 'auto' (Kaskade) oder 'fix'.
+      * `agg_tf_changed(str)`      – 'auto' oder konkreter Aggregations-TF
+                                     (21.03.12, Entscheidung 6a).
       * `range_changed(str, int, int)` – Preset-Name, from_ts, to_ts.
       * `sort_mode_changed(str)`   – 'date' | 'signal' | 'tf'.
       * `sessions_changed(list)`   – aktive Sessions (z. B. ['london']).
@@ -99,6 +106,7 @@ class MtfFilterBarWidget(QWidget):
 
     data_tf_changed = Signal(str)
     chart_tf_changed = Signal(str)
+    agg_tf_changed = Signal(str)
     range_changed = Signal(str, int, int)
     sort_mode_changed = Signal(str)
     sessions_changed = Signal(list)
@@ -110,12 +118,24 @@ class MtfFilterBarWidget(QWidget):
         provider: Optional[MtfFcProvider] = None,
         template_store: Optional[MtfFcTemplateStore] = None,
         parent: Optional[QWidget] = None,
+        # 21.03.12 (Analytics-Integration): Die TF-Listen sind konfigurierbar
+        # (Analytics hat 11 TFs M1..MN1 statt der 6 Chart-Defaults) und der
+        # Range-Referenzpunkt kann injiziert werden (`now_provider` – im
+        # Analytics der letzte Datenpunkt MAX(bar_time) statt time.time()).
+        data_tf_options: Optional[List[str]] = None,
+        agg_tf_options: Optional[List[str]] = None,
+        now_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         super().__init__(parent)
         # Provider ist die EINZIGE Brücke zum shared_state-Namespace (MVVM).
         self._provider = provider or MtfFcProvider()
         self._store = template_store or MtfFcTemplateStore()
         self._sessions: List[str] = []
+        self._data_tf_options = (
+            list(data_tf_options) if data_tf_options else list(DATA_TF_OPTIONS))
+        self._agg_tf_options = (
+            list(agg_tf_options) if agg_tf_options else list(AGG_TF_OPTIONS))
+        self._now_provider = now_provider or _now_epoch
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -138,7 +158,7 @@ class MtfFilterBarWidget(QWidget):
 
         row1.addWidget(QLabel("Data:"))
         self._data_tf_combo = QComboBox()
-        self._data_tf_combo.addItems(DATA_TF_OPTIONS)
+        self._data_tf_combo.addItems(self._data_tf_options)
         self._data_tf_combo.setMaximumWidth(105)
         self._data_tf_combo.setToolTip(
             "Source-Data-TF: 🌐 alle Timeframes (Multi) vs. 🔒 fixiert auf einen TF")
@@ -154,6 +174,21 @@ class MtfFilterBarWidget(QWidget):
             "Chart-Overlay-TF: ⚡ Auto (Kaskade) vs. 🔒 manuell fixiert")
         self._chart_tf_combo.currentTextChanged.connect(self._on_chart_tf_changed)
         row1.addWidget(self._chart_tf_combo)
+
+        # 21.03.12 (Entscheidung 6a): Aggregations-TF-Dropdown – nur bei
+        # '🔒 Fix' aktiv; bei '⚡ Auto' deaktiviert und auf 'Auto' gesetzt.
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Agg:"))
+        self._agg_tf_combo = QComboBox()
+        self._agg_tf_combo.addItems(self._agg_tf_options)
+        self._agg_tf_combo.setMaximumWidth(95)
+        self._agg_tf_combo.setToolTip(
+            "Aggregations-TF (21.03.12, 6a): ⚡ Auto = Granularitaet dynamisch "
+            "an den Zeitraum anpassen; 🔒 Fix = Daten starr auf diesem TF-Raster "
+            "zusammenfassen (eigenes Dropdown, unabhaengig von Data-TF).")
+        self._agg_tf_combo.currentTextChanged.connect(self._on_agg_tf_changed)
+        self._agg_tf_combo.setEnabled(False)
+        row1.addWidget(self._agg_tf_combo)
 
         row1.addSpacing(6)
         row1.addWidget(QLabel("Range:"))
@@ -250,6 +285,17 @@ class MtfFilterBarWidget(QWidget):
         """Aktiver Chart-Overlay-TF ('auto' oder 'fix')."""
         return _parse_chart_tf(self._chart_tf_combo.currentText())
 
+    def current_agg_tf(self) -> str:
+        """Aktiver Aggregations-TF ('auto' oder konkreter TF, z. B. 'H1')."""
+        text = self._agg_tf_combo.currentText()
+        for prefix in ("⚡ ", "🔒 "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        stripped = text.strip()
+        if not stripped or stripped.lower() in ("auto", "kaskade"):
+            return "auto"
+        return stripped
+
     def current_sort_mode(self) -> str:
         """Aktive Sortierung ('date' | 'signal' | 'tf')."""
         text = self._sort_combo.currentText()
@@ -258,6 +304,50 @@ class MtfFilterBarWidget(QWidget):
         if text.startswith("TF"):
             return "tf"
         return "date"
+
+    # 21.03.12 (Analytics-Integration): Externe Filterwerte anwenden (z. B.
+    # Profil-/Workspace-Restore des AnalyticsWindow). Setzt die Combos mit
+    # blockSignals und emittiert die Signale danach EXPLIZIT (Muster
+    # _apply_template). None = Eintrag unveraendert lassen.
+    def apply_external_state(
+        self,
+        data_tf: Optional[str] = None,
+        agg_tf: Optional[str] = None,
+        range_preset: Optional[str] = None,
+    ) -> None:
+        """Wendet externe Filterwerte auf die Combos an (in-memory)."""
+        if data_tf is not None:
+            self._data_tf_combo.blockSignals(True)
+            self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
+            self._data_tf_combo.blockSignals(False)
+            self.data_tf_changed.emit(self.current_data_tf())
+        if agg_tf is not None:
+            self._agg_tf_combo.blockSignals(True)
+            if str(agg_tf).strip().lower() == "auto":
+                self._agg_tf_combo.setCurrentText("⚡ Auto")
+            else:
+                self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
+            self._agg_tf_combo.blockSignals(False)
+            self.agg_tf_changed.emit(self.current_agg_tf())
+        if range_preset is not None:
+            self._range_combo.blockSignals(True)
+            self._range_combo.setCurrentText(str(range_preset))
+            self._range_combo.blockSignals(False)
+            if range_preset and range_preset != "Benutzerdefiniert":
+                self._on_range_changed(str(range_preset))
+
+    def set_chart_mode(self, mode: str) -> None:
+        """Setzt den Chart-Modus ('auto'|'fix') – externer Kontext (Analytics).
+
+        'fix' aktiviert das Aggregations-TF-Dropdown (Entscheidung 6a) und
+        stellt einen konkreten Agg-TF sicher; 'auto' deaktiviert es (dynamische
+        Granularitaet). Loeuft ueber die bestehende _on_chart_tf_changed-Logik
+        (Enable/Disable + Vorbelegung) und emittiert chart_tf_changed +
+        agg_tf_changed.
+        """
+        mode = "fix" if str(mode).strip().lower() == "fix" else "auto"
+        self._chart_tf_combo.setCurrentText(
+            CHART_TF_OPTIONS[1] if mode == "fix" else CHART_TF_OPTIONS[0])
 
     def active_sessions(self) -> List[str]:
         """Aktive Session-Filter (klein geschrieben)."""
@@ -277,12 +367,44 @@ class MtfFilterBarWidget(QWidget):
         self.data_tf_changed.emit(self.current_data_tf())
 
     def _on_chart_tf_changed(self, _text: str) -> None:
-        self.chart_tf_changed.emit(self.current_chart_tf())
+        """Aktiviert/deaktiviert das Aggregations-TF-Dropdown (Entscheidung 6a).
+
+        '⚡ Auto'  -> Agg-Combo deaktiviert und auf 'Auto' gesetzt (Granularitaet
+                     wird dynamisch aus dem Zeitraum abgeleitet).
+        '🔒 Fix'   -> Agg-Combo aktiv; ist noch kein konkreter TF gewaehlt,
+                     wird der erste fixierte Eintrag vorbelegt (damit 'Fix'
+                     IMMER einen konkreten Aggregations-TF liefert).
+        """
+        mode = self.current_chart_tf()
+        self._agg_tf_combo.blockSignals(True)
+        if mode == "auto":
+            self._agg_tf_combo.setCurrentText("⚡ Auto")
+            self._agg_tf_combo.setEnabled(False)
+        else:
+            if self.current_agg_tf() == "auto":
+                for opt in self._agg_tf_options:
+                    if not opt.startswith("⚡"):
+                        self._agg_tf_combo.setCurrentText(opt)
+                        break
+            self._agg_tf_combo.setEnabled(True)
+        self._agg_tf_combo.blockSignals(False)
+        self.chart_tf_changed.emit(mode)
+        self.agg_tf_changed.emit(self.current_agg_tf())
+
+    def _on_agg_tf_changed(self, _text: str) -> None:
+        self.agg_tf_changed.emit(self.current_agg_tf())
 
     def _on_range_changed(self, preset: str) -> None:
         if preset == "Benutzerdefiniert":
             return
-        now = _now_epoch()
+        # 21.03.12 (Analytics): Referenzpunkt injizierbar – im Analytics der
+        # letzte Datenpunkt (MAX(bar_time)) statt time.time(), damit Presets
+        # relativ zum letzten Signal und nicht zur Wanduhr rechnen. Defensiv:
+        # None/Fehler (z. B. noch kein Symbol/Timeframe gewaehlt) -> time.time().
+        try:
+            now = int(self._now_provider())
+        except (TypeError, ValueError):
+            now = int(_now_epoch())
         seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
                    "YTD": _ytd_epoch_offset(now)}.get(preset, 86400)
         self.range_changed.emit(preset, now - seconds, now)
@@ -300,6 +422,7 @@ class MtfFilterBarWidget(QWidget):
             name=name,
             data_tf=self.current_data_tf(),
             chart_tf=self.current_chart_tf(),
+            agg_tf=self.current_agg_tf(),
             range_preset=self._range_combo.currentText(),
             sort_mode=self.current_sort_mode(),
             session_filters=list(self._sessions),
@@ -335,6 +458,24 @@ class MtfFilterBarWidget(QWidget):
         self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
         self._data_tf_combo.blockSignals(False)
 
+        # 21.03.12 (Entscheidung 6a): Chart-Modus + Aggregations-TF aus dem
+        # Template anwenden (inkl. Enable/Disable der Agg-Combo).
+        chart_tf = str(template.get("chart_tf") or "auto")
+        self._chart_tf_combo.blockSignals(True)
+        self._chart_tf_combo.setCurrentText(
+            CHART_TF_OPTIONS[1] if chart_tf == "fix" else CHART_TF_OPTIONS[0])
+        self._chart_tf_combo.blockSignals(False)
+
+        agg_tf = str(template.get("agg_tf") or "auto")
+        self._agg_tf_combo.blockSignals(True)
+        if agg_tf == "auto":
+            self._agg_tf_combo.setCurrentText("⚡ Auto")
+            self._agg_tf_combo.setEnabled(False)
+        else:
+            self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
+            self._agg_tf_combo.setEnabled(True)
+        self._agg_tf_combo.blockSignals(False)
+
         range_preset = str(template.get("range_preset") or "7d")
         self._range_combo.blockSignals(True)
         self._range_combo.setCurrentText(range_preset)
@@ -357,6 +498,7 @@ class MtfFilterBarWidget(QWidget):
         # Explizite Signal-Emission nach der Anwendung (Bug 6).
         self.data_tf_changed.emit(self.current_data_tf())
         self.chart_tf_changed.emit(self.current_chart_tf())
+        self.agg_tf_changed.emit(self.current_agg_tf())
         self.sort_mode_changed.emit(self.current_sort_mode())
         self.sessions_changed.emit(list(self._sessions))
         if range_preset and range_preset != "Benutzerdefiniert":

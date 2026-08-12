@@ -122,6 +122,16 @@ OHLCV_SNAPSHOT_LIMIT = 5000
 # DAILY_OHLC_MAX_DAYS Tage (deckt den gesamten Heatmap-Zeitraum ab).
 DAILY_OHLC_MAX_DAYS = 4000
 
+# 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF ->
+# Bucket-Sekunden fuer das date-Raster der generischen Heatmap (`agg_tf`
+# fixiert auf einen konkreten TF, z. B. 'M15'/'H1'). 'auto' bedeutet KEIN
+# Bucketing (Granularitaet dynamisch, bisheriges Verhalten).
+TF_SECONDS = {
+    "M1": 60, "M2": 120, "M5": 300, "M10": 600, "M15": 900,
+    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
+    "W1": 604800, "MN1": 2592000,
+}
+
 
 class FeatureStoreReader:
     """Kapselt rein lesend DuckDB-Abfragen auf den feature_store."""
@@ -364,6 +374,46 @@ class FeatureStoreReader:
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 
+    # 21.03.12 (MTF-FC auf Analytics): Optionaler bar_time-Zeitfilter.
+    # Wird von allen Daten-Queries (fetch_rows/fetch_columns/fetch_heatmap/
+    # fetch_generic_heatmap) ueber `from_ts`/`to_ts` aufgerufen.
+    @staticmethod
+    def _apply_time_range(
+        from_ts: Optional[Any],
+        to_ts: Optional[Any],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um einen optionalen bar_time-Zeitfilter.
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int, relativ zum letzten
+        Datenpunkt – `now_provider` des MtfFilterBarWidget) oder None.
+        `EXTRACT('epoch' FROM bar_time)` liefert exakt die gespeicherte
+        Wanduhr-Epoch (Invariante 7) – der Vergleich ist damit DST-robust
+        (Wanduhr gegen Wanduhr). Ungueltige Werte werden defensiv
+        ignoriert (kein Filter).
+        """
+        if from_ts is None and to_ts is None:
+            return
+        try:
+            f = int(from_ts)
+        except (TypeError, ValueError):
+            f = None
+        try:
+            t = int(to_ts)
+        except (TypeError, ValueError):
+            t = None
+        if f is not None and t is not None:
+            conditions.append(
+                "EXTRACT('epoch' FROM bar_time)::BIGINT BETWEEN ? AND ?")
+            params.extend([f, t])
+        elif f is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT >= ?")
+            params.append(f)
+        elif t is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT <= ?")
+            params.append(t)
+
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
     # ------------------------------------------------------------------
@@ -376,6 +426,10 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
@@ -411,6 +465,7 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
 
         con = self._get_connection()
         try:
@@ -479,6 +534,14 @@ class FeatureStoreReader:
         try:
             if dim == "date":
                 if hasattr(value, "strftime"):
+                    # 21.03.12 (bucket_tf): tz-aware Datetimes (Session-TZ)
+                    # auf naive Wanduhr-UTC normalisieren - sonst zeigt das
+                    # Label den Berlin-Nachbar-Datumstag (+2h/+1h).
+                    try:
+                        value = value.astimezone(
+                            _dt_timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        pass
                     return value.strftime("%d.%m.")
                 return str(value)
             if dim == "hour":
@@ -510,7 +573,15 @@ class FeatureStoreReader:
             out: List[float] = []
             for v in values:
                 if isinstance(v, _dt_datetime):
-                    out.append(float(int(v.timestamp())))
+                    # 21.03.12 (bucket_tf): Naive Datetimes von to_timestamp
+                    # sind Wanduhr-encoded - als UTC-Darstellung interpretieren
+                    # (Invariante 7), sonst waere die Achse um den Berlin-
+                    # Offset (+2h/+1h) verschoben.
+                    if v.tzinfo is None:
+                        out.append(float(int(
+                            v.replace(tzinfo=_dt_timezone.utc).timestamp())))
+                    else:
+                        out.append(float(int(v.timestamp())))
                 elif hasattr(v, "year") and hasattr(v, "month") \
                         and hasattr(v, "day"):
                     # date-Objekt (CAST AS DATE): Mitternacht Wanduhr-UTC
@@ -661,6 +732,10 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
 
@@ -699,6 +774,7 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
 
         con = self._get_connection()
         try:
@@ -744,6 +820,10 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
 
@@ -804,6 +884,7 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
 
         con = self._get_connection()
         try:
@@ -880,6 +961,13 @@ class FeatureStoreReader:
         # ist VERWORFEN: der alte Guard `if not symbol or not timeframe:`
         # brach damit mit einer leeren Matrix ab).
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing). Optionaler Zeitfilter (Wanduhr-Epochs relativ zum
+        # letzten Datenpunkt; None = kein Filter).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -947,6 +1035,22 @@ class FeatureStoreReader:
         y_key = str(y_dim or "").lower()
         x_expr = DIM_MAPPINGS.get(x_key)
         y_expr = DIM_MAPPINGS.get(y_key)
+        # 21.03.12 (Entscheidung 6a): `bucket_tf` bucketed das date-Raster
+        # auf das Aggregations-TF-Raster (agg_tf). to_timestamp liefert
+        # naive TIMESTAMP-Werte (Wanduhr) - _axis_coords interpretiert sie
+        # als Wanduhr (UTC-Darstellung, Invariante 7).
+        if bucket_tf:
+            _secs = TF_SECONDS.get(str(bucket_tf).strip().upper())
+            if _secs:
+                _bucket_expr = (
+                    f"(to_timestamp((FLOOR(EXTRACT('epoch' FROM bar_time AT "
+                    f"TIME ZONE 'UTC') / {_secs})::BIGINT) * {_secs}) "
+                    f"AT TIME ZONE 'UTC')"
+                )
+                if x_key == "date":
+                    x_expr = _bucket_expr
+                if y_key == "date":
+                    y_expr = _bucket_expr
         if x_expr is None or y_expr is None:
             raise ValueError(
                 f"[FeatureStoreReader] Unbekannte Dimension '{x_dim}/{y_dim}' – "
@@ -986,6 +1090,7 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
@@ -1070,8 +1175,15 @@ class FeatureStoreReader:
             "matrix": matrix.tolist(),
             "x_labels": [self._format_dim_value(x_key, v) for v in x_values],
             "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
-            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
-            "x_values": [str(v) for v in x_values],
+            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt).
+            # 21.03.12 (bucket_tf): tz-aware Datetimes (falls DuckDB den
+            # Session-TZ anhaengt) defensiv auf naive Wanduhr-UTC normalisieren.
+            "x_values": [
+                (str(v.astimezone(_dt_timezone.utc).replace(tzinfo=None))
+                 if isinstance(v, _dt_datetime) and v.tzinfo is not None
+                 else str(v))
+                for v in x_values
+            ],
             # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
             # (date -> Mitternachts-Epochs, hour/dow -> Ganzzahlen, dow 1..5
             # Mo-Fr, kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.

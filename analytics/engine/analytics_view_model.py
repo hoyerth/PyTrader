@@ -54,6 +54,12 @@ DEBOUNCE_MS = 250
 DEFAULT_BINS = 20
 DEFAULT_LIMIT = 5000
 
+# 21.03.12 (MTF-FC auf Analytics): Alle Haupt-Queries, die beim data_tf-
+# Wechsel neu angestossen werden (OHLCV/DAILY_OHLC sind on-demand und
+# folgen keinem Filterwechsel - identisch zur refresh_all()-Liste).
+_ALL_QUERIES = (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES)
+
 
 class AnalyticsViewModel(QObject):
     """MVVM-ViewModel der Analytics-Engine (kein SQL, kein UI)."""
@@ -154,6 +160,22 @@ class AnalyticsViewModel(QObject):
             "table_row_height": 0,
             "table_sort_column": 0,
             "table_sort_order": 1,
+            # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter des
+            # MtfFilterBarWidget. `data_tf` = Analysequelle ('multi' = alle
+            # TFs in einer Query via all_timeframes; sonst fixierter TF, der
+            # den `timeframe`-Filter uebernimmt). `agg_tf` = Aggregations-TF
+            # (Entscheidung 6a: 'auto' oder konkreter TF fuer das Zeitraster
+            # der generischen Heatmap). `range_from`/`range_to` = optionaler
+            # Zeitfilter (bar_time BETWEEN), Basis = letzter Datenpunkt.
+            "data_tf": "multi",
+            "agg_tf": "auto",
+            "range_preset": None,
+            "range_from": None,
+            "range_to": None,
+            # 21.03.12: Von set_data_tf() verwaltetes Flag - True = alle
+            # Timeframes in EINER Query (data_tf='multi'), False = fixierter
+            # TF. Separates Flag von heatmap_all_timeframes (21.01-Preset).
+            "all_timeframes": False,
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -262,6 +284,100 @@ class AnalyticsViewModel(QObject):
                         (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
                          QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
                          QUERY_FEATURES))
+
+    # ------------------------------------------------------------------
+    # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter
+    # ------------------------------------------------------------------
+    def set_data_tf(self, data_tf: str) -> None:
+        """Setzt die Analysequelle des MtfFilterBarWidget ('multi' | TF).
+
+        'multi'  -> alle Timeframes in EINER Query (`all_timeframes=True`,
+                    der `timeframe`-Filter entfaellt im Reader).
+        'M15' o.ae. -> Fixiert auf diesen TF: `all_timeframes=False` und der
+                    `timeframe`-Filter uebernimmt den fixierten TF (die UI
+                    synchronisiert combo_tf daraus).
+        """
+        data_tf = str(data_tf or "").strip() or "multi"
+        if data_tf == "multi":
+            if (self._params.get("data_tf") == "multi"
+                    and not self._params.get("all_timeframes")):
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            elif self._params.get("data_tf") != "multi":
+                self._params["data_tf"] = "multi"
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            return
+        # Fixiert auf einen konkreten TF.
+        tf = data_tf.upper()
+        changed = (self._params.get("data_tf") != tf
+                   or self._params.get("timeframe") != tf
+                   or self._params.get("all_timeframes"))
+        if not changed:
+            return
+        self._params["data_tf"] = tf
+        self._params["all_timeframes"] = False
+        self._params["timeframe"] = tf
+        self._mark_dirty()
+        self._refresh(_ALL_QUERIES)
+
+    def set_agg_tf(self, agg_tf: str) -> None:
+        """Setzt den Aggregations-TF (Entscheidung 6a: 'auto' | TF).
+
+        'auto' -> Granularitaet wird dynamisch aus dem Zeitraum abgeleitet
+                  (kein Zeit-Bucketing; Verhalten wie bisher).
+        'H1' o.ae. -> Die generische Heatmap fasst die date-Achse starr auf
+                  diesem TF-Raster zusammen (bucket_tf im Reader).
+        """
+        agg_tf = str(agg_tf or "").strip().lower() or "auto"
+        self._set_param("agg_tf", agg_tf, (QUERY_HEATMAP_GENERIC,))
+
+    def set_range(self, from_ts, to_ts, preset: Optional[str] = None) -> None:
+        """Setzt den Zeitraum-Filter (optional, bar_time BETWEEN).
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int) oder None (kein Filter).
+        `preset` ist der Range-Preset-Name des MtfFilterBarWidget (z. B.
+        '7d'/'YTD', None = Benutzerdefiniert) und wird fuer die Profil-
+        Persistenz gemerkt. Wird vom Range-Picker des MtfFilterBarWidget
+        gesetzt (Basis = letzter Datenpunkt statt time.time()).
+        """
+        f = int(from_ts) if from_ts is not None else None
+        t = int(to_ts) if to_ts is not None else None
+        preset = str(preset or "").strip() or None
+        if (f == self._params.get("range_from")
+                and t == self._params.get("range_to")
+                and preset == self._params.get("range_preset")):
+            return
+        self._params["range_from"] = f
+        self._params["range_to"] = t
+        self._params["range_preset"] = preset
+        self._mark_dirty()
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def clear_range(self) -> None:
+        """Entfernt den Zeitraum-Filter (kein Zeitfilter mehr)."""
+        self.set_range(None, None)
+
+    def latest_data_epoch(self) -> Optional[int]:
+        """Neuester Wanduhr-Epoch der Feature-Daten (Range-Referenzpunkt).
+
+        Delegiert lesend an das Repository (`fetch_latest_bar_time` fuer das
+        aktuelle Symbol/Timeframe) – der `now_provider` des MtfFilterBarWidget
+        rechnet die Presets relativ zum letzten Datenpunkt statt zu
+        time.time(). Defensiv: ohne Symbol/Timeframe oder bei Fehler -> None
+        (das Widget faellt dann auf time.time() zurueck).
+        """
+        symbol = str(self._params.get("symbol") or "")
+        timeframe = str(self._params.get("timeframe") or "")
+        if not symbol or not timeframe:
+            return None
+        try:
+            return self._repo.get_latest_bar_time(symbol, timeframe)
+        except Exception:
+            return None
 
     def set_feature_id(self, feature_id: Optional[str]) -> None:
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
@@ -739,6 +855,10 @@ class AnalyticsViewModel(QObject):
             # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
             # Stale-Payloads (Queries vor dem letzten Restore).
             "restore_generation": self._restore_generation,
+            # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter
+            # (Wanduhr-Epochs relativ zum letzten Datenpunkt; None = alle).
+            "from_ts": p.get("range_from"),
+            "to_ts": p.get("range_to"),
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -756,8 +876,16 @@ class AnalyticsViewModel(QObject):
             base["agg"] = p["heatmap_agg"]
             # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
             # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
+            # 21.03.12: OR-verknuepft mit `all_timeframes` (data_tf='multi' -
+            # Analysequelle des MtfFilterBarWidget uebernimmt die Freigabe).
             base["all_timeframes"] = bool(
-                p.get("heatmap_all_timeframes", False))
+                p.get("heatmap_all_timeframes", False)
+                or p.get("all_timeframes", False))
+            # 21.03.12 (Entscheidung 6a): agg_tf -> bucket_tf fuer das
+            # date-Raster der generischen Heatmap ('auto'/leer = kein
+            # Bucketing, dynamische Granularitaet wie bisher).
+            _agg_tf = str(p.get("agg_tf") or "auto").strip().lower()
+            base["bucket_tf"] = None if _agg_tf in ("", "auto") else _agg_tf
             # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
             # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
             # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
@@ -1062,6 +1190,16 @@ class AnalyticsViewModel(QObject):
                 # Profil-Payload persistieren (Replace-Semantik beim
                 # Restore: fehlt der Key -> garantiert leer, B3-2).
                 "instance_hashes": list(p.get("instance_hashes") or []),
+                # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand
+                # (data_tf/agg_tf/range) im Profil persistieren - die
+                # Analysequelle, die Aggregations-TF und der Zeitraum des
+                # MtfFilterBarWidget werden beim Profilwechsel restauriert.
+                "data_tf": p.get("data_tf"),
+                "agg_tf": p.get("agg_tf"),
+                "range_preset": p.get("range_preset"),
+                "range_from": p.get("range_from"),
+                "range_to": p.get("range_to"),
+                "all_timeframes": p.get("all_timeframes"),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),

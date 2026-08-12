@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_view_model import AnalyticsViewModel
 from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.engine.feature_store_reader import FeatureStoreReader
+from chart.widgets.mtf_filter_bar import MtfFilterBarWidget
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -73,6 +74,13 @@ from serviceui.symbols_win import SymbolsWindow
 # Timeframes ohne Feature-Store-Daten werden in der Combo ausgegraut
 # (_refresh_timeframe_combo) und sind nicht auswaehlbar.
 TIMEFRAMES = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+
+# 21.03.12 (MTF-FC auf Analytics): TF-Listen des MtfFilterBarWidget –
+# 11 Analytics-Timeframes (M1..MN1) statt der 6 Chart-Defaults. `data_tf`
+# (Analysequelle: Multi oder fixierter TF) und `agg_tf` (Aggregations-TF,
+# Entscheidung 6a: Auto oder fixierter TF) sind unabhaengige Dropdowns.
+MTF_DATA_TF_OPTIONS = ["🌐 Multi"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
+MTF_AGG_TF_OPTIONS = ["⚡ Auto"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
 
 # Fenstertitel (Option B: '*' = ungespeicherte Parametertrends).
 WINDOW_TITLE_BASE = "PyTrader - Analytics"
@@ -357,6 +365,22 @@ class AnalyticsWindow(PersistentWindow):
         filt.addStretch(1)
         root.addLayout(filt)
 
+        # --- 21.03.12 (MTF-FC auf Analytics): Filterleiste des MtfFilterBarWidget ---
+        # Data-TF (Analysequelle: Multi/fixiert), Agg-TF (Aggregations-TF,
+        # Entscheidung 6a), Range-Picker, Sortierung + View-Templates.
+        # now_provider = letzter Datenpunkt (MAX(bar_time)) statt time.time(),
+        # damit Range-Presets relativ zum letzten Signal rechnen. Der
+        # Chart-Modus wird auf '🔒 Fix' gesetzt, damit das Agg-TF-Dropdown
+        # sofort aktiv ist (im Chart gated '⚡ Auto' das Agg-Dropdown).
+        self.mtf_bar = MtfFilterBarWidget(
+            data_tf_options=MTF_DATA_TF_OPTIONS,
+            agg_tf_options=MTF_AGG_TF_OPTIONS,
+            now_provider=self._vm.latest_data_epoch,
+            parent=self,
+        )
+        self.mtf_bar.set_chart_mode("fix")
+        root.addWidget(self.mtf_bar)
+
         # --- Body: Sidebar + Seiten (QStackedWidget) ---
         body = QHBoxLayout()
         # 10.08.2026 (Bugfix, UI-Splitter): Sidebar (links) und Seiten-Stack
@@ -579,6 +603,9 @@ class AnalyticsWindow(PersistentWindow):
             print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
         self._sync_profile_filters()
         self._sync_service_filter_button()
+        # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand nach einem
+        # Profil-/Workspace-Restore synchronisieren (data_tf/agg_tf/Range).
+        self._sync_mtf_bar_from_params()
 
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
@@ -644,9 +671,20 @@ class AnalyticsWindow(PersistentWindow):
         # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
         # automatisch neu laden. `refresh_all` ist im VM debounced.
         event_bus.service_set_changed.connect(self._on_service_set_changed)
-        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # 21.03.11/12 (MTF-FC): Sortier-Aenderung der Filterleiste (Analytics)
         # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
         event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+        # 21.03.12 (MTF-FC auf Analytics): MtfFilterBarWidget-Signale -> VM.
+        self.mtf_bar.data_tf_changed.connect(self._on_mtf_data_tf_changed)
+        self.mtf_bar.agg_tf_changed.connect(self._vm.set_agg_tf)
+        self.mtf_bar.range_changed.connect(self._on_mtf_range_changed)
+        # Sortierung der MTF-FC-Filterleiste ueber den bestehenden EventBus
+        # an die TablePage (set_external_sort_mode, IoC).
+        self.mtf_bar.sort_mode_changed.connect(
+            event_bus.mtf_fc_sort_changed.emit)
+        # Filterleisten-Zustand aus den VM-Params initial synchronisieren
+        # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
+        self._sync_mtf_bar_from_params()
 
     @Slot()
     def _on_service_set_changed(self) -> None:
@@ -666,11 +704,12 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot(str)
     def _on_mtf_fc_sort_changed(self, mode: str) -> None:
-        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+        """21.03.11/12 (MTF-FC): Sortier-Aenderung auf die TablePage anwenden.
 
-        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
-        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
-        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        Die MTF-FC-Filterleiste (AnalyticsWindow) emittiert
+        `event_bus.mtf_fc_sort_changed` ('date' | 'signal' | 'tf'). Die
+        TablePage setzt daraufhin ihre Anzeige-Sortierung entsprechend
+        (IoC, kein Fenster-Know-how).
         """
         if getattr(self, "table_page", None) is None:
             return
@@ -678,6 +717,44 @@ class AnalyticsWindow(PersistentWindow):
             self.table_page.set_external_sort_mode(str(mode))
         except Exception as e:
             print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
+
+    @Slot(str)
+    def _on_mtf_data_tf_changed(self, data_tf: str) -> None:
+        """21.03.12: Analysequelle des MtfFilterBarWidget uebernehmen.
+
+        `set_data_tf` setzt bei fixiertem TF auch den `timeframe`-Filter
+        (Analysequelle = Analyse-TF) - die Timeframe-Combo wird dann
+        synchronisiert (Muster set_data_tf-Docstring).
+        """
+        self._vm.set_data_tf(str(data_tf))
+        if str(data_tf).strip().lower() != "multi":
+            self._sync_profile_filters()
+
+    @Slot(str, int, int)
+    def _on_mtf_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
+        """21.03.12: Zeitraum-Preset des MtfFilterBarWidget uebernehmen."""
+        self._vm.set_range(int(from_ts), int(to_ts), str(preset))
+
+    def _sync_mtf_bar_from_params(self) -> None:
+        """Synchronisiert die MTF-FC-Filterleiste aus den VM-Params.
+
+        Wird nach Profil-/Workspace-Restore (params_restored) und initial
+        nach _wire_controls gerufen. `apply_external_state` setzt die Combos
+        mit blockSignals und emittiert die Aenderungs-Signale danach explizit
+        (der VM dedupliziert gleiche Werte, kein Doppel-Refresh).
+        """
+        bar = getattr(self, "mtf_bar", None)
+        if bar is None:
+            return
+        p = self._vm.params
+        try:
+            bar.apply_external_state(
+                data_tf=str(p.get("data_tf") or "multi"),
+                agg_tf=str(p.get("agg_tf") or "auto"),
+                range_preset=p.get("range_preset"),
+            )
+        except (RuntimeError, AttributeError):
+            pass
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:
