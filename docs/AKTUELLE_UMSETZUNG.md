@@ -1117,4 +1117,4 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   20.03-Tests, Qt-offscreen-Artefakte) mit und ohne die Aenderung; die 21.03.14-
   Aenderung fuegt KEINE neuen FAILs hinzu.
 
-- **Commit:** folgt im naechsten Schritt
+- **Commit:** `1ed270c`
