@@ -30,8 +30,9 @@
 ## 🎯 1. Kern-Anforderungen
 
 1. **Bloat-Analyse:** Startup-Anzeige auf `MainWindow` unter Optionen-Button via `PRAGMA database_size`.
-2. **Vacuum Execution:** Button `[ 🧹 DB Service (VACUUM) ]` in `PropertiesWindow` führt `VACUUM;` aus.
-3. **Concurrency-Guard:** `VACUUM` sperren, solange `_sync_pause_count > 0` (laufende Scans/Worker).
+2. **DB-Pflege beim App-Exit:** `main.py` `closeEvent` führt für jede DB-Datei `CHECKPOINT;` **gefolgt von** `VACUUM;` aus (WAL-Flush, konsistenter Zustand – keine Datei-Verkleinerung).
+3. **Kompaktierung (Button):** Button `[ 🧹 DB Service ]` in `PropertiesWindow` führt die **`COPY FROM DATABASE`-Kompaktierung** aus (echte Verkleinerung, Bloat entfernen). **Nicht** `VACUUM`-Button.
+4. **Concurrency-Guard:** Kompaktierung sperren, solange `_sync_pause_count > 0` (laufende Scans/Worker) – Zugriff über **EventBus-Zähler** (konsistent zu Phase 16, nicht `self.parent()`).
 
 ---
 
@@ -39,10 +40,11 @@
 
 ### Schritt 1: Core Engine (`db/db_utils.py`)
 
-Füge folgende Funktionen in `db/db_utils.py` ein:
+Füge folgende Funktionen in `db/db_utils.py` ein (**korrigierte Fassung, Stand 12.08.2026** – F1: `res[2]/res[4]`, F2: CHECKPOINT+VACUUM, `copy_database`-Helper):
 
 # db/db_utils.py
 import os
+from pathlib import Path
 from db.db_pool import DbPool
 
 def get_db_fragmentation_info(db_path: str) -> dict:
@@ -52,7 +54,9 @@ def get_db_fragmentation_info(db_path: str) -> dict:
     try:
         con = DbPool.get(db_path)
         res = con.execute("PRAGMA database_size;").fetchone()
-        block_size, used_blocks = (res[1], res[3]) if res else (262144, 0)
+        # Spalten: 0 database_name, 1 database_size, 2 block_size,
+        #          3 total_blocks, 4 used_blocks, 5 free_blocks, ...
+        block_size, used_blocks = (res[2], res[4]) if res else (262144, 0)
         netto_bytes = used_blocks * block_size
         bloat_bytes = max(0, file_bytes - netto_bytes)
         return {
@@ -64,46 +68,75 @@ def get_db_fragmentation_info(db_path: str) -> dict:
         return {"pct": 0, "bloat_mb": 0, "size_mb": round(file_bytes / (1024 * 1024), 1)}
 
 def execute_db_vacuum(db_path: str) -> None:
+    """DB-Pflege beim App-Exit (Stufe 1): CHECKPOINT gefolgt von VACUUM.
+
+    CHECKPOINT flusht die WAL in die Hauptdatei (konsistenter Zustand);
+    VACUUM ist in DuckDB ohne Dateigrößen-Effekt (Kompaktierung siehe
+    copy_database).
+    """
     con = DbPool.get(db_path)
+    con.execute("CHECKPOINT;")
     con.execute("VACUUM;")
+
+def copy_database(src_db_path: str, dst_db_path: str) -> None:
+    """Kompaktierung (Stufe 2): COPY FROM DATABASE in frische, minimale Datei.
+
+    Katalogname der Quelle = Datei-Basename ohne .duckdb (ggf. gequotet).
+    dst_db_path sollte ein absoluter Pfad sein (BASE_DIR-basiert).
+    """
+    con = DbPool.get(src_db_path)
+    src_catalog = Path(src_db_path).stem  # z. B. 'analytics'
+    con.execute(f"ATTACH '{dst_db_path}' AS new_db")
+    con.execute(f'COPY FROM DATABASE "{src_catalog}" TO new_db')
+    con.execute("DETACH new_db")
 
 ---
 
-### Schritt 2: Startup Status (`main.py`)[cite: 1]
-Beim App-Start in `main.py` aufrufen und UI-Label unter Optionen-Button befüllen:
-
+### Schritt 2: Startup Status (`main.py`)
+Beim App-Start in `main.py` aufrufen und UI-Label unter Optionen-Button befüllen (absoluter Pfad via `BASE_DIR`):
 
 # main.py
 from db.db_utils import get_db_fragmentation_info
 
-info = get_db_fragmentation_info("data/analytics.duckdb")
-# UI-Label setzen (z. B. label_db_status)
+info = get_db_fragmentation_info(str(BASE_DIR / "data" / "analytics.duckdb"))
+# UI-Label setzen (label_db_status – in ui/main_win.ui ergänzen oder per Code erzeugen)
 self.label_db_status.setText(f"DB Status: {info['pct']}% fragmentiert ({info['bloat_mb']} MB frei)")
 
 ---
 
-### Schritt 3: UI & Concurrency Guard (`properties_win.py`)[cite: 1]
-Button `[ 🧹 DB Service (VACUUM) ]` einbauen und mit Concurrency Guard schützen:
-
+### Schritt 3: UI, Concurrency-Guard & Kompaktierung (`properties_win.py`)
+Button `[ 🧹 DB Service ]` in `PropertiesWindow` für die **Kompaktierung** (COPY FROM DATABASE) einbauen. Guard über den **EventBus-Zähler** (konsistent zu Phase 16; NICHT `self.parent()`, da `PersistentWindow` kein Qt-Parent hat):
 
 # properties_win.py
-from db.db_utils import execute_db_vacuum, get_db_fragmentation_info
+from pathlib import Path
+from config.event_bus import event_bus
+from db.db_utils import copy_database
+
+BASE_DIR = Path(__file__).resolve().parent
 
 def _on_btn_vacuum_clicked(self) -> None:
-    # Concurrency-Guard
-    if getattr(self.parent(), "_sync_pause_count", 0) > 0:
-        print("⚠️ VACUUM gesperrt: Scans/Worker laufen aktuell.")
+    # Concurrency-Guard über EventBus-Zähler (MainWindow aktualisiert ihn
+    # in service_run_started/finished; Eigentum: Phase-16-Referenzzähler)
+    if getattr(event_bus, "sync_pause_count", 0) > 0:
+        print("⚠️ DB-Service gesperrt: Scans/Worker laufen aktuell.")
         return
 
-    execute_db_vacuum("data/analytics.duckdb")
-    execute_db_vacuum("data/market_data.duckdb")
-    print("✅ DB Vacuum erfolgreich ausgeführt.")
+    # Kompaktierung analytics + market_data (absolute Pfade, BASE_DIR)
+    copy_database(str(BASE_DIR / "data" / "analytics.duckdb"),
+                  str(BASE_DIR / "data" / "analytics_compacted.duckdb"))
+    copy_database(str(BASE_DIR / "data" / "market_data.duckdb"),
+                  str(BASE_DIR / "data" / "market_data_compacted.duckdb"))
+    # Datei-Ersatz NUR bei geschlossenen DbPool-Verbindungen (Windows File-Lock!)
+    # → Verbindungen schliessen/neu öffnen (DbPool-Methode), alte Datei löschen,
+    #   kompakte Datei umbenennen, DB erneut öffnen.
+    print("✅ DB-Kompaktierung erfolgreich ausgeführt.")
 
 ---
 
-## 📊 3. Akzeptanzkriterien (`test/test.py`)[cite: 1]
-1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück[cite: 1].
-2. `execute_db_vacuum()` schließt fehlerfrei ab[cite: 1].
+## 📊 3. Akzeptanzkriterien (`test/test.py`)
+1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück.
+2. `execute_db_vacuum()` (CHECKPOINT + VACUUM) schließt fehlerfrei ab und erzeugt eine konsistente Datei (kein WAL-Replay beim nächsten Öffnen).
+3. `copy_database(src, dst)`-Helper (Kompaktierung): Kopie ist kleiner als die Bloat-Datei und enthält Schema + Daten vollständig (headless-Test wie `test/check_copy_database.py`).
 
 ---
 
@@ -141,8 +174,9 @@ def _on_btn_vacuum_clicked(self) -> None:
 | Umsetzung allgemein | ⏸️ **Zurückgestellt:** Kein Coding jetzt |
 
 ### 4.5 Ergänzungen (bei späterer Umsetzung zu beachten)
-- `db/db_utils.py`: fehlendes `import os` im Snippet beachten; `DbPool`-Import ist innerhalb des `db`-Pakets zulässig (Basis-Schicht E4 bleibt sonst ohne Projekt-Import).
-- Markdown-Artefakte `[cite: 1]` im Kapitel bereinigen.
+- `db/db_utils.py`: `import os` (für `get_db_fragmentation_info`) und `from pathlib import Path` (für `copy_database`) im Snippet ergänzt; `DbPool`-Import ist innerhalb des `db`-Pakets zulässig (Basis-Schicht E4 bleibt sonst ohne Projekt-Import).
+- ✅ **Markdown-Artefakte `[cite: 1]` im Kapitel bereinigt** (12.08.2026, Abschnitte 2/3).
+- ✅ **Umsetzungsplan nachgezogen** (12.08.2026): Schritt 1–3 + AK entsprechen jetzt der F2-Lösung (CHECKPOINT+VACUUM, COPY FROM DATABASE, EventBus-Guard, `res[2]/res[4]`).
 - AK2-Formulierung folgt der F2-Lösung (siehe 4.6): `CHECKPOINT`/`VACUUM` allein verkleinern die Datei nicht – die **Kompaktierung** leistet `COPY FROM DATABASE`.
 
 ### 4.6 Lösungsweg F2: DB-Pflege beim App-Exit + Kompaktierung per COPY FROM DATABASE
@@ -164,8 +198,8 @@ VACUUM;       -- formale Defragmentierung (in DuckDB 1.5.5 ohne Dateigrößen-Ef
 Für eine echte Verkleinerung (Bloat entfernen) wird die Datenbank in eine frische, minimale Datei übertragen:
 
 ```sql
--- 1. Neue, leere Datenbank-Datei anheften
-ATTACH 'data/analytics_compacted.duckdb' AS new_db;
+-- 1. Neue, leere Datenbank-Datei anheften (absoluter Pfad, BASE_DIR-basiert!)
+ATTACH 'C:/Pfad/zum/Projekt/data/analytics_compacted.duckdb' AS new_db;
 
 -- 2. Alle Daten/Schema/Indizes in die neue DB kopieren (lückenlose Datei)
 --    WICHTIG: korrekte DuckDB-Syntax = COPY FROM DATABASE <src> TO <dst>
@@ -177,8 +211,10 @@ DETACH new_db;
 
 * Danach wird im Dateisystem die alte `analytics.duckdb` durch die kompakte `analytics_compacted.duckdb` ersetzt (Löschen/Umbenennen).
 * **Katalogname:** entspricht dem Datei-Basename ohne `.duckdb` (z. B. `analytics` für `analytics.duckdb`, `market_data` für `market_data.duckdb`). Bei Sonderzeichen (führender Unterstrich o. Ä.) ist der Katalogname in doppelte Anführungszeichen zu setzen: `COPY FROM DATABASE "_copy_src" TO new_db`.
-* **Empirisch verifiziert** (headless, `test/check_copy_database.py`, nur Test-Dateien): Reduktion **85,4 %** gegen Bloat; Schema, Tabellen, Constraints und Daten werden **vollständig** übertragen (PASS).
-* **Guard:** Kompaktierung nur bei `_sync_pause_count == 0` (keine laufenden Scans/Worker); sinnvoller Einstieg: der `[ 🧹 DB Service ]`-Button in `PropertiesWindow`.
+* **⚠️ Windows File-Locking:** Der Datei-Ersatz (alte Datei löschen/umbenennen) funktioniert **nur**, wenn **alle offenen DbPool-Verbindungen** zu dieser DB geschlossen sind – sonst wirft Windows `PermissionError` (Datei in Verwendung). Ablauf: (1) `copy_database()` ausführen, (2) **DbPool-Verbindung schliessen/leeren** (Methode in `db/db_pool.py`), (3) alte Datei löschen, (4) kompakte Datei umbenennen, (5) DB neu öffnen. Kein laufender Scan/Worker darf zugreifen (Guard `_sync_pause_count == 0`).
+* **⚠️ Absoluter Pfad:** `ATTACH`/`copy_database` immer mit **absolutem Pfad** (`BASE_DIR / "data" / ...`) aufrufen – relative Pfade hängen vom CWD ab (Desktop-Start vs. IDE unterscheidet sich).
+* **Empirisch verifiziert** (headless, `test/check_copy_database.py`, nur Test-Dateien): Reduktion **85,4 %** gegen Bloat (Testfall mit vollständig gelöschten Daten); Schema, Tabellen, Constraints und Daten werden **vollständig** übertragen (PASS). Die reale Reduktion hängt vom tatsächlichen Bloat ab.
+* **Guard:** Kompaktierung nur bei `_sync_pause_count == 0` (keine laufenden Scans/Worker); sinnvoller Einstieg: der `[ 🧹 DB Service ]`-Button in `PropertiesWindow` (nur Kompaktierung; App-Exit macht CHECKPOINT+VACUUM).
 
 #### Akzeptanzkriterien (angepasst an F2-Lösung)
 1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück.
