@@ -821,3 +821,82 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   (offscreen-Render-Artefakt) - logische Koordinaten maßgeblich.
 
 - **Commit:** `5194107`
+
+---
+
+# 21.03.12 - Architektur-Korrektur: MTF-FC-Ziel = Analytics (nicht Chart) (12.08.2026, Stand: Analyse & Entscheidung)
+
+> **Anwender-Feststellung (12.08.2026):** Kapitel 21.03 (MTF-FC) ist **ausschliesslich** fuer das
+> `AnalyticsWindow` (`analytics_win.py`) gedacht und macht zusaetzlich im `ServiceWindow`
+> (`service_win.py`) Sinn - **niemals im Chart-Fenster**, das bereits vollstaendig und perfekt
+> implementiert ist. Die bisherige Umsetzung (Commits `4425bc9`, `5194107`) hat das Widget
+> fehlerhaft in `chart/chart_win.py` verbaut.
+>
+> **Stand:** Nur Doku/Analyse (kein Coding). Wartet auf den expliziten Startschuss des Anwenders.
+
+## ?? 1. Befund (Code-verifiziert)
+
+1. **21.03 ist umgesetzt, aber im falschen Fenster:** Das `MtfFilterBarWidget`, die Engine-Module
+   (`mtf_fc_*`) und die JS-Layer (`07_mtf_fc.js`, `08_mtf_layers.js`, `09_mtf_axis.js`) wurden in
+   das Chart-Fenster integriert statt in das Analytics-Fenster.
+2. **Fehlende Imports in `chart/chart_win.py`:** Die MTF-FC-Klassen werden ohne Import referenziert
+   (`MtfFcProvider`, `MtfFcBoundary`, `default_mtf_fc_state`, `MtfFilterBarWidget`,
+   `evaluate_cascade`, `apply_transition`) - `NameError` beim Oeffnen eines Chart-Fensters
+   (Z. 337/338/340/495/1800/1812). `import chart.chart_win` bestaetigt: alle Namen fehlen im Modul.
+3. **Revert-Ziel verifiziert:** `chart/chart_win.py` ist zwischen `4217e71` (Stand vor 21.03) und
+   HEAD **+416/-2** - ausschliesslich 21.03-Adds + Bug-2-Refactor (Cascade-Viewport). Ein Revert
+   auf `4217e71` ist verlustfrei (kein Nicht-21.03-Verlust).
+4. **JS-Hooks additiv:** `chart/js/04_live_updates.js` enthaelt nur optionale, guarded Hooks
+   (`try { if (window._onMtfFc... ) }`) - ausschliesslich 21.03, sauber zuruecknehmbar.
+5. **Widget ist chart-frei:** `chart/widgets/mtf_filter_bar.py` importiert nur `analytics.engine.*` -
+   architektonisch problemlos nach `analytics_win` verschiebbar. Die Ablage unter `chart/widgets/`
+   war der einzige Fehlgriff.
+
+## ?? 2. Entscheidung 6(a) - Semantik-Vertrag fuer Analytics (fixiert)
+
+> Zu klären war: Woher nimmt `chart_tf` im Analytics-Kontext den konkreten Timeframe, wenn
+> `chart_tf_changed` nur `'auto' | 'fix'` emittiert? **Entscheidung des Anwenders: 6(a).**
+
+- **`data_tf` (Analysequelle / Filter):** Steuert `WHERE timeframe IN (...)`. `Multi` =
+  `all_timeframes=True` (21.01 E1, bereits implementiert in Reader/Worker), `Fixiert auf [M15]` =
+  `timeframe='M15'`.
+- **`chart_tf` (Anzeige-/Aggregations-Ebene):** `Auto` = Granularitaet dynamisch an den Range
+  anpassen (neue Reader-Logik, Zeit-Bucketing); `Fix` = **eigenes zweites TF-Dropdown**
+  (Aggregations-TF, unabhaengig von `data_tf`). Das bestehende `chart_tf`-Combo liefert nur
+  `'auto'|'fix'` - der konkrete TF kommt aus dem **neuen separaten Aggregations-TF-Dropdown**.
+- **Range:** Presets (`24h`/`7d`/`30d`/`YTD`) relativ zum **letzten Datenpunkt** (`MAX(bar_time)`
+  der feature_store-Daten) statt `time.time()` (im Chart ok, im Analytics koennten die letzten
+  Signale Tage alt sein -> leere Ergebnisse).
+- **Sort:** bestehende EventBus-Kette (`event_bus.mtf_fc_sort_changed` ->
+  `table_page.set_external_sort_mode`) - kein neuer Code.
+- **Nicht verdrahten im Analytics:** Guard-Override/Geister-Marker/Session-Farbbalken
+  (chart-spezifisch, 21.03.09). Sessions: Prio 2 (kein Session-Konzept im `feature_store_reader`).
+- **Templates:** Persistenz via `AnalyticsProfileRepository` (neue Sektion, z. B. `filters`);
+  `MtfFcTemplateStore` ist aktuell nur in-memory.
+- **TF-Liste:** `DATA_TF_OPTIONS` (6 Eintraege: Multi/M1/M5/M15/H1/H4) vs. Analytics-`TIMEFRAMES`
+  (11: M1..MN1) - fuer Analytics konfigurierbar erweitern.
+
+## ?? 3. Umsetzungsplan (wartet auf Startschuss)
+
+1. **Chart-Revert (1 Vorgang):**
+   ```
+   git checkout 4217e71 -- chart/chart_win.py chart/chart_basics.py chart/js/04_live_updates.js
+   git rm chart/js/07_mtf_fc.js chart/js/08_mtf_layers.js chart/js/09_mtf_axis.js
+   ```
+   Nicht anfassen: `mtf_filter_bar.py`, `mtf_fc_*`, `event_bus.py`, `analytics_win.py`,
+   `table_page.py`, `heatmap_widget.py`.
+2. **Analytics-Integration:** `MtfFilterBarWidget` in `analytics_win._build_ui()` (Filter-Zeile),
+   Signal-Verdrahtung (data_tf/chart_tf/range/template -> VM), `AnalyticsViewModel`-Parameter
+   (`data_tf`, `chart_tf`/`agg_tf`, `range_from`, `range_to`), `analytics_repository`-Option
+   `from_ts`/`to_ts`, Aggregations-TF-Dropdown fuer `Fix` (6a).
+3. **service_win (eigener Schritt, reduziert):** nur `data_tf` (Multi <-> `ALLE Timeframes`-Sentinel,
+   U15-E) + optional Range; keine Sort/Sessions/Templates.
+4. **Doku:** 21.03-Kapitel in `docs/AKTUELLE_UMSETZUNG.md` auf Analytics-Ziel ausrichten.
+
+## ?? 4. Verifikation (headless, Grundsatz 2)
+
+- `py_compile` aller geaenderten Dateien; `import chart.chart_win` (kein GUI-Start);
+  `node --check` fuer die JS-Ruecknahme; Logik-/DB-Tests in `test/test.py`.
+- Keine UI-/Regressionstests (harte Regel).
+
+- **Commit:** `-` (nur Doku; Coding erst nach Startschuss)
