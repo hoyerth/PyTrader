@@ -639,20 +639,45 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
-        # 06.08.2026 (Punkt 5): Limit-Textfeld -> ViewModel. Der Default
-        # (App-Optionen 'Statistik-Signale') wird beim Start gesetzt, damit
-        # Feld und VM-Parameter konsistent sind.
-        self.edit_limit.textChanged.connect(self._on_limit_text_changed)
-        self._vm.set_limit(self._default_limit)
-        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
-        self.btn_profile_new.clicked.connect(self._on_profile_new)
-        self.btn_profile_save.clicked.connect(self._on_profile_save)
-        self.btn_profile_delete.clicked.connect(self._on_profile_delete)
-        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
-        self.sidebar.currentRowChanged.connect(self._on_page_changed)
-        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
-        self._refresh_symbol_combo()
-        self._refresh_timeframe_combo()
+        # 21.03.11 (Bug 3): Nach abgeschlossenem Service-Run (der Worker
+        # emittiert `service_set_changed` einmalig nach der ALLE-TFs-/
+        # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
+        # automatisch neu laden. `refresh_all` ist im VM debounced.
+        event_bus.service_set_changed.connect(self._on_service_set_changed)
+        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
+        event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+
+    @Slot()
+    def _on_service_set_changed(self) -> None:
+        """21.03.11 (Bug 3): Nach abgeschlossenem Service-Run neu laden.
+
+        Der `ServiceRunWorker` emittiert `event_bus.service_set_changed`
+        genau einmal nach Abschluss der Ausfuehrung (auch bei Teilerfolg).
+        `refresh_all()` ist im ViewModel debounced (kein SQL-Feuer) und
+        stösst die aktiven Seiten-Queries (Tabelle/Heatmap) neu an.
+        """
+        if getattr(self, "_vm", None) is None:
+            return
+        try:
+            self._vm.refresh_all()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] service_set_changed-Refresh: {e}")
+
+    @Slot(str)
+    def _on_mtf_fc_sort_changed(self, mode: str) -> None:
+        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+
+        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
+        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
+        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        """
+        if getattr(self, "table_page", None) is None:
+            return
+        try:
+            self.table_page.set_external_sort_mode(str(mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:

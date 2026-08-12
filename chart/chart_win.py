@@ -339,6 +339,15 @@ class PyTraderChartWindow(QMainWindow):
         self._mtf_fc_context = None  # PluginContext wird lazy je Aufruf erzeugt
         self._mtf_fc_ns: Dict[str, Any] = default_mtf_fc_state()
         self._mtf_fc_last_viewport: Optional[Tuple[int, int]] = None
+        # 21.03.11 (Bug 2): Pending-Viewport-Epochs nach einem Kaskaden-TF-
+        # Wechsel. Die persistierten `visible_from/visible_to` sind Bar-Offsets
+        # des ALTEN TF-Fensters (H1) und dürfen NICHT auf das neue Fenster
+        # (z. B. M5) angewendet werden (sonst zeigt der Chart einen winzigen
+        # Ausschnitt und die Kaskade springt direkt weiter). Stattdessen wird
+        # der Zeitbereich des auslösenden Viewports (Wanduhr-Epochs) beim
+        # Refresh beibehalten und in logische Indizes des neuen Fensters
+        # übersetzt (`_resolve_epoch_logical_range`).
+        self._mtf_fc_pending_epochs: Optional[Tuple[int, int]] = None
 
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
@@ -492,6 +501,12 @@ class PyTraderChartWindow(QMainWindow):
         self.mtf_filter_bar.chart_tf_changed.connect(self._on_mtf_fc_chart_tf_changed)
         self.mtf_filter_bar.range_changed.connect(self._on_mtf_fc_range_changed)
         self.mtf_filter_bar.guard_override_requested.connect(self._on_mtf_fc_guard_override_requested)
+        # 21.03.11 (Bug 6): Fehlende Verdrahtung nachgerüstet – Sortierung,
+        # Session-Filter und Template-Anwendung waren als UI vorhanden, aber
+        # nicht an die Logik angebunden (Dropdowns/Buttons wirkungslos).
+        self.mtf_filter_bar.sort_mode_changed.connect(self._on_mtf_fc_sort_mode_changed)
+        self.mtf_filter_bar.sessions_changed.connect(self._on_mtf_fc_sessions_changed)
+        self.mtf_filter_bar.template_applied.connect(self._on_mtf_fc_template_applied)
         self.mtf_filter_bar.refresh_templates()
 
         self.web_view = QWebEngineView()
@@ -1054,8 +1069,19 @@ class PyTraderChartWindow(QMainWindow):
 
         # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
         # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
-        range_from, range_to = self._resolve_visible_logical_range(
-            len(continuous_candles))
+        # 21.03.11 (Bug 2): Nach einem Kaskaden-TF-Wechsel (z. B. H1 -> M5)
+        # werden die auslösenden Viewport-EPOCHS beibehalten, statt die
+        # Bar-Offsets des alten TF-Fensters auf das neue Fenster anzuwenden
+        # (die Offsets sind fensterspezifisch -> winziger/verrutschter
+        # Ausschnitt, Kaskade würde sofort weiter springen).
+        if self._mtf_fc_pending_epochs is not None:
+            vp_from, vp_to = self._mtf_fc_pending_epochs
+            self._mtf_fc_pending_epochs = None
+            range_from, range_to = self._resolve_epoch_logical_range(
+                continuous_candles, vp_from, vp_to)
+        else:
+            range_from, range_to = self._resolve_visible_logical_range(
+                len(continuous_candles))
         if range_from is not None and range_to is not None:
             update_package["rangeFrom"] = range_from
             update_package["rangeTo"] = range_to
@@ -1210,6 +1236,80 @@ class PyTraderChartWindow(QMainWindow):
         f = max(0, min(vf, total - 1))
         t = max(f + 1, min(vt, total))
         return f, t
+
+    def _resolve_epoch_logical_range(
+        self, candles: List[Dict[str, Any]],
+        from_epoch: Optional[int], to_epoch: Optional[int]):
+        """21.03.11 (Bug 2): Übersetzt einen Zeitbereich (Wanduhr-Epochs) in
+        logische Indizes des aktuellen Tier-1-Fensters.
+
+        Nach einem Kaskaden-TF-Wechsel wird der auslösende Viewport-Zeitbereich
+        beibehalten (statt der fensterspezifischen Bar-Offsets). Die konti-
+        nuierlichen Candle-Zeiten werden über `_time_cont_to_real` auf echte
+        Epochs gemappt und per Binärsuche in Indizes übersetzt.
+
+        Args:
+            candles: Tier-1-Kerzen (kontinuierliche Zeiten).
+            from_epoch/to_epoch: Zeitbereich als Wanduhr-Epochs.
+
+        Returns:
+            (range_from, range_to) als ints oder (None, None).
+        """
+        if not candles:
+            return None, None
+        if from_epoch is None or to_epoch is None:
+            return None, None
+        try:
+            from_epoch, to_epoch = int(from_epoch), int(to_epoch)
+        except (TypeError, ValueError):
+            return None, None
+        # Zeitbereich -> kontinuierliche Zeiten (Binärsuche auf cont-Keys).
+        # _time_cont_to_real mappt cont -> real (bijektiv, monoton steigend,
+        # Invariante 7). Die reale Epoch ist in cont monoton wachsend, daher
+        # ist die Binärsuche auf den sortierten cont-Keys korrekt.
+        if not self._time_cont_to_real:
+            return None, None
+        cont_keys = sorted(self._time_cont_to_real.keys())
+        if not cont_keys:
+            return None, None
+        f_cont = self._epoch_to_cont(cont_keys, from_epoch)
+        t_cont = self._epoch_to_cont(cont_keys, to_epoch)
+        if f_cont is None or t_cont is None:
+            return None, None
+        # Kontinuierliche Zeiten -> Indizes im Tier-1-Fenster.
+        f_idx, t_idx = 0, len(candles) - 1
+        for i, c in enumerate(candles):
+            if int(c["time"]) >= f_cont:
+                f_idx = i
+                break
+        for i in range(len(candles) - 1, -1, -1):
+            if int(candles[i]["time"]) <= t_cont:
+                t_idx = i
+                break
+        if t_idx < f_idx:
+            t_idx = f_idx
+        return f_idx, t_idx
+
+    def _epoch_to_cont(self, cont_keys: List[int], epoch: int) -> Optional[int]:
+        """Binärsuche: kontinuierliche Zeit für einen Wanduhr-Epoch.
+
+        Liefert den cont-Key, dessen reale Epoch am nächsten unterhalb der
+        gesuchten liegt (obere Schranke), damit der Viewport den Zeitbereich
+        inklusive der linken Kante abdeckt. Liegt die gesuchte Epoch vor dem
+        ersten Datenpunkt, wird der erste Key geliefert."""
+        if not cont_keys:
+            return None
+        lo, hi = 0, len(cont_keys) - 1
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            mid_real = self._time_cont_to_real[cont_keys[mid]]
+            if mid_real <= epoch:
+                best = cont_keys[mid]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best if best is not None else cont_keys[0]
 
     def _on_jump_to_live(self) -> None:
         """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
@@ -1689,6 +1789,12 @@ class PyTraderChartWindow(QMainWindow):
                     self._mtf_fc_switch_tf(source_tf)
                 return
 
+            # 21.03.11 (Bug 2/6): Chart-TF-Modus 'fix' unterbindet die Auto-
+            # Kaskade (kein automatischer TF-Wechsel bei Zoom). Der Modus war
+            # bisher nur gespeichert (Namespace), aber nie ausgewertet.
+            if ns.get("chart_tf_mode") == "fix":
+                return
+
             # Auto-Kaskade (21.03.03): Kandidat aus Viewport-Breite.
             cascade["current_tf"] = self.current_tf
             result = evaluate_cascade(from_ts, to_ts, self.current_tf, cascade)
@@ -1716,10 +1822,18 @@ class PyTraderChartWindow(QMainWindow):
 
         Setzt `current_tf` und synchronisiert die ComboBox, damit die
         bestehende `on_tf_changed`-Logik (Zustand laden, Refresh) sauber
-        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt."""
+        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt.
+
+        21.03.11 (Bug 2): Der aktuelle Viewport-ZEITBEREICH (Wanduhr-Epochs)
+        wird als pending übernommen, damit der neue TF nach dem Refresh
+        denselben Zeitausschnitt zeigt (statt der fensterspezifischen
+        Bar-Offsets des alten TF -> sonst winziger/verrutschter Ausschnitt)."""
         new_tf = str(new_tf or "").upper()
         if not new_tf or new_tf == self.current_tf:
             return
+        # Viewport-Epochs für den folgenden Refresh merken (sofern bekannt).
+        if self._mtf_fc_last_viewport is not None:
+            self._mtf_fc_pending_epochs = self._mtf_fc_last_viewport
         if self.tf_combo is not None:
             idx = self.tf_combo.findText(new_tf)
             if idx < 0:
@@ -1819,6 +1933,39 @@ class PyTraderChartWindow(QMainWindow):
         self._push_mtf_fc_override_ui()
         if restored and str(restored).lower() != "multi":
             self._mtf_fc_switch_tf(restored)
+
+    def _on_mtf_fc_sort_mode_changed(self, mode: str) -> None:
+        """Filterleiste: Tabellen-Sortierung ('date' | 'signal' | 'tf').
+
+        21.03.11 (Bug 6): Nachgeruestete Verdrahtung. Der Modus wird im
+        MTF-FC-Namespace persistiert und zusaetzlich ueber den EventBus
+        emittiert (`mtf_fc_sort_changed`) - das AnalyticsWindow wendet ihn
+        auf die TablePage-Sortierung an (Entkopplung, kein Fenster-Know-how).
+        """
+        self._mtf_fc_ns["sort_mode"] = mode
+        try:
+            event_bus.mtf_fc_sort_changed.emit(mode)
+        except Exception as e:  # pragma: no cover
+            print(f"WARN [MTF-FC] Sort-EventBus-Emission fehlgeschlagen: {e}")
+        print(f"[MTF-FC] Sortierung: {mode}")
+
+    def _on_mtf_fc_sessions_changed(self, sessions: list) -> None:
+        """Filterleiste: Session-Farbbalken (London/NY/Tokio) im M1/M5-Zoom."""
+        self._mtf_fc_ns["sessions"] = list(sessions)
+        print(f"[MTF-FC] Sessions: {list(sessions)}")
+
+    def _on_mtf_fc_template_applied(self, template: dict) -> None:
+        """Filterleiste: View-Template geladen.
+
+        Die Werte (Data-TF, Range, Sortierung, Sessions) wurden vom Widget
+        bereits über die Einzelsignale emittiert – hier nur der Log-/Sync-
+        Abschluss, damit die Filterleiste den konsolidierten State zeigt.
+        """
+        print(f"[MTF-FC] Template angewendet: "
+              f"{template.get('name') or 'Unbenannt'}")
+        fb = getattr(self, "mtf_filter_bar", None)
+        if fb is not None:
+            fb.apply_namespace_state(self)
 
     def _push_mtf_fc_override_ui(self) -> None:
         """Sendet den Override-Zustand an die JS-Layer (Reset-Badge)."""

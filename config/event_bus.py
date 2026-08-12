@@ -42,6 +42,11 @@ class EventBus(QObject):
     favorites_changed = Signal()
     profile_changed = Signal(str)
     service_set_changed = Signal()
+    # 21.03.11 (Bug 6): Tabellen-Sortierung der Filterleiste. Das
+    # ChartWindow emittiert nach jeder Sortier-Aenderung ('date'|'signal'|
+    # 'tf'); das AnalyticsWindow wendet sie auf die TablePage an. Entkoppelt
+    # via EventBus – das ChartWindow kennt das AnalyticsWindow NICHT (IoC).
+    mtf_fc_sort_changed = Signal(str)
     # Phase 16 (05.08.2026): Concurrency-Guard gegen Konflikte zwischen
     # Service-Berechnungen (SetRunWorker/ServiceRunWorker/HistoricalScanner)
     # und dem 45s-Hintergrund-Sync (sync_timer in main.py). Entkoppelt via

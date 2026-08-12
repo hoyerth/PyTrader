@@ -678,6 +678,16 @@ class HeatmapWidget(QWidget):
         self._plot_hm.addItem(self._cross_y, ignoreBounds=True)
         self._plot_hm.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
+        # 21.03.11 (Bug 5): Zwei-Wege-Sync der Zoom-Slider - Maus-Zoom
+        # (Mausrad/Drag) auf der Heatmap-ViewBox muss die X-/Y-Slider
+        # mitbewegen (bisher nur einseitig Slider -> Range). Die Handler
+        # aktualisieren Slider + VM-Params (blockSignals/_syncing-Guard
+        # verhindern Endlos-Schleifen).
+        self._plot_hm.plotItem.vb.sigXRangeChanged.connect(
+            self._on_heatmap_x_range_changed)
+        self._plot_hm.plotItem.vb.sigYRangeChanged.connect(
+            self._on_heatmap_y_range_changed)
+
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a, 11.08.2026): Senkrechte
         # Teiler je Dateneinheit (Bar-Intervall des TFs, z. B. H1 -> jede
         # Stunde). Als EIN PlotCurveItem mit connect='pairs' (schnell),
@@ -2120,6 +2130,63 @@ class HeatmapWidget(QWidget):
         return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
 
     # ------------------------------------------------------------------
+    # 21.03.11 (Bug 5): Zoom-Slider Zwei-Wege-Sync (Maus-Zoom -> Slider)
+    # ------------------------------------------------------------------
+    def _on_heatmap_x_range_changed(self, _vb, xrange) -> None:
+        """Aktualisiert den X-Zoom-Slider nach Maus-Zoom auf der X-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_x, xrange,
+            self._x_min, self._x_max, "zoom_x_range")
+
+    def _on_heatmap_y_range_changed(self, _vb, yrange) -> None:
+        """Aktualisiert den Y-Zoom-Slider nach Maus-Zoom auf der Y-Achse."""
+        if getattr(self, "_syncing", False) or self._view_model is None:
+            return
+        self._sync_slider_from_range(
+            self._slider_zoom_y, yrange,
+            self._y_min, self._y_max, "zoom_y_range")
+
+    def _sync_slider_from_range(self, slider, vrange, vmin, vmax, key) -> None:
+        """Setzt Slider + VM-Params aus einem ViewBox-Range (Bug 5).
+
+        Rechnet den sichtbaren Achsen-Anteil [lo, hi] aus dem Range in den
+        normalisierten [0,1]-Bereich um und stellt den Slider invers ein.
+        Kein DB-Requery (set_heatmap_zoom ist rein client-seitig).
+        """
+        span = float(vmax) - float(vmin)
+        if span <= 0:
+            return
+        try:
+            lo = (float(vrange[0]) - float(vmin)) / span
+            hi = (float(vrange[1]) - float(vmin)) / span
+        except (TypeError, ValueError, IndexError):
+            return
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+        if hi <= lo:
+            return
+        self._set_zoom_slider(slider, [lo, hi])
+        # VM-Params aktualisieren (Persistenz) - Endlos-Schleifen-Guard via
+        # _syncing (set_heatmap_zoom emittiert kein ViewBox-Range-Event).
+        try:
+            if getattr(self, "_syncing", False) or self._view_model is None:
+                return
+            self._syncing = True
+            zx = list(self._view_model.params.get("zoom_x_range") or [0.0, 1.0])
+            zy = list(self._view_model.params.get("zoom_y_range") or [0.0, 1.0])
+            if key == "zoom_x_range":
+                zx = [lo, hi]
+            else:
+                zy = [lo, hi]
+            self._view_model.set_heatmap_zoom(zx, zy)
+        except Exception:
+            pass
+        finally:
+            self._syncing = False
+
+    # ------------------------------------------------------------------
     # 21.01 Bugfix 3: Fadenkreuz + Zellwert-Info
     # ------------------------------------------------------------------
     def _on_mouse_moved(self, pos) -> None:
@@ -2222,13 +2289,27 @@ class HeatmapWidget(QWidget):
                 frac = (c - vmin) / (vmax - vmin)
                 frac = max(0.0, min(1.0, frac))
                 color = cmap.map(frac, mode="qcolor")
-                label = str(c) if c < 5 else "5+"
+                # 21.03.11 (Bug 1): Operator-korrekte Beschriftung
+                # (= Treffer-Wert, >=" fuer alles darueber).
+                label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-                val = vmin + frac * (vmax - vmin)
-                color = cmap.map(frac, mode="qcolor")
-                self._add_legend_swatch(color, _format_heatmap_value(val))
+            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            span = vmax - vmin
+            v25 = vmin + 0.25 * span
+            v50 = vmin + 0.50 * span
+            v75 = vmin + 0.75 * span
+            fmt = _format_heatmap_value
+            self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
+                                    "<= {}".format(fmt(v25)))
+            self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
+                                    "{} - {}".format(fmt(v25), fmt(v50)))
+            self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
+                                    "{} - {}".format(fmt(v50), fmt(v75)))
+            self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
+                                    "{} - {}".format(fmt(v75), fmt(vmax)))
+            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
+                                    ">= {}".format(fmt(v75)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:

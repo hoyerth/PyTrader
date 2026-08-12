@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -39,17 +40,19 @@ from analytics.engine.mtf_fc_templates import (
     migrate_template,
 )
 
-#: Data-TF-Auswahl (Multi + fixierte Timeframes).
-DATA_TF_OPTIONS = ["🌐 Alle Timeframes (Multi)", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4"]
+#: Data-TF-Auswahl (Multi + fixierte Timeframes). 21.03.11 (Bug 6):
+#: Labels kompakt, damit die Leiste in 1200-px-Fenster passt (sizeHint war
+#: w=2248 px -> Uberlauf/Clipping, Controls unsichtbar).
+DATA_TF_OPTIONS = ["🌐 Multi", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4"]
 
 #: Chart-Overlay-TF (Auto-Kaskade vs. manuell fix).
-CHART_TF_OPTIONS = ["⚡ Auto (Kaskade)", "🔒 Manuell Fix"]
+CHART_TF_OPTIONS = ["⚡ Auto", "🔒 Fix"]
 
 #: Range-Presets.
 RANGE_PRESETS = ["24h", "7d", "30d", "YTD", "Benutzerdefiniert"]
 
 #: Tabellen-Sortierung.
-SORT_MODES = ["Datum 🠇", "Signal-Stärke 🠇", "TF 🠅"]
+SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
 
 #: Session-Filter (Farbbalken im M1/M5-Zoom, 21.03.08).
 SESSION_OPTIONS = ["London", "New York", "Tokio"]
@@ -63,9 +66,15 @@ def _parse_data_tf(text: str) -> str:
         if text.startswith(prefix):
             text = text[len(prefix):]
     stripped = text.strip()
-    if not stripped or stripped.startswith("Alle Timeframes"):
+    if not stripped or stripped.lower() in ("multi", "alle timeframes",
+                                            "alle tf", "alle timeframes (multi)"):
         return "multi"
     return stripped
+
+
+def _data_tf_label(data_tf: str) -> str:
+    """Erzeugt das kompakte Data-TF-Dropdown-Label aus dem Wert."""
+    return "🌐 Multi" if str(data_tf).lower() == "multi" else f"🔒 {data_tf}"
 
 
 def _parse_chart_tf(text: str) -> str:
@@ -113,79 +122,102 @@ class MtfFilterBarWidget(QWidget):
     # UI-Aufbau
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
+        # 21.03.11 (Bug 6, 2. Fix): ZWEI-ZEILEN-Layout statt einer Zeile.
+        # Der 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
+        # minimumSizeHint=1209 -> das Fenster wird auf ~1220 px aufgezwungen,
+        # Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) waren rechts
+        # abgeschnitten/unsichtbar. Zeile 1 = Kern-Steuerung (Data/Chart/
+        # Range/Sort), Zeile 2 = Sessions + Templates -> sizeHint < 700 px.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(2)
 
-        # --- Source-Data-TF --------------------------------------------
-        layout.addWidget(QLabel("Data-TF:"))
+        # --- Zeile 1: Source-Data-TF / Chart-Overlay-TF / Range / Sort --
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+
+        row1.addWidget(QLabel("Data:"))
         self._data_tf_combo = QComboBox()
         self._data_tf_combo.addItems(DATA_TF_OPTIONS)
+        self._data_tf_combo.setMaximumWidth(105)
         self._data_tf_combo.setToolTip(
             "Source-Data-TF: 🌐 alle Timeframes (Multi) vs. 🔒 fixiert auf einen TF")
         self._data_tf_combo.currentTextChanged.connect(self._on_data_tf_changed)
-        layout.addWidget(self._data_tf_combo)
+        row1.addWidget(self._data_tf_combo)
 
-        # --- Chart-Overlay-TF ------------------------------------------
-        layout.addWidget(QLabel("Chart-TF:"))
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Chart:"))
         self._chart_tf_combo = QComboBox()
         self._chart_tf_combo.addItems(CHART_TF_OPTIONS)
+        self._chart_tf_combo.setMaximumWidth(85)
         self._chart_tf_combo.setToolTip(
             "Chart-Overlay-TF: ⚡ Auto (Kaskade) vs. 🔒 manuell fixiert")
         self._chart_tf_combo.currentTextChanged.connect(self._on_chart_tf_changed)
-        layout.addWidget(self._chart_tf_combo)
+        row1.addWidget(self._chart_tf_combo)
 
-        # --- Range-Picker ----------------------------------------------
-        layout.addWidget(QLabel("Range:"))
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Range:"))
         self._range_combo = QComboBox()
         self._range_combo.addItems(RANGE_PRESETS)
-        self._range_combo.setToolTip("Zeitfenster-Preset (24h/7d/30d/YTD)")
+        self._range_combo.setMaximumWidth(100)
+        self._range_combo.setToolTip(
+            "Zeitfenster-Preset (24h/7d/30d/YTD) – filtert den anzuzeigenden Zeitraum")
         self._range_combo.currentTextChanged.connect(self._on_range_changed)
-        layout.addWidget(self._range_combo)
+        row1.addWidget(self._range_combo)
 
-        # --- Tabellen-Sortierung ---------------------------------------
-        layout.addWidget(QLabel("Sortierung:"))
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Sort:"))
         self._sort_combo = QComboBox()
         self._sort_combo.addItems(SORT_MODES)
+        self._sort_combo.setMaximumWidth(95)
         self._sort_combo.setToolTip(
             "Tabellen-Sortierung: Datum, Signal-Stärke oder Timeframe")
         self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
-        layout.addWidget(self._sort_combo)
+        row1.addWidget(self._sort_combo)
 
-        # --- Session-Filter --------------------------------------------
+        row1.addStretch(1)
+        outer.addLayout(row1)
+
+        # --- Zeile 2: Session-Filter + View-Templates -------------------
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+
         self._session_checks: Dict[str, QCheckBox] = {}
         for session in SESSION_OPTIONS:
             cb = QCheckBox(session)
             cb.setToolTip("Session-Farbbalken im M1/M5-Zoom (UTC-Epochs)")
             cb.stateChanged.connect(self._on_sessions_changed)
             self._session_checks[session.lower()] = cb
-            layout.addWidget(cb)
+            row2.addWidget(cb)
 
-        # --- View-Templates (SchemaMigrator) ---------------------------
-        layout.addSpacing(8)
+        row2.addSpacing(6)
         self._template_name = QLineEdit()
-        self._template_name.setPlaceholderText("Preset-Name")
-        self._template_name.setMaximumWidth(110)
+        self._template_name.setPlaceholderText("Preset")
+        self._template_name.setMaximumWidth(90)
         self._template_name.setToolTip("Name des View-Templates")
-        layout.addWidget(self._template_name)
+        row2.addWidget(self._template_name)
 
-        self._btn_save_template = QPushButton("💾 Preset")
+        self._btn_save_template = QPushButton("💾")
         self._btn_save_template.setToolTip(
             "Aktuelle Filter-Konfiguration als View-Template speichern")
+        self._btn_save_template.setMaximumWidth(34)
         self._btn_save_template.clicked.connect(self._save_template)
-        layout.addWidget(self._btn_save_template)
+        row2.addWidget(self._btn_save_template)
 
-        self._btn_load_template = QPushButton("📂 Preset")
+        self._btn_load_template = QPushButton("📂")
         self._btn_load_template.setToolTip("Gespeichertes View-Template laden")
+        self._btn_load_template.setMaximumWidth(34)
         self._btn_load_template.clicked.connect(self._load_template)
-        layout.addWidget(self._btn_load_template)
+        row2.addWidget(self._btn_load_template)
 
         self._template_combo = QComboBox()
         self._template_combo.setToolTip("Verfügbare View-Templates")
+        self._template_combo.setMaximumWidth(110)
         self._template_combo.currentIndexChanged.connect(self._on_template_selected)
-        layout.addWidget(self._template_combo)
+        row2.addWidget(self._template_combo)
 
-        layout.addStretch(1)
+        row2.addStretch(1)
+        outer.addLayout(row2)
 
     # ------------------------------------------------------------------
     # Public API (State-Sync über Provider, kein SQL)
@@ -200,10 +232,8 @@ class MtfFilterBarWidget(QWidget):
         data_tf = str(ns.get("active_data_tf") or "M15")
         chart_tf = str(ns.get("active_chart_tf") or "M5")
 
-        data_label = "🌐 Alle Timeframes (Multi)" if data_tf.lower() == "multi" \
-            else f"🔒 {data_tf}"
         self._data_tf_combo.blockSignals(True)
-        self._data_tf_combo.setCurrentText(data_label)
+        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
         self._data_tf_combo.blockSignals(False)
 
         # 'auto' wird im Chart über die Kaskade bestimmt; bei fixiertem
@@ -294,12 +324,15 @@ class MtfFilterBarWidget(QWidget):
         self._load_template()
 
     def _apply_template(self, template: Dict[str, Any]) -> None:
-        """Wendet ein geladenes Template auf die Widgets an (in-memory)."""
+        """Wendet ein geladenes Template auf die Widgets an (in-memory).
+
+        21.03.11 (Bug 6): Nach der Widget-Anwendung werden die Signale
+        EXPLIZIT emittiert, damit der Orchestrator (chart_win) die Werte
+        übernimmt (blockSignals unterbindet sonst die Signal-Verdrahtung).
+        """
         data_tf = str(template.get("data_tf") or "multi")
-        label = "🌐 Alle Timeframes (Multi)" if data_tf.lower() == "multi" \
-            else f"🔒 {data_tf}"
         self._data_tf_combo.blockSignals(True)
-        self._data_tf_combo.setCurrentText(label)
+        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
         self._data_tf_combo.blockSignals(False)
 
         range_preset = str(template.get("range_preset") or "7d")
@@ -320,7 +353,14 @@ class MtfFilterBarWidget(QWidget):
             cb.setChecked(key in sessions)
             cb.blockSignals(False)
         self._sessions = [s for s in sessions if s in self._session_checks]
+
+        # Explizite Signal-Emission nach der Anwendung (Bug 6).
+        self.data_tf_changed.emit(self.current_data_tf())
+        self.chart_tf_changed.emit(self.current_chart_tf())
+        self.sort_mode_changed.emit(self.current_sort_mode())
         self.sessions_changed.emit(list(self._sessions))
+        if range_preset and range_preset != "Benutzerdefiniert":
+            self._on_range_changed(range_preset)
 
     # ------------------------------------------------------------------
     # Guard-Override (Ebene 2, 21.03.05) – Klick auf Reset-Badge

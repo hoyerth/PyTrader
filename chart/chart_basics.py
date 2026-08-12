@@ -46,6 +46,10 @@ JS_FILES = [
     # sich über optionale Hooks in 04 ein (Muster 06_two_tier.js).
     "07_mtf_fc.js",
     "08_mtf_layers.js",
+    # 21.03.11 (Bug 4): TF-spezifische Achsen-Ticks – Overlay-Layer rendert
+    # Zeit-Tick-Labels aligniert zum gewählten Timeframe (M15 -> 15-min-
+    # Marken, H1 -> 1h-Marken); 04 liefert die Intraday-Labels zurück.
+    "09_mtf_axis.js",
 ]
 
 

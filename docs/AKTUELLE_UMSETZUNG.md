@@ -753,3 +753,71 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   - **Bug 6:** Filterleiste wird eingefügt, aber `sizeHint` w=2248 px (verifiziert, offscreen Strukturcheck) → Überlauf/Clipping; 3 Signale unverdrahtet → Fix: kompakter Umbau + Verdrahtung.
 - **Verifikation:** `test/check_filterbar_layout.py` (temporär, offscreen, danach gelöscht): `verticalLayout_toolbar` gefunden, Items 2→3, `MtfFilterBarWidget` sizeHint w=2248 px – Ursache für Bug 6 bestätigt. Keine Code-Änderungen.
 - **Commit:** – (nur Doku)
+
+## 21.03.11 - Bug-Fix-Umsetzung (12.08.2026, nach Anwender-Bestätigung)
+
+> Die vom Anwender gemeldete Buglist (6 Punkte) wurde umgesetzt. Nach der
+> reinen Analyse (`eb78ee4`) wurden alle Fixes implementiert und headless
+> verifiziert (Grundsatz 2, keine UI-Ausführung).
+
+### Bug 4 - TF-spezifische X-Achsen-Ticks (M15/H1) - FERTIG
+
+- **Neu:** `chart/js/09_mtf_axis.js` - Overlay-Layer `#mtf-axis-layer` rendert TF-alignierte
+  Tick-Labels (M15 → 15/30-min-Marken, H1 → 1h-Marken), `MTF_AXIS_STEPS`,
+  `MTF_AXIS_MIN_LABEL_PX = 90`, nur Intraday (TF < 86400 s), Tagesgrenzen (00:00) an LWC;
+  API `mtfAxisSetTf`/`mtfAxisClear`; Hooks `_onMtfAxisFullUpdate`/`_onMtfAxisVisibleRangeChanged`;
+  `window._mtfAxisActive`-Flag.
+- **Geändert:** `chart/js/04_live_updates.js` (`tickMarkFormatter` gibt bei aktivem Overlay
+  Intraday-Labels ab, 2 optionale Hooks), `chart/chart_basics.py` (`JS_FILES` um `09_mtf_axis.js`).
+- **Verifikation:** `test/check_mtf_axis.js` (permanent, 14/14 PASS); `node --check` alle 9 JS;
+  HTML-Template-Checks PASS. Wichtig: `window.TF_SECONDS_MAP` ist `const` (kein window-Property).
+
+### Bug 2 - H1 + Zoom-In: kein Wechsel in kleinere TFs - FERTIG
+
+- **Geändert:** `chart/chart_win.py` - Viewport-Transfer-Bug behoben: Bei pending
+  MTF-FC-Epochs wird `_resolve_epoch_logical_range` statt alter Bar-Offsets verwendet
+  (Binärsuche auf `_time_cont_to_real`, geklemmt). `chart_tf_mode == "fix"` unterbindet
+  die Auto-Kaskade (`_on_mtf_fc_viewport_changed`-Guard). Neuer State
+  `_mtf_fc_pending_epochs`, gesetzt durch `_mtf_fc_switch_tf` aus `_mtf_fc_last_viewport`.
+- **Verifikation:** `py_compile`; Engine-H1-Zoom-In-Checks PASS; JS-Trigger-Checks PASS;
+  Epoch-Range-Checks 8/8 PASS.
+
+### Bug 3 - "Alle TF ausführen" aktualisiert Analytics-Fenster nicht - FERTIG
+
+- **Geändert:** `analytics/ui/analytics_win.py` -
+  `event_bus.service_set_changed.connect(self._on_service_set_changed)` + debounced `refresh_all()`.
+- **Verifikation:** `py_compile`; Code-Inspektion (EventBus-Entkopplung, Grundsatz 2/5).
+
+### Bug 1 + Bug 5 - Heatmap-Legende & Zoom-Slider-Sync - FERTIG
+
+- **Geändert:** `analytics/ui/heatmap_widget.py` - `sigXRangeChanged`/`sigYRangeChanged`
+  → `_sync_slider_from_range()` mit `_syncing`-Guard (Bug 5, Zwei-Wege-Sync);
+  Confluence-Legende mit `=`/`>=`-Operatoren (Bug 1).
+- **Verifikation:** `py_compile`; Code-Inspektion.
+
+### Bug 6 - Filterleiste nicht sichtbar / Sortierung wirkungslos - FERTIG
+
+- **Befund:** (1) 1-Zeilen-Layout zu breit (sizeHint 1281 px) → Fenster wurde auf ~1220 px
+  aufgezwungen, Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) rechts abgeschnitten;
+  (2) `sort_mode_changed` speicherte nur im Namespace - die Analytics-Tabelle hatte keinerlei
+  Verbindung (Konzept-Lücke).
+- **Geändert:** `chart/widgets/mtf_filter_bar.py` - ZWEI-ZEILEN-Layout (row1: Data-TF/
+  Chart-TF/Range/Sort, row2: Sessions/Templates) → sizeHint 699 px, alle Controls sichtbar
+  bei `resize(1000,700)`. `config/event_bus.py` - neues Signal `mtf_fc_sort_changed(str)`.
+  `chart/chart_win.py` - `_on_mtf_fc_sort_mode_changed` emittiert zusätzlich auf dem
+  EventBus (Entkopplung, kein Fenster-Know-how). `analytics/ui/analytics_win.py` - Slot
+  `_on_mtf_fc_sort_changed` → `table_page.set_external_sort_mode()`. `analytics/ui/table_page.py` -
+  `set_external_sort_mode()`/`_apply_external_sort()`/`_find_dynamic_header()`,
+  `_SortableValueItem` (numerische JSON-Union-Sortierung: 10.2 > 9.5 korrekt statt lexikografisch),
+  Anwendung nach jedem Befüllen (Vorrang vor Profil-Sortierung, kein User-Setting/Dirty-Flag).
+- **Sortier-Semantik:** `Datum 🠇` → Zeit absteigend (UserRole-Epoch);
+  `Signal 🠇` → Header-Substring (signal/stärke/score/conf/wert) numerisch
+  absteigend; `TF 🠅` → timeframe aufsteigend; Fallback (keine Spalte) → Zeit.
+- **Verifikation:** `test/check_mtf_sort_binding.py` (permanent, 21/21 PASS: EventBus, alle 3
+  Modi, Numerik, Fallback, Refresh-Persistenz, kein User-Setting, Row-Mapping intakt);
+  `test/check_filterbar_visible.py` (permanent): sizeHint 699 px, Range/Sort sichtbar innerhalb
+  990 px fb bei 1000 px Fenster; `py_compile` aller geänderten Dateien PASS.
+  DPI-Artefakt geklärt: `devicePixelRatio` = 1.0, aber `mapTo`-global-x ≈ 2× intern
+  (offscreen-Render-Artefakt) - logische Koordinaten maßgeblich.
+
+- **Commit:** nach diesem Doku-Eintrag

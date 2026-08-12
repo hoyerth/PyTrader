@@ -138,6 +138,27 @@ class _SortableTimeItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class _SortableValueItem(QTableWidgetItem):
+    """JSON-Union-Item mit numerischem Vergleich (21.03.11, Bug 6).
+
+    Die dynamischen Feature-Werte (z. B. `signal_strength`) sind im Text
+    auf 4 signifikante Stellen gekuerzt ('9.5' > '10.2' lexikografisch falsch).
+    Diese Subklasse vergleicht den Rohwert aus dem UserRole numerisch,
+    damit die 'Signal-Staerke'-Sortierung der MTF-FC-Filterleiste korrekt ist.
+    """
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, QTableWidgetItem):
+            try:
+                a = self.data(Qt.UserRole)
+                b = other.data(Qt.UserRole)
+                if a is not None and b is not None:
+                    return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
+
+
 class TablePage(QWidget):
     """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
 
@@ -164,6 +185,12 @@ class TablePage(QWidget):
         self._page_size: int = 100
         self._current_page: int = 0
         self._total_pages: int = 1
+        # 21.03.11 (Bug 6): Externe Sortierung aus der MTF-FC-Filterleiste
+        # ('date' | 'signal' | 'tf'). None = keine externe Vorgabe (die
+        # TablePage sortiert wie bisher nach Profil/User-Klick). Ein gesetzter
+        # Modus hat VORRANG vor der Profil-Sortierung (wird nach jedem
+        # Befuellen erneut angewendet) und persistiert NICHT als User-Setting.
+        self._external_sort_mode: Optional[str] = None
 
         self._header = QLabel("Feature-Store-Tabelle")
         self._table = QTableWidget(0, len(_BASE_COLUMNS))
@@ -292,6 +319,77 @@ class TablePage(QWidget):
             self._render_current_page()
 
     # ------------------------------------------------------------------
+    # 21.03.11 (Bug 6): Externe Sortierung (MTF-FC-Filterleiste via EventBus)
+    # ------------------------------------------------------------------
+    def set_external_sort_mode(self, mode: str) -> None:
+        """Setzt die externe Sortierung ('date' | 'signal' | 'tf').
+
+        Wird vom AnalyticsWindow aufgerufen, wenn die MTF-FC-Filterleiste
+        des ChartWindows eine neue Sortierung emittiert (EventBus). Der Modus
+        hat VORRANG vor der Profil-/User-Sortierung, wird nach jedem
+        Befuellen erneut angewendet und persistiert NICHT als User-Setting.
+        Ein leerer/ungueltiger Modus deaktiviert die externe Vorgabe.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = ""
+        if mode == (self._external_sort_mode or ""):
+            return
+        self._external_sort_mode = mode or None
+        if self._table.rowCount() > 0:
+            self._apply_external_sort()
+
+    def _apply_external_sort(self) -> None:
+        """Wendet die externe Sortierung auf die Tabelle an (Bug 6).
+
+        Spalten-Mapping: 'date' -> Zeit (absteigend, UserRole-Epoch),
+        'signal' -> Header-Substring (signal/stärke/score/conf/wert) auf den
+        dynamischen JSON-Union-Spalten (absteigend, numerisch via
+        `_SortableValueItem`), 'tf' -> Header-Substring (timeframe/tf)
+        aufsteigend. Fallback (keine passende Spalte): Zeit absteigend.
+        Die QTableWidget-Sortierung (setSortingEnabled + sortItems) betrifft
+        nur die ANZEIGE – `_current_rows` und das Jump-to-Chart-Mapping
+        (UserRole+1) bleiben unveraendert.
+        """
+        mode = self._external_sort_mode or "date"
+        column: int = _COL_TIME
+        order: Qt.SortOrder = Qt.DescendingOrder
+        if mode == "signal":
+            col = self._find_dynamic_header(
+                ("signal", "stärke", "staerke", "score", "conf", "wert"))
+            if col is not None:
+                column, order = col, Qt.DescendingOrder
+        elif mode == "tf":
+            col = self._find_dynamic_header(("timeframe", "tf"))
+            if col is not None:
+                column, order = col, Qt.AscendingOrder
+        # Signale blockieren: externe Sortierung ist KEINE User-Aktion und
+        # darf nicht `table_settings_changed` (Profil-Persistenz) ausloesen.
+        header = self._table.horizontalHeader()
+        header.blockSignals(True)
+        try:
+            self._table.setSortingEnabled(True)
+            self._table.sortItems(column, order)
+        finally:
+            header.blockSignals(False)
+
+    def _find_dynamic_header(self, needles: tuple) -> Optional[int]:
+        """Findet eine dynamische JSON-Union-Spalte per Header-Substring.
+
+        Sucht NUR die Spalten ab `_COL_SERVICE + 1` (die dynamischen
+        Feature-Keys) – Basis-Spalten 'Zeit (Wanduhr)'/'Service' werden nie
+        getroffen (ein 'tf'-Substring in 'Zeit' waere falsch).
+        """
+        for col in range(_COL_SERVICE + 1, self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            text = str(item.text()).lower()
+            if any(n in text for n in needles):
+                return col
+        return None
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -413,6 +511,11 @@ class TablePage(QWidget):
         finally:
             for w in blocked:
                 w.blockSignals(False)
+        # 21.03.11 (Bug 6): Externe MTF-FC-Sortierung hat Vorrang vor der
+        # Profil-Sortierung und wird nach JEDEM Befuellen erneut angewendet
+        # (nur Anzeige, kein User-Setting, kein Dirty-Flag).
+        if self._external_sort_mode:
+            self._apply_external_sort()
         self._update_page_controls()
 
     def _populate_rows(
@@ -445,6 +548,10 @@ class TablePage(QWidget):
             self._table.setItem(r, _COL_SERVICE,
                                 QTableWidgetItem(service_names[r] or "-"))
             # JSON-Union-Spalten: Wert aus feature_data, sonst "-".
+            # 21.03.11 (Bug 6): Numerische Werte als `_SortableValueItem` mit
+            # Rohwert im UserRole – die 'Signal-Staerke'-Sortierung der
+            # MTF-FC-Filterleiste vergleicht dann numerisch statt lexiko-
+            # grafisch ('9.5' < '10.2' korrekt).
             fd = row.get("feature_data")
             if not isinstance(fd, dict):
                 fd = {}
@@ -453,7 +560,9 @@ class TablePage(QWidget):
                 if v is None:
                     self._table.setItem(r, ci, QTableWidgetItem("-"))
                 elif isinstance(v, (int, float)):
-                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
+                    item = _SortableValueItem(f"{v:.4g}")
+                    item.setData(Qt.UserRole, float(v))
+                    self._table.setItem(r, ci, item)
                 else:
                     self._table.setItem(r, ci, QTableWidgetItem(str(v)))
 
