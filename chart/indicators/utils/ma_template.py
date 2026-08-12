@@ -113,9 +113,18 @@ def resolve_bull_color(
 
 
 def _sma_values(values: np.ndarray, period: int) -> np.ndarray:
-    """SMA über rollierende Fenster (konstanter Gewichtsvektor)."""
+    """SMA über rollierende Fenster (konstanter Gewichtsvektor).
+
+    Bugfix 12.08.2026 (srv_trend_hma_pivot / LiveAnalyzer): Ist die Serie
+    KÜRZER als `period`, liefert `np.convolve(..., mode="valid")` ein Array
+    der Länge `period-n+1`, während `result[period-1:]` leer ist -> ValueError
+    "could not broadcast input array from shape (k,) into shape (0,)". Guard:
+    kurze Serien -> komplett NaN (Warmup-Vertrag, kein Crash).
+    """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     window = np.ones(period, dtype=float)
     conv = np.convolve(values, window, mode="valid") / float(period)
     result = np.full(len(values), np.nan, dtype=float)
@@ -133,6 +142,8 @@ def _wma_values(values: np.ndarray, period: int) -> np.ndarray:
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     weights = np.arange(period, 0, -1, dtype=float)
     conv = np.convolve(values, weights, mode="valid") / weights.sum()
     result = np.full(len(values), np.nan, dtype=float)
@@ -270,6 +281,8 @@ def _alma_values(values: np.ndarray, period: int) -> np.ndarray:
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     offset = (period - 1) * _ALMA_OFFSET
     sigma = period / 6.0
     m = np.arange(period, dtype=float) - offset
@@ -292,6 +305,8 @@ def _vwma_values(
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     vol = np.where(np.isnan(volume), 0.0, volume)
     pv = values * vol
     pv_sum = np.convolve(pv, np.ones(period, dtype=float), mode="valid")

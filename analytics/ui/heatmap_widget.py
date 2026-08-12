@@ -241,7 +241,7 @@ def _format_heatmap_value(val: Any) -> str:
         return str(val)
     if fval == int(fval) and abs(fval) < 1e15:
         return f"{int(fval):,}".replace(",", ".")
-    return f"{fval:.6f}".rstrip("0").rstrip(".")
+    return f"{fval:.2f}".rstrip("0").rstrip(".")
 
 
 class _HeatmapAxis(pg.AxisItem):
@@ -588,6 +588,15 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
+        # 12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'):
+        # TF-Anzeige des Kerzen-Overlays - der Nutzer sieht, welcher
+        # Timeframe die Kerzenbreite bestimmt (z. B. 'D1' -> 16,8h-Kerzen).
+        self._label_overlay_tf = QLabel("")
+        self._label_overlay_tf.setStyleSheet(
+            "color: #808080; font-size: 11px;")
+        self._label_overlay_tf.setToolTip(
+            "Timeframe des Kerzen-Overlays - bestimmt die Kerzenbreite "
+            "(bar_sec * 0.7). Wird aus den OHLCV-Overlay-Daten gelesen.")
         self._slider_zoom_x = QSlider(Qt.Horizontal)
         self._slider_zoom_y = QSlider(Qt.Horizontal)
         self._label_info = QLabel("")
@@ -604,6 +613,7 @@ class HeatmapWidget(QWidget):
 
         ctrl2 = QHBoxLayout()
         ctrl2.addWidget(self._chk_candle)
+        ctrl2.addWidget(self._label_overlay_tf)
         ctrl2.addWidget(QLabel("Zoom X:"))
         ctrl2.addWidget(self._slider_zoom_x)
         ctrl2.addWidget(QLabel("Zoom Y:"))
@@ -1969,7 +1979,16 @@ class HeatmapWidget(QWidget):
         # (Wick + Bull-Koerper + Bear-Koerper) fuer ALLE Bars (vorher bei
         # 5000 Bars = 10.000 Einzel-Items -> Pan/Zoom rueckelte). Die
         # Daten werden als numpy-Arrays an BarGraphItem uebergeben.
-        bar_sec = self._bar_interval_seconds()
+        # 12.08.2026 (User-Meldung 4): Kerzenbreite an den DATEN-TF der
+        # OHLCV-Bars koppeln + TF im UI-Label anzeigen.
+        data_tf = str(data.get("timeframe") or "").strip().upper()
+        bar_sec = self._bar_interval_seconds(data_tf or None)
+        lbl_tf = getattr(self, "_label_overlay_tf", None)
+        if lbl_tf is not None:
+            if data_tf:
+                lbl_tf.setText(f"Overlay: {data_tf}")
+            else:
+                lbl_tf.setText("Overlay: ?")
         times = np.asarray([c[0] for c in candles], dtype=np.float64)
         opens = np.asarray([c[1] for c in candles], dtype=np.float64)
         highs = np.asarray([c[2] for c in candles], dtype=np.float64)
@@ -2082,14 +2101,21 @@ class HeatmapWidget(QWidget):
     # ------------------------------------------------------------------
     # 21.01 Bugfix 5: Adaptives Overlay (OHLCV im Heatmap-Timeframe)
     # ------------------------------------------------------------------
-    def _bar_interval_seconds(self) -> float:
-        """Bar-Intervall des Heatmap-Timeframes in Sekunden (Bugfix 5).
+    def _bar_interval_seconds(self,
+                             data_tf: Optional[str] = None) -> float:
+        """Bar-Intervall des Overlay-Timeframes in Sekunden (Bugfix 5).
 
-        Liest `params["timeframe"]` des ViewModels (z. B. 'H1' -> 3600) und
-        liefert einen Fallback (3600s), falls der TF unbekannt/leer ist.
+        12.08.2026 (User-Meldung 4, 'Anzeigebalken ca. 18h breit'): Der
+        TF wird zunaechst aus den OHLCV-Overlay-DATEN gelesen (diejenige
+        Zeitebene, deren Kerzen tatsaechlich gerendert werden) und erst
+        dann aus `params["timeframe"]` des ViewModels - die Breite folgt
+        damit IMMER der angezeigten Datenbasis (Race-/Divergenz-sicher).
+        Fallback 3600s, falls beide TF unbekannt/leer sind.
         """
         tf = ""
-        if self._view_model is not None:
+        if data_tf:
+            tf = str(data_tf)
+        elif self._view_model is not None:
             tf = str(self._view_model.params.get("timeframe") or "")
         return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
 

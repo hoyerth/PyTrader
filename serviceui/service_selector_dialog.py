@@ -85,6 +85,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -444,6 +445,19 @@ class ServiceSelectorDialog(QDialog):
         panel_layout.addLayout(tf_row)
         self.badge_bar = TfStatusBadgeBar()
         panel_layout.addWidget(self.badge_bar)
+        # 12.08.2026 (User-Meldung 2): Fortschrittsbalken fuer Service-Runs
+        # (Muster service_win) - zeigt je Service den Fortschritt ueber alle
+        # Services des aktuellen Timeframes (ServiceRunWorker.service_progress).
+        self.progress_label = QLabel("")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(0)   # Busy bis zum 1. Wert
+        self.progress_bar.setFixedHeight(16)
+        self.progress_bar.setTextVisible(False)
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(6)
+        progress_row.addWidget(self.progress_label, 3)
+        progress_row.addWidget(self.progress_bar, 2)
+        panel_layout.addLayout(progress_row)
         self._fill_run_tf_combo()
         self.param_panel = panel  # 06.08.2026: feste Breite auf dem PANEL-WIDGET
         self.param_scroll = QScrollArea(panel)
@@ -796,6 +810,67 @@ class ServiceSelectorDialog(QDialog):
             pass
         return None
 
+    def _purge_legacy_allowed(self, plugin_id: str,
+                              params: Optional[Dict[str, Any]]) -> bool:
+        """True, wenn der Params-only-Legacy-Pool der Variante EINDEUTIG
+        dieser Variante gehoert (12.08.2026, Bugfix Runde 6).
+
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung (11.08.2026) liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name). Dieser Pool ist mehreren Varianten mit
+        IDENTISCHEN Params gemeinsam - er darf beim 'Data Only Loeschen'
+        einer einzelnen Variante nur entfernt werden, wenn KEINE andere
+        aktive Variante (Preset/Clone ODER Set-Instanz) denselben
+        Params-only-Hash besitzt.
+
+        Returns:
+            True = Pool eindeutig dieser Variante zugeordnet (Legacy-Purge
+            erlaubt); False = Pool wird geteilt oder nicht bestimmbar.
+        """
+        if not plugin_id or params is None:
+            return False
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            return False
+        target = generate_instance_hash(plugin_id, params)
+        owners = 0
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            try:
+                sm = self.model.state_manager
+            except Exception:
+                sm = None
+        if sm is not None:
+            try:
+                for p in sm.list_plugin_presets(plugin_id) or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if generate_instance_hash(
+                            plugin_id, p.get("params") or {}) == target:
+                        owners += 1
+            except Exception:
+                pass
+        try:
+            for set_id in (self.set_repo.list_sets()
+                           if self.set_repo is not None else []):
+                defn = self.set_repo.get_set(set_id)
+                if not isinstance(defn, dict):
+                    continue
+                for cfg in (defn.get("services") or {}).values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    cpid = str(cfg.get("plugin_id") or "")
+                    if cpid.lower() == plugin_id.lower() and \
+                            generate_instance_hash(
+                                cpid, cfg.get("params") or {}) == target:
+                        owners += 1
+        except Exception:
+            pass
+        # owners == 1: nur diese eine Variante belegt den Pool. owners == 0
+        # (z. B. Standalone-Service): kein Legacy-Pool-Szenario - False.
+        return owners == 1
+
     @Slot(str, str, str, str)
     def _on_duplicate_variant(self, set_id: str, service_id: str,
                               plugin_id: str, instance_hash: str) -> None:
@@ -1004,7 +1079,9 @@ class ServiceSelectorDialog(QDialog):
         try:
             from analytics.features.feature_builder import FeatureBuilder
             FeatureBuilder().purge_instance_data(
-                instance_hash, plugin_id, params)
+                instance_hash, plugin_id, params,
+                purge_legacy=self._purge_legacy_allowed(
+                    plugin_id, params))
         except Exception:
             pass
         event_bus.service_set_changed.emit()
@@ -1082,7 +1159,9 @@ class ServiceSelectorDialog(QDialog):
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
                     FeatureBuilder().purge_instance_data(
-                        instance_hash, plugin_id, preset.get("params") or {})
+                        instance_hash, plugin_id, preset.get("params") or {},
+                        purge_legacy=self._purge_legacy_allowed(
+                            plugin_id, preset.get("params") or {}))
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()
@@ -1653,6 +1732,9 @@ class ServiceSelectorDialog(QDialog):
         # 21.01b: Per-TF-Signale -> Pill-Strip (Laufzeit-/Fehler-Zustand).
         self._run_worker.tf_started.connect(self._on_tf_started)
         self._run_worker.tf_finished.connect(self._on_tf_finished)
+        # 12.08.2026 (User-Meldung 2): Per-Service-Fortschritt -> Progress-Bar.
+        self._run_worker.service_progress.connect(self._on_service_progress)
+        self._reset_run_progress("Starte Ausfuehrung ...")
         self._run_worker.start()
 
     def _on_run_log(self, message: str) -> None:
@@ -1824,14 +1906,38 @@ class ServiceSelectorDialog(QDialog):
         """Run abgeschlossen: Pill-Strip zuruecksetzen + Status neu laden."""
         self._on_run_log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) "
                          f"im feature_store gespeichert ({scope_id}).")
+        self._reset_run_progress()
         self.badge_bar.set_running(None)
         self._refresh_badge_bar()
 
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
         """Run fehlgeschlagen: Pill-Strip zuruecksetzen + Status neu laden."""
         self._on_run_log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+        self._reset_run_progress()
         self.badge_bar.set_running(None)
         self._refresh_badge_bar()
+
+    @Slot(str, str, int, int)
+    def _on_service_progress(self, tf: str, iid: str, done: int,
+                             total: int) -> None:
+        """12.08.2026 (User-Meldung 2): Per-Service-Fortschritt anzeigen."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(max(total, 1))
+            bar.setValue(done)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(f"{tf}: {iid} ({done}/{total})")
+
+    def _reset_run_progress(self, label: str = "") -> None:
+        """Setzt den Fortschrittsbalken zurueck (Default: leeres Label)."""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(0)
+            bar.setValue(0)
+        lbl = getattr(self, "progress_label", None)
+        if lbl is not None:
+            lbl.setText(label)
 
     def _on_tf_started(self, tf: str) -> None:
         """Hebt den gerade laufenden Timeframe im Pill-Strip blau hervor."""

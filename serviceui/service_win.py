@@ -2625,6 +2625,61 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Preset-Suche fehlgeschlagen: {e}")
         return None
 
+    def _purge_legacy_allowed(self, plugin_id: str,
+                              params: Optional[Dict[str, Any]]) -> bool:
+        """True, wenn der Params-only-Legacy-Pool der Variante EINDEUTIG
+        dieser Variante gehoert (12.08.2026, Bugfix Runde 6).
+
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung (11.08.2026) liegen
+        unter dem reinen Params-only-Hash `generate_instance_hash(plugin_id,
+        params)` (ohne preset_name). Dieser Pool ist mehreren Varianten mit
+        IDENTISCHEN Params gemeinsam - er darf beim 'Data Only Loeschen'
+        einer einzelnen Variante nur entfernt werden, wenn KEINE andere
+        aktive Variante (Preset/Clone ODER Set-Instanz) denselben
+        Params-only-Hash besitzt.
+
+        Returns:
+            True = Pool eindeutig dieser Variante zugeordnet (Legacy-Purge
+            erlaubt); False = Pool wird geteilt oder nicht bestimmbar.
+        """
+        if not plugin_id or params is None:
+            return False
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            return False
+        target = generate_instance_hash(plugin_id, params)
+        owners = 0
+        sm = getattr(self, "_state_manager", None)
+        if sm is not None:
+            try:
+                for p in sm.list_plugin_presets(plugin_id) or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if generate_instance_hash(
+                            plugin_id, p.get("params") or {}) == target:
+                        owners += 1
+            except Exception:
+                pass
+        try:
+            for set_id in self.set_repo.list_sets():
+                defn = self.set_repo.get_set(set_id)
+                if not isinstance(defn, dict):
+                    continue
+                for cfg in (defn.get("services") or {}).values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    cpid = str(cfg.get("plugin_id") or "")
+                    if cpid.lower() == plugin_id.lower() and \
+                            generate_instance_hash(
+                                cpid, cfg.get("params") or {}) == target:
+                        owners += 1
+        except Exception:
+            pass
+        # owners == 1: nur diese eine Variante belegt den Pool. owners == 0
+        # (z. B. Standalone-Service): kein Legacy-Pool-Szenario - False.
+        return owners == 1
+
     def _next_preset_copy_name(self, sm, plugin_id: str,
                                base: str) -> str:
         """Naechster freier Preset-Name fuer eine Varianten-Kopie (Q8).
@@ -2699,12 +2754,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         try:
             from analytics.features.feature_builder import FeatureBuilder
             n = FeatureBuilder().purge_instance_data(
-                instance_hash, plugin_id, params)
+                instance_hash, plugin_id, params,
+                purge_legacy=self._purge_legacy_allowed(
+                    plugin_id, params))
         except Exception as e:
             self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
             return
         self.log(f"Feature-Daten gelöscht: {n} Zeilen "
                  f"(Instanz #{instance_hash}, alle Timeframes).")
+        self._reset_run_progress()
         event_bus.service_set_changed.emit()
 
     @Slot(str, str, str, str)
@@ -2793,6 +2851,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
             self.log(f"Variante #{hash_} purged ({n} Zeilen).")
+            self._reset_run_progress()
         self.log(f"Instanz vollständig gelöscht: {label}")
         event_bus.service_set_changed.emit()
         if self._current_set_id == set_id:
@@ -2834,11 +2893,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             try:
                 from analytics.features.feature_builder import FeatureBuilder
                 n = FeatureBuilder().purge_instance_data(
-                    instance_hash, plugin_id, preset.get("params") or {})
+                    instance_hash, plugin_id, preset.get("params") or {},
+                    purge_legacy=self._purge_legacy_allowed(
+                        plugin_id, preset.get("params") or {}))
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
             self.log(f"Variante #{instance_hash} purged ({n} Zeilen).")
+            self._reset_run_progress()
         self.log(f"Preset vollständig gelöscht: '{preset_name}'.")
         event_bus.service_set_changed.emit()
 
