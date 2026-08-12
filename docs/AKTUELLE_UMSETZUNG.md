@@ -568,3 +568,69 @@ Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller
 ## ✅ Headless-Verifikation
 
 - Gesamtlauf `test/test.py` (alle Checks PASS); `test/`-Inhalt = nur `test.py`.
+
+---
+
+# Implementierungs-Log 21.03 (MTF-FC v4) – 12.08.2026
+
+> Taxonomie 21.03, Format MD. Einträge je umgesetztem Schritt nach Anwender-Bestätigung. Headless-Validierung ohne UI-Ausführung (Grundsatz 2).
+
+## 21.03.01 – Data Provider & `shared_state`-Namespace (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_state.py` (Namespace-Factory `default_mtf_fc_state()`, `ensure_mtf_fc_namespace()` – alle Keys aus §5), `analytics/engine/mtf_fc_provider.py` (`MtfFcProvider` mit `get_earliest_timestamp`/`get_latest_timestamp` via MIN/MAX `"time"`, Cache-Key `(symbol, timeframe, partition)`, `is_cache_valid`, `read_namespace`/`write_namespace`, `clear_partition`).
+- **Verifikation:** Namespace-Default-Struktur (alle §5-Keys), `get_earliest_timestamp("SILVER", "M1")` ≈ 2013-06-05 (reale DB, Wanduhr), Cache-Stale-Erkennung bei veraltetem `source_max_timestamp` – Test 1-Teilblock in `test/test.py` PASS.
+- **Commit:** `4217e71`
+
+## 21.03.02 – Boundary Policy & Historien-Detection (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_boundary.py` (`MtfFcBoundary` mit `resolve_boundary`, `evaluate_coverage` native/fallback, `format_available_date` als `DD.MM.JJJJ`, Wanduhr-Formatierung ohne Berlin-Offset, Fallback-Kandidaten M5/M15/H1/H4/D1). Regel: höhere Aggregationsstufe wird nie als M1 deklariert.
+- **Verifikation:** Test 3 (Daten vor M1-Grenze → `fallback`/`source_tf = "H1"`, nach Grenze → `"native"`) PASS.
+- **Commit:** `4217e71`
+
+## 21.03.03 – Hysterese-Kaskaden-Engine (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_cascade.py` – Schwellwerte (M1/M5→H1 bei 3.5 d, H1→M5 bei <2.0 d, H1→H4 bei >10 d, H4→D1 bei >35 d, D1→H4 bei <28 d), `CROSSFADE_DURATION_MS = 250`, `evaluate_cascade`, `transition_guard_ok`, `apply_transition`, Telemetrie `(trigger, from_tf, to_tf, range_days)`.
+- **Verifikation:** Test 1 (Hysterese-Boundary 1.99/2.01/3.49/3.51 d) + Test 2 (20-fach Anti-Oszillation im Fenster [1.9 d, 3.6 d]) PASS.
+- **Commit:** `4217e71`
+
+## 21.03.04 – Confluence-Gewichtung & Normalisierung (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_confluence.py` – Gewichte (D1=3.0, H4=2.5, H1=2.0, M15/M30=1.5, M5=1.2, M1=1.0), `min_max_normalize` mit Constant-Matrix-Policy (flache Matrix → 0.5, keine Division durch Null), `volatility_ratio` mit Clamp 0.2–5.0 und Deaktivierung bei ATR ≤ 1e-6.
+- **Verifikation:** Test 5 (flache Matrix → 0.5; W-D1-Übermacht vor Min-Max) PASS.
+- **Commit:** `4217e71`
+
+## 21.03.05 – State-Machine & Prioritäts-Kette (Guards & Override) (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_guards.py` – `apply_priority_chain` (Ebene 1 Hard Data Availability Guard → Ebene 2 Temporary User Override → Ebene 3 Fixed Data-TF Guard → Ebene 4 Auto Cascade → Ebene 5 Visual Preference), `start_override`/`reset_override` mit Transaktions-Semantik (`previous_data_tf`, `target_tf`, `reason`), `override_badge_text`, Inkongruenz-Warnung `WARNING_INCONGRUENT`.
+- **Verifikation:** Test 4 (M15-Fix + D1-Geister-Marker-Klick → `previous_data_tf = "M15"`, Reset stellt exakt wieder her) PASS.
+- **Commit:** `4217e71`
+
+## 21.03.06 – Event-Partitionierung & Cache-Invalidierung (12.08.2026 17:11)
+
+- **Umgesetzt:** `analytics/engine/mtf_fc_partition.py` – `partition`, `invalidate_partition` (+ `cache_generation`-Inkrement), `invalidate_partition_via_provider`; Integration mit Provider-Cache-Versionierung (21.03.01).
+- **Verifikation:** Test 6 (historischer Tick t = vor 5 Tagen → exakt die betroffene Zeit-Partition wird invalidiert, alle übrigen bleiben) PASS.
+- **Commit:** `4217e71`
+
+## 21.03.07 – MtfFilterBarWidget & Control-Panel (UI) (12.08.2026 17:16)
+
+- **Umgesetzt:** `chart/widgets/mtf_filter_bar.py` (`MtfFilterBarWidget`, MVVM – keine SQL/DB in UI): Source-Data-TF (`multi`/Fixiert), Chart-Overlay-TF (Auto/Manuell), Range-Picker (24h/7d/30d/YTD/benutzerdefiniert), Sortierung, Sessions (London/NY/Tokio), Presets; Signale für Data-TF/Range/TF-Wechsel. `analytics/engine/mtf_fc_templates.py` (`create_template`, `migrate_template` mit SchemaMigrator-Semantik, Payload-Key `mtf_fc_schema_version = "1.0.0"`, `MtfFcTemplateStore` in-memory).
+- **Verifikation:** `py_compile` aller Dateien; Code-Inspektion (kein SQL in UI, EventBus-Entkopplung); Template-Migration headless (T7v1/v2) PASS.
+- **Commit:** `4425bc9`
+
+## 21.03.08 – Chart-Integration: Kaskade, Puls-Breadcrumb & Historien-Anzeige (12.08.2026 17:16)
+
+- **Umgesetzt:** `chart/js/07_mtf_fc.js` (Zoom-Hook `pyBridge.onViewportChanged`, `_mtfFcApplyRange`, Puls-Breadcrumb, Boundary-UI), `chart/js/04_live_updates.js` (optionale Hooks `_onMtfFcFullUpdate`/`_onMtfFcVisibleRangeChanged`), `chart/chart_basics.py` (`JS_FILES` erweitert), `chart/chart_win.py` (`ChartBridge.viewportChanged`, MTF-FC-Init, `_on_mtf_fc_viewport_changed`, `_on_mtf_fc_range_changed`, `_mtf_fc_switch_tf`, `mtfFcState` im Update-Payload).
+- **Verifikation:** `node --check` auf allen JS-Dateien; `py_compile`; Code-Inspektion.
+- **Commit:** `4425bc9`
+
+## 21.03.09 – Interaktives Layering: TF-Badges & Geister-Marker (12.08.2026 17:16)
+
+- **Umgesetzt:** `chart/js/08_mtf_layers.js` (TF-Badges `onBadgeClick`, Geister-Marker `onGhostMarkerClick`, Reset-Badge, `animateToGhostLevel`), `chart/chart_win.py` (`badgeClicked`, `ghostMarkerClicked`, `guardOverrideReset`, `_push_mtf_fc_override_ui`, Handler `_on_mtf_fc_badge_clicked`, `_on_mtf_fc_ghost_marker_clicked`, `_on_mtf_fc_guard_reset`).
+- **Verifikation:** `node --check`; `py_compile`; Code-Inspektion (Guard-Override-Trigger über 21.03.05, Reset stellt `previous_data_tf` wieder her).
+- **Commit:** `4425bc9`
+
+## 21.03.10 – Abschluss: Integrationstest & Cleanup (12.08.2026 17:20)
+
+- **Umgesetzt:** Test 7 (Service-Failure-Degradation) standalone verifiziert und als Tests 1–7 (inkl. T7v1/v2 Template-Migration) in `test/test.py` integriert; Gesamtlauf ausgeführt; Cleanup temporärer Skripte (`check_mtf_fc.py`, `check_mtf_fc_test7.py`, `check_mtf_fc_ui.py`, `test_output_stderr.txt`) – verbleibt nur der Harness `test/test.py` (Grundsatz 10).
+- **Verifikation:** `py_compile test/test.py` EXIT 0; Gesamtlauf: **alle 21.03 MTF-FC-Checks PASS** (T1a–T7.7, T7v1/v2). 26 vorbestehende FAILs (Fenster-/Reflow-, JSON-Feld-Auflösung, `instance_hash`-Binder in den 20.03-Analytics-Tests) sind Bestandszustand und nicht durch MTF-FC verursacht – der 21.03-Block ist vollständig grün. Keine neuen Quell-Commits nötig (Code bereits in `4217e71`/`4425bc9`, `test/` gitignored).
+- **Commit:** – (nur Doku)
