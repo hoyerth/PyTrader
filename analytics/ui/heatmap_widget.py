@@ -731,14 +731,14 @@ class HeatmapWidget(QWidget):
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
         # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
-        # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung ist ENTFERNT -
-        # das 'Feld'-Dropdown schreibt KEIN feature_ids mehr (kein
-        # Ueberschreiben der ServicePicker-Auswahl bzw. des Restores). Die
-        # Haken spiegeln den aktiven Filter (_sync_combos_from_payload); die
-        # Feld-Auswahl (Current-Item) steuert heatmap_field weiterhin ueber
-        # currentIndexChanged -> _on_config_changed.
-        # self._combo_field.selection_changed.connect(
-        #     self._on_field_selection_changed)
+        # 21.03.15 (Bug 1): Die Verbindung ist WIEDER AKTIV - Check/Uncheck
+        # im 'Feld'-Dropdown schreibt feature_ids ueber den bestehenden
+        # ServicePicker-Pfad (`_on_field_selection_changed` ->
+        # `_reconcile_sammel_checks` -> `_checked_field_service_ids` ->
+        # `set_feature_ids`), damit ServicePicker-Auswahl und Feld-Dropdown
+        # konsistent bleiben.
+        self._combo_field.selection_changed.connect(
+            self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -1011,14 +1011,13 @@ class HeatmapWidget(QWidget):
     # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
     # ------------------------------------------------------------------
     def _on_field_selection_changed(self, _checked: List[str]) -> None:
-        """CheckState-Wechsel im 'Feld'-Dropdown (nicht mehr verbunden).
+        """CheckState-Wechsel im 'Feld'-Dropdown -> feature_ids-Filter.
 
-        10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung
-        selection_changed -> dieser Handler wurde in __init__ entfernt - das
-        'Feld'-Dropdown schreibt KEIN feature_ids mehr (Single Source of
-        Truth = ServicePicker; kein Ueberschreiben des Restores). Der Handler
-        bleibt als Bestandscode erhalten.
-        -> feature_ids-Filter.
+        21.03.15 (Bug 1): Die Verbindung selection_changed -> dieser
+        Handler ist WIEDER aktiv (siehe __init__) - Check/Uncheck im
+        'Feld'-Dropdown schreibt feature_ids ueber den ServicePicker-
+        Pfad, damit ServicePicker-Auswahl und Feld-Dropdown konsistent
+        bleiben (Single Source of Truth = ServicePicker + Dropdown).
 
         Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
         `set_feature_ids` stoesst den Debounce-Refresh der generischen
@@ -1609,6 +1608,21 @@ class HeatmapWidget(QWidget):
         active_ids = {str(f).strip().lower()
                       for f in (p.get("feature_ids") or [])}
         no_filter = not active_ids
+        # 21.03.15 (Bug 2): Bei leerem Filter (kein feature_ids-Filter)
+        # wird NICHT mehr jede Checkbox angehakt, sondern nur der ERSTE
+        # Parameter vorbelegt (fuer AVG/SUM/MIN/MAX ist genau EIN aktives
+        # Hauptfeld sinnvoll). `_chk` liefert im no_filter-Modus genau
+        # einmal True.
+        first_done = [no_filter]
+
+        def _chk(match: bool) -> bool:
+            if no_filter:
+                if first_done[0]:
+                    first_done[0] = False
+                    return True
+                return False
+            return match
+
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
@@ -1621,21 +1635,22 @@ class HeatmapWidget(QWidget):
                     src = self._field_sources.get(k) or []
                     self._combo_field.add_checkable_item(
                         f"Alle Services / {k}", f"ALL|{k}",
-                        checked=no_filter or all(
-                            s.lower() in active_ids for s in src))
+                        checked=_chk(all(
+                            s.lower() in active_ids for s in src)))
             if self._field_keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
             for k in sorted(self._field_keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
                     # Eindeutiger Service: nur angehakt, wenn der Service im
-                    # aktiven Filter liegt (oder kein Filter).
+                    # aktiven Filter liegt (ohne Filter der erste Eintrag).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
-                        checked=no_filter or sids[0].lower() in active_ids)
+                        checked=_chk(sids[0].lower() in active_ids))
                 elif not sids:
                     # Legacy ohne field_sources (roher Key, defensiv).
-                    self._combo_field.add_checkable_item(k, k, checked=True)
+                    self._combo_field.add_checkable_item(k, k,
+                                                         checked=_chk(True))
                 else:
                     # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
                     # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
@@ -1643,8 +1658,8 @@ class HeatmapWidget(QWidget):
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
-                            checked=no_filter
-                            or (sid.lower() in active_ids and not all_active))
+                            checked=_chk(sid.lower() in active_ids
+                                         and not all_active))
             if prev_field in self._field_keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
@@ -2294,14 +2309,17 @@ class HeatmapWidget(QWidget):
                 label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            # 21.03.15 (Bug 5): Viridis als halboffene Intervalle [a,b) -
+            # die Schwellen v25/v50/v75/vmax gehoeren exakt zu EINEM
+            # Intervall (keine ueberlappenden Kanten mehr): `< v25`,
+            # `v25..v50`, `v50..v75`, `v75..vmax`, `>= vmax`.
             span = vmax - vmin
             v25 = vmin + 0.25 * span
             v50 = vmin + 0.50 * span
             v75 = vmin + 0.75 * span
             fmt = _format_heatmap_value
             self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
-                                    "<= {}".format(fmt(v25)))
+                                    "< {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
                                     "{} - {}".format(fmt(v25), fmt(v50)))
             self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
@@ -2309,7 +2327,7 @@ class HeatmapWidget(QWidget):
             self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
                                     "{} - {}".format(fmt(v75), fmt(vmax)))
             self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
-                                    ">= {}".format(fmt(v75)))
+                                    ">= {}".format(fmt(vmax)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:

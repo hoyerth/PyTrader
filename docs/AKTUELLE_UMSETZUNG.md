@@ -1118,3 +1118,94 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   Aenderung fuegt KEINE neuen FAILs hinzu.
 
 - **Commit:** `1ed270c`
+
+## 21.03.15 - Bug-Runde 5 Bugs: Range-Presets 90d/Year, Feld-Dropdown, Session-Zeile (FERTIG)
+
+Umsetzung der 5 gemeldeten Bugs mit den Benutzer-Entscheidungen (21.03.15):
+Bug 3 -> 'Year' (365-Tage-Fenster) statt 'YTD' + neues Preset '90d'; Bug 4 ->
+Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
+
+### Bug 1 - Heatmap 'Feld'-Dropdown schreibt wieder feature_ids (FIX)
+- **Geaendert:** `analytics/ui/heatmap_widget.py` - die seit 10.08.2026
+  (Runde 7) auskommentierte Verbindung `_combo_field.selection_changed ->
+  _on_field_selection_changed` ist WIEDER AKTIV. Check/Uncheck im
+  'Feld'-Dropdown schreibt `feature_ids` ueber den bestehenden
+  ServicePicker-Pfad (`_reconcile_sammel_checks` -> `_checked_field_service_ids`
+  -> `set_feature_ids`), damit ServicePicker-Auswahl und Feld-Dropdown
+  konsistent bleiben. Docstring von `_on_field_selection_changed` aktualisiert.
+
+### Bug 2 - Feld-Dropdown: bei leerem Filter NUR erster Parameter (FIX)
+- **Geaendert:** `analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`
+  haengte bei leerem `feature_ids`-Filter JEDE Checkbox an (`no_filter=True`).
+  Neu: lokaler Helper `_chk(match)` - im `no_filter`-Modus wird genau der
+  ERSTE Parameter (erster Checkable-Eintrag) angehakt, alle weiteren leer
+  (fuer AVG/SUM/MIN/MAX ist genau EIN aktives Hauptfeld sinnvoll). Bei
+  aktivem Filter unveraendert (nur passende Haken).
+
+### Bug 3 - Range-Presets: 'YTD' -> 'Year' (365 Tage) + '90d' (FIX)
+- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - `RANGE_PRESETS` =
+  `["24h", "7d", "30d", "90d", "Year"]`; `_on_range_changed` rechnet
+  `90d = 90*86400` und `Year = 365*86400` (kein Jahresbeginn-Fenster mehr,
+  wie entschieden). `_ytd_epoch_offset` entfernt, ToolTip aktualisiert.
+- **Migration:** Alt-Profile mit `'YTD'` -> `'Year'` und `'Benutzerdefiniert'`
+  -> `'7d'` werden an 3 Stellen abgebildet: Widget `apply_external_state`
+  (defensiv vor `setCurrentText`), VM `set_range` und VM
+  `_restore_params_from_payload` (Restore-Pfad). Dadurch ueberleben
+  gespeicherte Profile den Preset-Umbau.
+
+### Bug 4 - Custom-Panel entfernt, Sessions in Zeile 1 (FIX)
+- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - das benutzerdefinierte
+  Von-/Bis-Panel (QDateTimeEdit-Picker, Zeile 2) ist KOMPLETT entfernt:
+  Imports (`QDateTime`/`QDateTimeEdit`), State-Vars (`_last_range`,
+  `_custom_from`, `_custom_to`), Methoden (`_apply_custom_range_state`,
+  `_default_custom_range`, `_set_custom_pickers`, `_show_custom_pickers`,
+  `_hide_custom_pickers`, `_on_custom_range_changed`, `_emit_custom_range`,
+  `_epoch_to_qdt`, `_qdt_to_epoch`), `apply_external_state`-Parameter
+  `range_from`/`range_to` und der `"Benutzerdefiniert"`-Zweig. Die
+  Session-Checkboxen stehen jetzt in ZEILE 1 rechts neben der Sortierung
+  (eine Zeile, sizeHint 1152x26).
+- **Geaendert:** `analytics/ui/analytics_win.py` - `_sync_mtf_bar_from_params`
+  ruft `apply_external_state` ohne `range_from`/`range_to`.
+- **Geaendert:** `analytics/engine/analytics_view_model.py` - Docstring von
+  `set_range` aktualisiert ('7d'/'90d'/'Year'); `range_from`/`range_to`
+  bleiben als effektiver Zeitfilter in den Params/Payload erhalten.
+- **Geaendert:** `analytics/engine/mtf_fc_templates.py` - `custom_range` aus
+  `_TEMPLATE_KNOWN_KEYS`/`_TEMPLATE_DEFAULTS` entfernt; neue Helper-Funktion
+  `_normalize_obsolete` entfernt `custom_range` auch aus Alt-Templates mit
+  bereits aktueller Schema-Version und mappt `YTD`/`Benutzerdefiniert`.
+
+### Bug 5 - Viridis-Legende: Intervalle ohne ueberlappende Kanten (FIX)
+- **Geaendert:** `analytics/ui/heatmap_widget.py` - `_update_legend`
+  (Viridis-Zweig): die alten Labels `<= v25 / v25-v50 / v50-v75 / v75-vmax /
+  >= v75` ueberlappten an v50/v75/vmax. Neu halboffene Intervalle [a,b):
+  `< v25`, `v25-v50`, `v50-v75`, `v75-vmax`, `>= vmax` - jede Schwelle
+  gehoert exakt zu EINEM Intervall.
+
+### Verifikation (headless, Grundsatz 2 - keine UI-/Regressionstests)
+- `py_compile` aller geaenderten Dateien EXIT 0 (mtf_filter_bar.py,
+  analytics_win.py, analytics_view_model.py, heatmap_widget.py,
+  mtf_fc_templates.py).
+- **Neu/umgebaut:** `test/check_custom_range_sortmode.py` (permanent,
+  47/47 PASS):
+  * Teil A: Preset-Satz 24h/7d/30d/90d/Year, Sekunden exakt (90d/Year),
+    'YTD'/'Benutzerdefiniert' entfallen, kein `_custom_panel`/`_dt_from`.
+  * Teil B: `apply_external_state` migriert 'YTD'->'Year' und
+    'Benutzerdefiniert'->'7d'; Signatur ohne range_from/range_to.
+  * Teil C: VM-Migration `set_range` + `_restore_params_from_payload`.
+  * Teil D: Session-Checkboxen (Bug 4) - London/New York/Tokio,
+    `sessions_changed` emittiert korrekt.
+  * Teil E-H: sort_mode-Persistenz (21.03.14 erhalten), Integrationspfad,
+    AnalyticsWindow-Quelltext-Inspektion (kein range_from/to mehr, kein
+    Custom-Picker-Code).
+- **Neu:** `test/check_heatmap_field_checks.py` (permanent, 4/4 PASS):
+  * Bug 1: `selection_changed` -> `set_feature_ids` (Verbindung aktiv).
+  * Bug 2: no_filter -> genau EIN Haken (erster Parameter); aktiver Filter
+    -> passende Haken.
+- Unveraendert gruen: `test/check_analytics_mtffc_win.py` 22/22,
+  `test/check_analytics_mtffc.py` 13/13, `test/check_mtf_sort_binding.py`
+  21/21; `test/check_filterbar_visible.py` (Diagnose) zeigt die neue
+  EIN-Zeilen-Leiste (sizeHint 1152x26, alle Controls sichtbar).
+- `test/test.py` referenziert keine entfernten APIs (kein Custom-Panel/
+  YTD-Code); die MTF-FC-Kette bleibt unveraendert.
+
+- **Commit:** dd80a79

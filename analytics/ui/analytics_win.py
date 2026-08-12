@@ -750,15 +750,15 @@ class AnalyticsWindow(PersistentWindow):
             return
         p = self._vm.params
         try:
-            # 21.03.14 (Wunsch 1/2): range_from/range_to stellen einen
-            # gespeicherten benutzerdefinierten Zeitraum wieder her;
-            # sort_mode stellt die Tabellen-Sortierung wieder her.
+            # 21.03.14 (Wunsch 2): sort_mode stellt die Tabellen-Sortierung
+            # wieder her. 21.03.15 (Bug 3): range_preset wird auf den neuen
+            # Preset-Satz abgebildet (Alt-Werte 'YTD'/'Benutzerdefiniert'
+            # migriert die Filterleiste selbst); range_from/range_to (Custom-
+            # Panel) sind seit 21.03.15 entfallen.
             bar.apply_external_state(
                 data_tf=str(p.get("data_tf") or "multi"),
                 agg_tf=str(p.get("agg_tf") or "auto"),
                 range_preset=p.get("range_preset"),
-                range_from=p.get("range_from"),
-                range_to=p.get("range_to"),
                 sort_mode=p.get("sort_mode"),
             )
         except (RuntimeError, AttributeError):

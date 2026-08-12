@@ -362,13 +362,21 @@ class AnalyticsViewModel(QObject):
 
         `from_ts`/`to_ts` sind Wanduhr-Epochs (int) oder None (kein Filter).
         `preset` ist der Range-Preset-Name des MtfFilterBarWidget (z. B.
-        '7d'/'YTD', None = Benutzerdefiniert) und wird fuer die Profil-
-        Persistenz gemerkt. Wird vom Range-Picker des MtfFilterBarWidget
-        gesetzt (Basis = letzter Datenpunkt statt time.time()).
+        '7d'/'90d'/'Year', 21.03.15) und wird fuer die Profil-Persistenz
+        gemerkt. Alt-Werte 'YTD' (bis 21.03.15) bzw. 'Benutzerdefiniert'
+        (entfallenes Custom-Panel) werden auf den neuen Preset-Satz
+        abgebildet. Wird vom Range-Picker des MtfFilterBarWidget gesetzt
+        (Basis = letzter Datenpunkt statt time.time()).
         """
         f = int(from_ts) if from_ts is not None else None
         t = int(to_ts) if to_ts is not None else None
         preset = str(preset or "").strip() or None
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Preset-Satz (24h/7d/30d/90d/Year) abbilden.
+        if preset == "YTD":
+            preset = "Year"
+        elif preset == "Benutzerdefiniert":
+            preset = "7d"
         if (f == self._params.get("range_from")
                 and t == self._params.get("range_to")
                 and preset == self._params.get("range_preset")):
@@ -1181,6 +1189,13 @@ class AnalyticsViewModel(QObject):
                 self._params[key] = flat[key]
         if "instance_hashes" not in flat or not flat.get("instance_hashes"):
             self._params["instance_hashes"] = []
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Range-Preset-Satz abbilden (das Custom-Panel ist entfallen).
+        _preset = str(self._params.get("range_preset") or "").strip() or None
+        if _preset == "YTD":
+            self._params["range_preset"] = "Year"
+        elif _preset == "Benutzerdefiniert":
+            self._params["range_preset"] = "7d"
 
     def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
         """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
