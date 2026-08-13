@@ -1539,4 +1539,4 @@ def _on_mode_filter_changed(self) -> None:
   - `test/check_mode_filter_vm.py` (11 Checks): Default, Idempotenz, globaler Refresh, Dirty-Flag, `_current_params` fuer 6 Kinds, `_current_payload` sources - PASS.
   - `test/check_mode_filter_widget.py` (10 Checks): Items, enabled/disabled (Entscheidung 4), Reset auf all, `_on_mode_filter_changed`, Stale-Guard - PASS.
   - Bestehende Tests gruen: `check_analytics_mtffc.py` (13), `check_analytics_mtffc_win.py` (22), `check_field_pairs_db.py` (5), `check_field_selection.py` (19), `check_heatmap_field_checks.py`, `check_mtf_sort_binding.py` (21). `check_custom_range_sortmode.py` NICHT lauffaehig (externe DB-Sperre data/app_data.duckdb durch laufende App - unabhaengig von dieser Umsetzung).
-- **Commit:** Wird nach Anwender-Bestaetigung erstellt und hier nachgetragen.
+- **Commit:** ceb2351
