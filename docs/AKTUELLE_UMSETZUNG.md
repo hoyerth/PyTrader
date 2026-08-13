@@ -1520,3 +1520,23 @@ def _on_mode_filter_changed(self) -> None:
 - Keine UI-/Regressionstests (harte Regel). UI-Verhalten (Dropdown-Sichtbarkeit/Deaktivierung) per Code-Inspektion + manueller Anwender-Prüfung.
 - Implementierungs-Log: Eintrag 21.03.20 in `docs/AKTUELLE_UMSETZUNG.md` nach Anwender-Bestätigung.
 
+
+
+---
+
+# Implementierungs-Log 21.03.20 - Analytics Modus-Filter (13.08.2026 10:41)
+
+- **Umgesetzt (Entscheidungen 1-5):**
+  - `analytics/engine/analytics_view_model.py`: `_params["service_mode"] = "all"` Default, `set_service_mode(mode)` mit globalem Refresh (QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_SCATTER, QUERY_DISTRIBUTION; idempotent), `_current_params` Basis-Dict `service_mode` fuer ALLE Query-Kinds, `_current_payload` sources-Sektion `service_mode` (Restore ueber generische Key-Schleife).
+  - `analytics/engine/feature_store_reader.py`: `_apply_mode_filter` (json_extract_string + LOWER, `"all"`/None/leer = kein Filter) an allen 4 Daten-Pfaden (`fetch_rows`/`fetch_columns`/`fetch_heatmap`/`fetch_generic_heatmap`); `service_mode`-Parameter an alle 4 Signaturen; `_feature_meta_base` sammelt additiv `source_modes_by_service` (gleicher gecachter Basis-Scan, kein Extra-Roundtrip); neue Methode `fetch_available_source_modes(symbol, timeframe, feature_id, feature_ids, instance_hashes) -> (source_modes, has_source_mode_services)` mit feature_ids-/Hash-Filter (Muster `feature_keys_by_service`).
+  - `analytics/engine/analytics_worker.py`: `service_mode = p.get("service_mode")` einmalig lesen, Durchreichung an alle 5 Repo-Methoden (`get_table`/`get_heatmap`/`get_generic_heatmap`/`get_scatter`/`get_distribution`).
+  - `analytics/engine/analytics_repository.py`: `service_mode`-Parameter an alle 5 Methoden + Reader-Durchreichung; `get_available_features` liefert im QUERY_FEATURES-Leichtpfad `source_modes` + `has_source_mode_services` (defensiv leere Liste/False bei Fehler).
+  - `analytics/ui/heatmap_widget.py`: `_combo_mode_filter` (QComboBox, `[ Alle Modi ]` = data "all", min 150 px) in ctrl2 zwischen Aggregation und Feld; Signal `currentIndexChanged` -> `_on_mode_filter_changed` -> `vm.set_service_mode`; `_sync_mode_filter_from_payload` (blockSignals/_syncing, Stale-Guard via restore_generation) befuellt die Items aus `source_modes` (case-original), deaktiviert + resettet auf `"all"` bei `has_source_mode_services == False`, Restore aus `vm.params["service_mode"]`; `_sync_from_params` restauriert die Auswahl.
+- **Verifikation (headless, keine UI):**
+  - `py_compile` aller 5 geaenderten Quelldateien + 4 neuen Testdateien OK.
+  - `test/check_mode_filter_db.py` (26 Checks): `fetch_available_source_modes` (distinct/sortiert, feature_ids-Filter, has-Flag), alle 4 Reader-Filter-Pfade (rows/columns/heatmap/generic), Repo-Payload (`source_modes`/`has_source_mode_services`), `get_table`/`get_heatmap`/`get_scatter`/`get_distribution`-Durchreichung - ALLE PASS.
+  - `test/check_mode_filter_worker.py` (6 Checks): Dispatch-Kette _execute -> alle 5 Repo-Methoden - PASS.
+  - `test/check_mode_filter_vm.py` (11 Checks): Default, Idempotenz, globaler Refresh, Dirty-Flag, `_current_params` fuer 6 Kinds, `_current_payload` sources - PASS.
+  - `test/check_mode_filter_widget.py` (10 Checks): Items, enabled/disabled (Entscheidung 4), Reset auf all, `_on_mode_filter_changed`, Stale-Guard - PASS.
+  - Bestehende Tests gruen: `check_analytics_mtffc.py` (13), `check_analytics_mtffc_win.py` (22), `check_field_pairs_db.py` (5), `check_field_selection.py` (19), `check_heatmap_field_checks.py`, `check_mtf_sort_binding.py` (21). `check_custom_range_sortmode.py` NICHT lauffaehig (externe DB-Sperre data/app_data.duckdb durch laufende App - unabhaengig von dieser Umsetzung).
+- **Commit:** Wird nach Anwender-Bestaetigung erstellt und hier nachgetragen.

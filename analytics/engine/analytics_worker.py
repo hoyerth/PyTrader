@@ -171,6 +171,10 @@ class AnalyticsAsyncWorker(QThread):
         from_ts = p.get("from_ts")
         to_ts = p.get("to_ts")
         bucket_tf = p.get("bucket_tf") or None
+        # 21.03.20 (Analytics Modus-Filter): globaler
+        # source_mode-Filter fuer Multi-Modus-Services
+        # (None/"all" = kein Filter).
+        service_mode = p.get("service_mode")
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
@@ -180,6 +184,7 @@ class AnalyticsAsyncWorker(QThread):
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
                 from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP:
             return repo.get_heatmap(
@@ -189,6 +194,7 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -218,6 +224,7 @@ class AnalyticsAsyncWorker(QThread):
                 # Auswahl des 'Feld'-Dropdowns -> Reader filtert auf
                 # Parameter-Ebene (feature_data-JSON-Keys je Service).
                 field_pairs=p.get("field_selection") or [],
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -244,6 +251,7 @@ class AnalyticsAsyncWorker(QThread):
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
                 from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
@@ -255,6 +263,7 @@ class AnalyticsAsyncWorker(QThread):
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
                 from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params

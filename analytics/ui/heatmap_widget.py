@@ -586,6 +586,22 @@ class HeatmapWidget(QWidget):
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown fuer
+        # Multi-Modus-Services (srv_swing_*/srv_trend_* schreiben
+        # `source_mode` top-level in jedes feature_data-Record).
+        # Wird aus dem QUERY_FEATURES-Payload befuellt
+        # (`source_modes` + `has_source_mode_services`);
+        # "[Alle Modi]" (data "all") = kein Filter. Deaktiviert,
+        # wenn KEIN aktiver Service source_mode schreibt.
+        self._combo_mode_filter = QComboBox()
+        self._combo_mode_filter.addItem("[Alle Modi]", "all")
+        self._combo_mode_filter.setMinimumWidth(150)
+        self._combo_mode_filter.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self._combo_mode_filter.setToolTip(
+            "Modus-Filter: grenzt die Daten auf einen source_mode "
+            "der Multi-Modus-Services ein (global fuer Tabelle, "
+            "Heatmaps, Scatter, Verteilung).")
         # 20.03.02 (F1c/F7): 'Feld' ist ein CheckableComboBox – die
         # Multi-Auswahl steuert den Datenquellen-Filter `feature_ids`, die
         # Aggregation nutzt genau EIN aktives Hauptfeld (currentData). Bei
@@ -653,6 +669,9 @@ class HeatmapWidget(QWidget):
         ctrl2.addSpacing(15)
         ctrl2.addWidget(QLabel("Aggregation:"))
         ctrl2.addWidget(self._combo_agg)
+        ctrl2.addSpacing(10)
+        ctrl2.addWidget(QLabel("Modus:"))
+        ctrl2.addWidget(self._combo_mode_filter)
         ctrl2.addSpacing(10)
         ctrl2.addWidget(QLabel("Feld:"))
         ctrl2.addWidget(self._combo_field, 1)
@@ -758,6 +777,10 @@ class HeatmapWidget(QWidget):
         self._combo_x.currentIndexChanged.connect(self._on_config_changed)
         self._combo_y.currentIndexChanged.connect(self._on_config_changed)
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
+        # 21.03.20 (Analytics Modus-Filter): Aenderung im Modus-
+        # Dropdown -> globaler ViewModel-Refresh (alle Datenquellen).
+        self._combo_mode_filter.currentIndexChanged.connect(
+            self._on_mode_filter_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
         # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
         # 21.03.15 (Bug 1): Die Verbindung ist WIEDER AKTIV - Check/Uncheck
@@ -843,6 +866,12 @@ class HeatmapWidget(QWidget):
             self._set_combo_data(
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
+            # 21.03.20 (Analytics Modus-Filter): Modus-Auswahl aus
+            # den VM-Params wiederherstellen (Profil-/Workspace-
+            # Restore; unbekannte Werte werden additiv ergaenzt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(p.get("service_mode") or "all"))
             # Runde 8 (Bugfix 3): Das 'Feld'-Dropdown wird aus den gecachten
             # Feld-Metadaten (self._field_keys/self._field_sources) + den
             # aktuellen VM-Params SYNCHRON neu abgeleitet (Items, Haken,
@@ -987,6 +1016,19 @@ class HeatmapWidget(QWidget):
         self._update_controls()
         self._apply_config()
         self.request_data()
+
+    def _on_mode_filter_changed(self, *args) -> None:
+        """21.03.20: Modus-Filter-Aenderung -> ViewModel (global).
+
+        `set_service_mode` stoesst intern den Refresh von
+        QUERY_FEATURES + allen Datenquellen an (Tabelle, beide
+        Heatmaps, Scatter, Verteilung - Entscheidung 1). Der
+        _syncing-Guard verhindert Endlos-Schleifen.
+        """
+        if self._syncing or self._view_model is None:
+            return
+        mode = str(self._combo_mode_filter.currentData() or "all")
+        self._view_model.set_service_mode(mode)
 
     def _apply_config(self) -> None:
         self._view_model.set_heatmap_config(
@@ -1378,6 +1420,11 @@ class HeatmapWidget(QWidget):
                 field_sources if isinstance(field_sources, dict) else {})
         else:
             self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown aus dem
+        # LEICHTEN QUERY_FEATURES-Payload befuellen (`source_modes`
+        # + `has_source_mode_services`; Entscheidung 2: kein Extra-
+        # Roundtrip, Worker-Thread + Reader-Cache).
+        self._sync_mode_filter_from_payload(data)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
         """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
@@ -1391,6 +1438,51 @@ class HeatmapWidget(QWidget):
             self._no_data_variants_error = True
             self._rebuild_field_dropdown(self._field_keys,
                                          self._field_sources)
+
+    def _sync_mode_filter_from_payload(self, data: Dict[str, Any]) -> None:
+        """Befuellt das Modus-Dropdown aus dem QUERY_FEATURES-Payload.
+
+        21.03.20 (Entscheidung 2/4): `source_modes` (distinct, case-original)
+        fuellt die Items (itemData = Modus-Wert). `has_source_mode_services
+        == False` deaktiviert die Combo und setzt den Filter auf "all"
+        zurueck (kein aktiver Service schreibt source_mode). Stale-Payloads
+        werden verworfen (Generation-Guard, Muster _sync_combos_from_payload).
+        """
+        if self._view_model is None:
+            return
+        vm = self._view_model
+        payload_gen = data.get("restore_generation")
+        if (payload_gen is not None
+                and str(payload_gen) != str(
+                    getattr(vm, "restore_generation", 0))):
+            return  # Stale-Payload (Query lief VOR dem letzten Restore)
+        modes = [str(m) for m in (data.get("source_modes") or [])]
+        has_sm = bool(data.get("has_source_mode_services"))
+        self._syncing = True
+        try:
+            self._combo_mode_filter.blockSignals(True)
+            self._combo_mode_filter.clear()
+            self._combo_mode_filter.addItem("[Alle Modi]", "all")
+            for m in modes:
+                if str(m).strip():
+                    self._combo_mode_filter.addItem(
+                        str(m).strip(), str(m).strip())
+            # Deaktivierung: Combo aus + Filter auf "all" zuruecksetzen
+            # (idempotent - set_service_mode("all") refresh-t nur bei
+            # tatsaechlicher Aenderung).
+            if not has_sm:
+                self._combo_mode_filter.setEnabled(False)
+                if str(vm.params.get("service_mode") or "all") != "all":
+                    vm.set_service_mode("all")
+            else:
+                self._combo_mode_filter.setEnabled(True)
+            # Auswahl aus den VM-Params wiederherstellen (Restore gewinnt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(vm.params.get("service_mode") or "all"))
+        finally:
+            self._combo_mode_filter.blockSignals(False)
+            self._syncing = False
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)

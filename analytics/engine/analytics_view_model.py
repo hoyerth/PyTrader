@@ -182,6 +182,11 @@ class AnalyticsViewModel(QObject):
             # Profil-/Workspace-Restore ueber die Filterleiste restauriert
             # (nach dem Rueckbau der View-Template-Buttons).
             "sort_mode": "date",
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+            # Multi-Modus-Services. Default "all" = kein Filter (alle Modi).
+            # Wirkt GLOBAL auf alle Analytics-Datenquellen (Entscheidung 1);
+            # wird in der sources-Sektion des Profil-Payloads persistiert.
+            "service_mode": "all",
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -356,6 +361,25 @@ class AnalyticsViewModel(QObject):
             return
         self._params["sort_mode"] = mode
         self._mark_dirty()
+
+    def set_service_mode(self, mode: str) -> None:
+        """21.03.20: Setzt den Modus-Filter (z. B. 'MA_Peak_Hysteresis').
+
+        `"all"` (Default) = kein Filter (alle Modi). Wirkt GLOBAL auf
+        alle Analytics-Datenquellen (Entscheidung 1): Tabelle, beide
+        Heatmaps, Scatter, Verteilung. `QUERY_FEATURES` wird mitrefreshed,
+        damit die dynamische Modus-Liste / das Deaktivierungs-Flag
+        (`has_source_mode_services`) synchron zur Auswahl bleibt. Idempotent
+        ohne Aenderung (kein Refresh/Dirty).
+        """
+        mode = str(mode or "all").strip()
+        if mode == self._params.get("service_mode"):
+            return
+        self._params["service_mode"] = mode
+        self._mark_dirty()
+        self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
 
     def set_range(self, from_ts, to_ts, preset: Optional[str] = None) -> None:
         """Setzt den Zeitraum-Filter (optional, bar_time BETWEEN).
@@ -981,6 +1005,9 @@ class AnalyticsViewModel(QObject):
             # (Wanduhr-Epochs relativ zum letzten Datenpunkt; None = alle).
             "from_ts": p.get("range_from"),
             "to_ts": p.get("range_to"),
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+            # (GLOBAL - alle Query-Kinds, Entscheidung 1).
+            "service_mode": p.get("service_mode", "all"),
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -1343,6 +1370,10 @@ class AnalyticsViewModel(QObject):
                 "range_to": p.get("range_to"),
                 "all_timeframes": p.get("all_timeframes"),
                 "sort_mode": p.get("sort_mode"),
+                # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+                # wird additiv in der sources-Sektion persistiert
+                # (Restore ueber _restore_params_from_payload).
+                "service_mode": p.get("service_mode"),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),

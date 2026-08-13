@@ -63,6 +63,9 @@ class AnalyticsRepository:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
 
@@ -72,7 +75,8 @@ class AnalyticsRepository:
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes, limit=limit,
-            from_ts=from_ts, to_ts=to_ts)
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -91,6 +95,9 @@ class AnalyticsRepository:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -119,7 +126,8 @@ class AnalyticsRepository:
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
             feature_ids=feature_ids, instance_hashes=instance_hashes,
-            from_ts=from_ts, to_ts=to_ts
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode
         )
         result["metrics"] = metrics
         return result
@@ -233,6 +241,9 @@ class AnalyticsRepository:
         # auf PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer/
         # None = kein Paar-Filter (reines feature_ids-Verhalten).
         field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -282,6 +293,7 @@ class AnalyticsRepository:
                 all_timeframes=all_timeframes,
                 bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
                 field_pairs=field_pairs,
+                service_mode=service_mode,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -371,6 +383,9 @@ class AnalyticsRepository:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
@@ -402,6 +417,7 @@ class AnalyticsRepository:
             feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes, limit=limit,
             from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -440,6 +456,9 @@ class AnalyticsRepository:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
@@ -471,6 +490,7 @@ class AnalyticsRepository:
             symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, instance_hashes=instance_hashes,
             limit=limit, from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -577,6 +597,19 @@ class AnalyticsRepository:
             instance_hashes=instance_hashes)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
+        # 21.03.20 (Analytics Modus-Filter): source_modes +
+        # Deaktivierungs-Flag im LEICHTEN QUERY_FEATURES-Payload
+        # (Modus-Dropdown im HeatmapWidget; gecachter Reader-Basis-
+        # Scan, kein zusaetzlicher Roundtrip).
+        try:
+            source_modes, has_sm = (
+                self.reader.fetch_available_source_modes(
+                    symbol, timeframe, feature_ids=feature_ids,
+                    instance_hashes=instance_hashes))
+        except Exception:
+            source_modes, has_sm = [], False
+        result["source_modes"] = source_modes
+        result["has_source_mode_services"] = has_sm
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(

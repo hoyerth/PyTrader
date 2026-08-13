@@ -259,6 +259,11 @@ class FeatureStoreReader:
         types_by_service: Dict[str, Dict[str, set]] = {}
         hashes_by_service: Dict[str, set] = {}
         null_hash_pids: Set[str] = set()
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Werte je
+        # Service (Multi-Modus-Services srv_swing_*/srv_trend_*) -
+        # Grundlage des Modus-Dropdowns OHNE zusaetzlichen
+        # DB-Roundtrip (gleicher Cache wie die Keys, Runde 15).
+        source_modes_by_service: Dict[str, Set[str]] = {}
         for fid, hash_raw, raw in rows:
             data = self._normalize_feature_data(raw)
             if not isinstance(data, dict):
@@ -285,10 +290,18 @@ class FeatureStoreReader:
                 hashes_by_service.setdefault(svc_l, set()).add(h_s)
             else:
                 null_hash_pids.add(svc_l)
+            # source_mode (nur nicht-leere String-Werte) - das
+            # Modus-Dropdown zeigt ausschliesslich tatsaechlich
+            # geschriebene Modi (dynamisch, keine Registry-Logik).
+            sm = data.get("source_mode")
+            if sm is not None and str(sm).strip():
+                source_modes_by_service.setdefault(
+                    service, set()).add(str(sm).strip())
         entry = {
             "types_by_service": types_by_service,
             "hashes_by_service": hashes_by_service,
             "null_hash_pids": null_hash_pids,
+            "source_modes_by_service": source_modes_by_service,
         }
         self._meta_put(key, entry)
         return entry
@@ -417,6 +430,26 @@ class FeatureStoreReader:
         if clauses:
             conditions.append("(" + " OR ".join(clauses) + ")")
 
+    # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+    # Multi-Modus-Services (srv_swing_structure/srv_swing_momentum/...).
+    # Nur die 6 Swing-/Trend-Services schreiben `source_mode` top-level
+    # in jedes feature_data-Record; `"all"`/None/leer = kein Filter.
+    # Muster-Konsistenz (21.03.16): json_extract_string statt
+    # feature_data->>'source_mode' (DuckDB-v1.5.5-Arrow-Optimizer-Bug
+    # in Kombination mit LOWER/TRIM-Equalities). LOWER auf beiden Seiten
+    # = case-tolerantes Matching (z. B. 'ma_peak_hysteresis').
+    @staticmethod
+    def _apply_mode_filter(
+        service_mode: Optional[str],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        if not service_mode or str(service_mode).lower() in ("all", "alle", ""):
+            return
+        conditions.append(
+            "LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)")
+        params.append(str(service_mode).strip())
+
     # 21.03.12 (MTF-FC auf Analytics): Optionaler bar_time-Zeitfilter.
     # Wird von allen Daten-Queries (fetch_rows/fetch_columns/fetch_heatmap/
     # fetch_generic_heatmap) ueber `from_ts`/`to_ts` aufgerufen.
@@ -473,6 +506,9 @@ class FeatureStoreReader:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
@@ -509,6 +545,7 @@ class FeatureStoreReader:
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
         self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -765,6 +802,65 @@ class FeatureStoreReader:
                 out[service] = keys
         return out
 
+    def fetch_available_source_modes(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
+    ) -> Tuple[List[str], bool]:
+        """Distinct source_mode-Werte je Symbol/TF (21.03.20, Modus-Dropdown).
+
+        Analysiert den gecachten Metadaten-Basis-Scan `_feature_meta_base`
+        (Runde 15, Performance-Fix 3: EIN DB-Scan fuer alle Metadaten-
+        Methoden) - der leichte QUERY_FEATURES-Pfad bekommt die Modus-Liste
+        OHNE zusaetzlichen Roundtrip. Der feature_ids-Filter folgt dem
+        Muster `feature_keys_by_service` (case-insensitiv + whitespace-
+        tolerant): abgewaehlte Services liefern ihre Modi NICHT mehr.
+
+        Returns:
+            (source_modes, has_source_mode_services)
+              source_modes:             sortierte, case-originale Modus-Werte
+                                        (z. B. ['momentum', 'structure'])
+              has_source_mode_services: True, wenn mindestens ein AKTIVER
+                                        Service einen nicht-leeren
+                                        source_mode-Wert schreibt (Combo-
+                                        Deaktivierung im HeatmapWidget).
+        """
+        if not symbol or not timeframe:
+            return [], False
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return [], False
+        modes_by_service = base.get("source_modes_by_service", {})
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        hashes = set()
+        if instance_hashes:
+            hashes = {str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()}
+        hashes_by_service = base["hashes_by_service"]
+        null_hash_pids = base["null_hash_pids"]
+
+        values: Set[str] = set()
+        has = False
+        for service, modes in modes_by_service.items():
+            svc_l = str(service).strip().lower()
+            if wanted and svc_l not in wanted:
+                continue
+            if hashes:
+                svc_hashes = hashes_by_service.get(svc_l, set())
+                if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
+                    continue
+            if modes:
+                values.update(modes)
+                has = True
+        return sorted(values), has
+
     def fetch_columns(
         self,
         symbol: str,
@@ -779,6 +875,9 @@ class FeatureStoreReader:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
 
@@ -818,6 +917,7 @@ class FeatureStoreReader:
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
         self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -867,6 +967,9 @@ class FeatureStoreReader:
         # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
 
@@ -928,6 +1031,7 @@ class FeatureStoreReader:
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
         self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -1016,6 +1120,9 @@ class FeatureStoreReader:
         # auf PARAMETER-Ebene (feature_data->>key IS NOT NULL je Service).
         # Leer/None = kein Paar-Filter (reines feature_ids-Verhalten).
         field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -1145,6 +1252,7 @@ class FeatureStoreReader:
         # feature_ids-Filter).
         self._apply_field_pair_filter(field_pairs, conditions, params)
         self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
