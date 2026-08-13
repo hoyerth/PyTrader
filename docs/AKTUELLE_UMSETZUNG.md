@@ -1570,3 +1570,60 @@ def _on_mode_filter_changed(self) -> None:
   - `test/check_bugfix_2132b.py` (17 Checks): keys_by_service_mode row-genau (Peak/Slope getrennt), feature_keys_by_service mit service_mode (numeric_only), _field_metadata modus-gefiltert, output_schema-Fallback fuer unbekannten Modus, get_available_features-Durchreichung, _date_marks ohne OSError bei negativen Epochs - ALLE PASS.
   - `test/check_bugfix_2132_layout.py` (8 Checks, umgestellt auf QGridLayout-Semantik), `test/check_bugfix_2132.py` (8), `test/check_bugfix_2132_label.py` (5), `test/check_mode_filter_db.py` (25), `test/check_mode_filter_worker.py` (6), `test/check_mode_filter_vm.py` (11), `test/check_mode_filter_widget.py` (10) - ALLE PASS.
 - **Commit:** f71690f
+
+# Implementierungs-Log 21.03.20 - Analyse & Entscheidungen Punkte 1-8 (F1-F8) (13.08.2026)
+
+- **Stand:** Analyse & Entscheidungen, KEIN Coding (Anwender-Anweisung: nur Textblock + Doku + Commit). Die eigentliche Umsetzung erfolgt erst nach explizitem Startschuss.
+
+- **Punkt 1 - MA_Slope_Change: a) Achse, b) Parameter-Dropdown**
+  - **F1 (final):** Achsenpunkte generell erscheinen (fuer alle Modi, nicht nur gespeicherte).
+  - **1a-Ursache (verifiziert):** `get_generic_heatmap` (analytics/engine/analytics_repository.py) setzt `extra_service_modes` NUR bei `service_mode in ("", "all", "alle")` - bei konkretem Modus bleibt `x_values=[]` → Achsenpunkt fehlt.
+  - **1a-Loesung:** Bei konkretem Modus die Registry-Paare (`_registry_service_mode_pairs`) dieses Modus ergaenzen (analog All-Modus, aber modus-gefiltert).
+  - **1b-Ursache (echter Code-Fehler aus Bugfixing Runde 2):** `get_generic_heatmap` ruft `_field_metadata(...)` OHNE `service_mode`; nur `get_available_features` reicht ihn durch. → Das QUERY_HEATMAP_GENERIC-Payload ueberschreibt die modus-gefilterte Feld-Liste aus QUERY_FEATURES.
+  - **1b-Loesung:** `service_mode` an `_field_metadata` durchreichen.
+
+- **Punkt 2 - Legende**
+  - **F2 (final):** Confluence so anzeigen, wie es ueblich und semantisch richtig ist → Confluence bleibt `= 0` … `= 4`, `>= 5` (aktueller Zustand ist OK). NUR Viridis aendern: Operatoren VOR Zahl, kein `x` → `<= v25`, `>= v25`, `>= v50`, `>= v75`, `>= vmax`.
+  - **Stelle:** `_update_legend` (analytics/ui/heatmap_widget.py).
+
+- **Punkt 3 - Timeframes sortiert (fein→grob)**
+  - **F3 (final):** inkl. M10 zwischen M5 und M15; Positionen: a) analytics_win oben (Pill-Strip zwischen Datenquellen und Limit), b) Service-Picker unter Run Timeframe, c) service_win ueber Parameter-Box.
+  - **Verifiziert:** `combo_tf` in analytics_win ist bereits kanonisch (M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1). Unsorted sind die TF-Pill-Strips (alle 3 nutzen `FeatureStoreReader.fetch_service_tf_status(pid)` → Dict ohne ORDER → `TfStatusBadgeBar.update_status`). Zusaetzlich sortiert `get_available_timeframes` (feature_store_reader.py) `ORDER BY timeframe` = alphabetisch.
+  - **Loesung:** Kanonische TF-Reihenfolge definieren (M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1); `fetch_service_tf_status` sortiert zurueckgeben (fixt a+b+c), zusaetzlich defensiv in `TfStatusBadgeBar._rebuild` sortieren; `get_available_timeframes` kanonisch sortieren.
+
+- **Punkt 4 - Feld-Dropdown Check/Uncheck wirkt nicht**
+  - **F4 (final):** Genau ein angehaktes Feld → die angehakten Paare bestimmen die Verfuegbarkeit/Aggregation; genau EIN angehaktes Feld wird aggregiert/angezeigt. Zweite Runde (mehrere Services und Modi - Darstellung insgesamt und mit Aggregationen) folgt spaeter; jetzt nur die Grundlage schaffen.
+  - **Verifiziert:** Verbindung `selection_changed → _on_field_selection_changed → vm.set_field_selection` ist AKTIV. Problem: `srv_swing_momentum` schreibt dichte Records (alle Keys immer vorhanden) → Paar-Filter `key IS NOT NULL` wirkungslos.
+  - **Loesung:** Angehakte Paare steuern die Aggregations-/Anzeige-Optionen (nur angehakte Felder als Optionen; Abhaken des aktiven Felds → Wechsel auf naechstes). Restore vorhanden (`_rebuild_field_dropdown` → `sel_map`).
+
+- **Punkt 5 - Unsinnig hohe Legendenwerte**
+  - **F5 (final):** NUR fuer preisartige Felder deaktivieren → SUM fuer preisartige Felder (price etc.) sperren/deaktivieren, fuer Signal-Felder (strength_value) erlauben. Keine DB-Ausgabe.
+  - **Verifiziert:** SUM ueber price bei SILVER ≈ 5×30=150 pro 5-Min, ~43k pro Tag. DB derzeit gesperrt durch laufende App.
+
+- **Punkt 6 - MasterTree: Modus in Namen**
+  - **F6 (final):** a) Format `swing_momentum [MA_Peak_Hysteresis] (13.08.26)`; b) Clones mit echtem Datum (Hash ist seit 10.08.2026 schon aus dem Label entfernt - nur der Modus fehlt); c) auch im Tooltip.
+  - **Stellen:** master_tree.py Plugin-Zeile (~Z. 645), Clone-Zeile (~Z. 674, hat params + last_execution), Set-Service-Zeile (~Z. 573) + Tooltips.
+  - **Loesung:** Helper `_mode_suffix(plugin_id, params)`: nur bei >1 Option im `parameter_schema["mode"]["options"]` → `" [{mode}]"` anhaengen.
+
+- **Punkt 7 - Ausfuehrung: Modus aus Parameterbox**
+  - **F7 (final):** Variante a (nur gewaehlter Modus), implizites Uebernehmen der Parameterbox-Werte beim Run.
+  - **Verifiziert (Wurzel von Bug 4):** Zwei Run-Pfade: service_win `collect_set_definition()` liest LIVE alle Controls (korrekt); Picker/MasterTree (`_on_run_service`/`_on_run_set` = `set_repo.get_set`, `_on_run_plugin` = `variant_run_entries`/`_plugin_config` = default_params → erster Mode-Eintrag) nutzt die GESPEICHERTE Definition → Parameterbox-Aenderungen ohne Speichern gehen verloren. Erklaert, warum MA_Slope_Change nie in der DB landete.
+  - **Loesung:** Picker-Run uebernimmt die aktuellen Parameterbox-Werte (inkl. Modus) implizit vor der Ausfuehrung.
+
+- **Punkt 8 (neu) - Dropdown Modi → Einzelservices-Parameter**
+  - **Identischer Root Cause wie 1b** (`get_generic_heatmap` → `_field_metadata` ohne service_mode). Loesung = Fix 1b.
+
+- **Fix-Zuordnung (Code-Stellen, fuer die spaetere Umsetzung):**
+  | Punkt | Stelle |
+  |---|---|
+  | 1a | `get_generic_heatmap` (analytics/engine/analytics_repository.py): extra_service_modes bei konkretem Modus |
+  | 1b+8 | `get_generic_heatmap` → `_field_metadata`: service_mode durchreichen |
+  | 2 | `_update_legend` (analytics/ui/heatmap_widget.py): Viridis-Operatoren `<=`/`>=`, x entfaellt; Confluence unveraendert |
+  | 3 | `fetch_service_tf_status` + `get_available_timeframes` (feature_store_reader.py), `TfStatusBadgeBar._rebuild` |
+  | 4 | `_rebuild_field_dropdown`/Feld-Metadaten: genau ein angehaktes Feld aggregieren |
+  | 5 | Aggregations-UI: SUM nur fuer preisartige Felder sperren |
+  | 6 | master_tree.py (3 Label-Builder + Tooltips) |
+  | 7 | service_selector_dialog `_on_run_*`: implizites Uebernehmen |
+
+- **Kein Coding:** Es wurden keine Quelldateien geaendert (nur dieses Doku-Log). Die Umsetzung erfolgt nach explizitem Anwender-Startschuss.
+- **Commit:** Doku-Log (einziger Content dieses Commits)
