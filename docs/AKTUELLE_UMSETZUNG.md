@@ -1660,3 +1660,21 @@ def _on_mode_filter_changed(self) -> None:
   - Bestehende Tests gruen: `check_bugfix_2132.py` (8), `check_bugfix_2132b.py` (17), `check_bugfix_2132_label.py` (5), `check_bugfix_2132_layout.py` (8), `check_mode_filter_worker.py` (6), `check_mode_filter_vm.py` (11), `check_mode_filter_widget.py` (10), `check_mode_filter_db.py` (25).
   - P3 gegen echte DB (read-only): `fetch_service_tf_status('srv_swing_momentum')` liefert M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1 (kanonisch); `get_available_timeframes('SILVER')` ebenfalls.
 - **Commit:** 9214f00
+
+# Implementierungs-Log 21.03.20 - Bugfix 'Heatmap wird nicht gezeigt / nicht anklickbar' (13.08.2026)
+
+- **User-Meldung (13.08.2026):** Die Heatmap wird nicht gezeigt und kann nicht angeklickt werden.
+
+- **Root Cause 1 (Hauptursache, End-to-End verifiziert):** `HeatmapPage._stack_modes` (analytics/ui/heatmap_page.py) blieb nach dem Start auf Index 0 (Legacy-Standard-UI Wochentag x Stunde), obwohl das Ansicht-Dropdown 'Generisch' zeigt. `set_mode()`/`_on_mode_changed()` setzen zwar Seite 1, aber ohne Workspace-Restore mit `heatmap_mode` wurde dieser Initial-Switch nie ausgefuehrt -> das generische Widget wurde NIE dargestellt, seine Bedien-Controls (Feld-Dropdown, Aggregation, Modus-Filter, ...) waren nicht bedienbar ('nicht anklickbar').
+- **Root Cause 2 (Zusatz-Risiko):** Der (unsichtbare) Standard-`QUERY_HEATMAP`-Zweig in `HeatmapPage.on_data_ready` konnte bei leerer Matrix den Seiten-Overlay-Stack auf Index 1 (No-Data-Meldung) schalten und damit das generische Widget verdecken.
+
+- **Fix (analytics/ui/heatmap_page.py, 2 Stellen):**
+  1. `__init__`: `self._stack_modes.setCurrentIndex(1)` direkt nach dem Stack-Aufbau - die Basis-Ansicht ist seit 21.01 IMMER das generische Widget (Stack Seite 1). Damit ist der Initial-Zustand korrekt, unabhaengig vom Workspace-Restore.
+  2. `on_data_ready(QUERY_HEATMAP)`: Der Leer-Matrix-Zweig setzt den Overlay NICHT mehr auf Index 1 (die Standard-Ansicht ist nicht mehr sichtbar und darf die Seiten-Sichtbarkeit nicht mehr steuern) - nur noch `return`; der Render-Pfad mit `setCurrentIndex(0)` bleibt unveraendert.
+
+- **Verifikation (headless, keine UI):**
+  - `py_compile analytics/ui/heatmap_page.py` OK; CRLF-Zeilenenden erhalten (Datei ist 100 % CRLF, Fix per CRLF-erhaltendem Skript angewendet).
+  - `test/check_heatmap_page_stack.py` (10 Checks, neu): Initial-Stack zeigt Generisch (Index 1), nach attach ebenfalls, Overlay bleibt auf Content (Index 0) auch bei leerem QUERY_HEATMAP-Payload, generisches Payload rendert - ALLE PASS.
+  - `test/check_heatmap_e2e.py` (8 Checks, neu): echte temp-DuckDB + echter AnalyticsViewModel + echter Async-Worker - Stack Index 1 vor und nach Request, generisches Image (2x3), currentWidget = HeatmapWidget, Page-Overlay 0 - ALLE PASS.
+  - Regression gruen: `test/check_heatmap_render.py` (12), `test/check_punkte_1_8.py` (9).
+- **Commit:** 529ef6b
