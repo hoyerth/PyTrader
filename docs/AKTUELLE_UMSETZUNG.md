@@ -28,13 +28,13 @@
 # 21.03.22 – Full Market-Data Sync Button (ServiceWindow)
 
 ## 🎯 Zielstellung & Fachliche Motivation
-Für umfassende Analysen im `ServiceWindow` müssen alle in `market_data.duckdb` gespeicherten **Symbol:Timeframe-Paare** auf den neuesten Stand gebracht werden. Ein manueller Button oben rechts in der `top_row` stößt den vollständigen Sync aller lokal vorhandenen Paare an. Während dieses Vorgangs pausiert der automatische 45-Sekunden-Sync.
+Für umfassende Analysen im `ServiceWindow` müssen alle in `market_data.duckdb` gespeicherten **Symbol:Timeframe-Paare** auf den neuesten Stand gebracht werden. Ein manueller Button in der Filter-/Symbol-Zeile (`layout_symbol`), **direkt links neben dem Papierkorb** (`btn_trash_sets`), stößt den vollständigen Sync aller lokal vorhandenen Paare an. Das rechte Ende des Papierkorb-Buttons schließt dabei bündig mit dem rechten Ende der Parameter-Box ab. Während dieses Vorgangs pausiert der automatische 45-Sekunden-Sync.
 
 ---
 
 ## ✅ Entscheidungen & Antworten auf IDE-Rückfragen (13.08.2026)
 
-1. **Einbindung in `serviceui/service_win.py`:** Es existieren KEINE Methoden `_build_ui()` / `_wire_events()` – Layout-Aufbau (Zeilen 184–395) und Signal-Verdrahtung (ab Zeile 410) passieren direkt im `__init__`. Button-Erzeugung daher direkt im `__init__` im `top_row`-Block NACH `self.top_row.addWidget(self.main_splitter)` (Zeile 365), rechtsbündig via `self.top_row.addStretch(1)` + `addWidget`. Signal-Verdrahtung `clicked.connect(...)` im bestehenden Connect-Block ab Zeile 410.
+1. **Einbindung in `serviceui/service_win.py`:** Es existieren KEINE Methoden `_build_ui()` / `_wire_events()` – Layout-Aufbau (Zeilen 184–395) und Signal-Verdrahtung (ab Zeile 410) passieren direkt im `__init__`. **Positions-Korrektur (User-Feedback 13.08.2026):** Der Button wird im `top_row`-Block (NACH `self.top_row.addWidget(self.main_splitter)`, Zeile ~365) mit Parent `self.ui` erzeugt, aber NICHT in `top_row` platziert – die Einfügung erfolgt im `layout_symbol`-Block (neben `btn_symbol_fav`, Zeile ~468) **direkt vor `btn_trash_sets`** (`insertWidget(indexOf(btn_trash_sets), btn)`). Für die Rechtsbündigkeit wird der bestehende `horizontalSpacer` der `.ui` per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer gemacht, sodass Papierkorb + Sync-Button am rechten Fensterrand (= rechtes Ende der Parameter-Box) abschließen. Signal-Verdrahtung `clicked.connect(...)` im bestehenden Connect-Block ab Zeile 410.
 2. **`sync_market_data(target_pairs=None)`:** Signatur `sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None)`. Bei übergebenem `target_pairs` (nicht `None`) wird **exakt über diese `(symbol, timeframe)`-Paare** iteriert; bei `None`/leer greift der **Fallback auf das bisherige Standard-Raster** (`SYMBOLS` × `get_timeframes()`). Der Delta-Sync-Abgleich mit `get_latest_timestamp(symbol, tf)` bleibt pro Paar voll erhalten (inkrementelles Laden).
 3. **Signal & Typing:** `sync_completed = Signal(set)` wird übernommen (voll kompatibel mit `main.py`, das ein Set empfängt). `from typing import Optional, Set, Tuple` im `DataSyncWorker` ergänzen.
 4. **DB-Zugriffsmuster im Repository:** Generell `DbPool.get(self.db_path)` nutzen (Thread-local, kein manuelles `close()`, konsistent mit `get_symbol_precision` und projektweiten Standards).
@@ -105,13 +105,28 @@ class DataSyncWorker(QThread):
 In `serviceui/service_win.py` direkt im `__init__` (kein `_build_ui()`/`_wire_events()` – Aufbau und Verdrahtung passieren dort):
 
 # serviceui/service_win.py (in __init__, top_row-Block NACH self.top_row.addWidget(self.main_splitter), Zeile ~365)
+# Erzeugung mit Parent self.ui - PLATZIERT wird der Button weiter unten!
 
-self.btn_sync_all_market = QPushButton("🔄 Sync Alle Daten")
+self.btn_sync_all_market = QPushButton("🔄 Sync Alle Daten", self.ui)
 self.btn_sync_all_market.setToolTip(
     "Aktualisiert ALLE in market_data.duckdb gespeicherten Symbol:Timeframe-Paare aus MT5."
 )
-self.top_row.addStretch(1)
-self.top_row.addWidget(self.btn_sync_all_market)
+self._sync_worker = None
+
+# serviceui/service_win.py (in __init__, layout_symbol-Block neben btn_symbol_fav, Zeile ~468)
+# Einfuegung LINKS neben den Papierkorb + Stretch-Spacer fuer Rechtsbuendigkeit
+# (Papierkorb-Ende = rechtes Ende der Parameter-Box):
+
+if layout_symbol is not None and self.btn_trash_sets is not None:
+    btn_sync = getattr(self, "btn_sync_all_market", None)
+    if btn_sync is not None:
+        for _i in range(layout_symbol.count()):
+            _item = layout_symbol.itemAt(_i)
+            if _item is not None and _item.spacerItem() is not None:
+                layout_symbol.setStretch(_i, 1)
+                break
+        idx = layout_symbol.indexOf(self.btn_trash_sets)
+        layout_symbol.insertWidget(idx, btn_sync)
 
 # serviceui/service_win.py (in __init__, bestehender Connect-Block ab Zeile ~410)
 
@@ -178,3 +193,7 @@ def _on_sync_all_completed(self, updated_pairs) -> None:
 - `data_sync/mt5_sync_service.py`: `sync_market_data(target_pairs=None)` – exakte Paar-Iteration (UPPER-normalisiert, unbekannte TFs gefiltert) mit Fallback auf `SYMBOLS` × `get_timeframes()`; Delta-Sync via `get_latest_timestamp` bleibt pro Paar erhalten.
 - `serviceui/service_win.py`: `btn_sync_all_market` rechtsbündig in `top_row` (nach Splitter, Zeile ~365), `clicked`-Verdrahtung im Connect-Block (Zeile ~427), Handler `_on_sync_all_market_clicked`/`_on_sync_all_completed` (vor `_refresh_badge_bar`). Concurrency-Guard via `event_bus.service_run_started/finished`; UI-Refresh via `_refresh_badge_bar()` + `service_selector.refresh()`. Zwei Robustheits-Fixes während der Validierung: Guard nutzt `_qt_valid` (shiboken) gegen „Internal C++ object already deleted" nach `deleteLater`, und `_sync_worker` wird nach Abschluss auf `None` gesetzt.
 - **Validierung (headless, `test/check_21322_full_sync.py` + Block in `test/test.py`, kein echter MT5-Sync):** T1 Pair-Query (UPPER + NULL-Filter), T2/T2b Worker-Param-Durchreichung (pairs/None), T2c/T2c2 `target_pairs`-Filter (D1 raus) + Fallback-Raster (6 Paare), T3a–T3e Signal-Emission (`service_run_started` vor Start, `service_run_finished` nach `sync_completed`) + Button-State (enabled/disabled/enabled). **Alle Checks PASS.** `py_compile` OK für alle 4 Dateien. Git-Tag: `phase21_step4`.
+
+**13.08.2026 (Positions-Korrektur, User-Feedback, phase21_step5):** Der `btn_sync_all_market` sitzt nun **links neben dem Papierkorb** in der Filter-/Symbol-Zeile (`layout_symbol`) statt rechts in `top_row`:
+- `serviceui/service_win.py`: Button-Erzeugung im `top_row`-Block mit Parent `self.ui` (kein `addStretch`/`addWidget` in `top_row` mehr); Einfügung im `layout_symbol`-Block via `insertWidget(indexOf(btn_trash_sets), btn)` – direkt vor den Papierkorb. Der bestehende `horizontalSpacer` der `.ui` wird per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer, damit Papierkorb + Sync-Button rechtsbündig mit dem rechten Ende der Parameter-Box abschließen.
+- **Validierung:** Neue Checks T3f (Sync-Button direkt links neben Papierkorb: `indexOf(sync)+1 == indexOf(trash)`) und T3f2 (Stretch-Spacer vor der Gruppe, `stretch(i) >= 1`) in `test/check_21322_full_sync.py` + `test/test.py` – **alle 12 Checks PASS**, `py_compile` OK. Git-Tag: `phase21_step5`.

@@ -363,17 +363,17 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.main_splitter.setSizes([460, 820])
 
             self.top_row.addWidget(self.main_splitter)
-            # 21.03.22 (Full Market-Data Sync Button): Rechtsbuendig im
-            # top_row-Header den Full-Sync-Button platzieren. Er aktualisiert
-            # ALLE in market_data.duckdb gespeicherten Symbol:TF-Paare und
-            # pausiert waehrenddessen den 45s-Auto-Sync (Concurrency-Guard).
-            self.btn_sync_all_market = QPushButton("🔄 Sync Alle Daten")
+            # 21.03.22 (Full Market-Data Sync Button): Der Button wird hier
+            # nur ERZEUGT (Parent self.ui) - platziert wird er weiter unten
+            # in der Filter-/Symbol-Zeile (layout_symbol) LINKS neben dem
+            # Papierkorb (btn_trash_sets). Waehrend des Syncs pausiert der
+            # 45s-Auto-Sync (Concurrency-Guard).
+            self.btn_sync_all_market = QPushButton(
+                "🔄 Sync Alle Daten", self.ui)
             self.btn_sync_all_market.setToolTip(
                 "Aktualisiert ALLE in market_data.duckdb gespeicherten "
                 "Symbol:Timeframe-Paare aus MT5."
             )
-            self.top_row.addStretch(1)
-            self.top_row.addWidget(self.btn_sync_all_market)
             self._sync_worker = None
             self.central_layout.insertLayout(idx, self.top_row)
         # Fenstergroesse (15.02): 1280 x 800 als Default – Single Source of
@@ -469,6 +469,21 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if layout_symbol is not None and self.combo_symbol is not None:
             idx = layout_symbol.indexOf(self.combo_symbol)
             layout_symbol.insertWidget(idx + 1, self.btn_symbol_fav)
+        # 21.03.22 (Full Market-Data Sync Button): Links neben dem Papierkorb
+        # (btn_trash_sets). Damit Papierkorb + Sync-Button rechtsbuendig mit
+        # dem rechten Ende der Parameter-Box abschliessen, wird der bestehende
+        # horizontalSpacer der .ui zum Stretch-Spacer (setStretch) - die
+        # Gruppe rutscht damit an den rechten Fensterrand (= Param-Box-Rand).
+        if layout_symbol is not None and self.btn_trash_sets is not None:
+            btn_sync = getattr(self, "btn_sync_all_market", None)
+            if btn_sync is not None:
+                for _i in range(layout_symbol.count()):
+                    _item = layout_symbol.itemAt(_i)
+                    if _item is not None and _item.spacerItem() is not None:
+                        layout_symbol.setStretch(_i, 1)
+                        break
+                idx = layout_symbol.indexOf(self.btn_trash_sets)
+                layout_symbol.insertWidget(idx, btn_sync)
         self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
         # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
