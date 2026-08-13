@@ -237,6 +237,10 @@ class AnalyticsWindow(PersistentWindow):
         # ServiceSelectorModel ist injizierbar (Headless-Tests); der Dialog
         # wird lazy erzeugt (nicht-modal) und beim Schliessen zerstört.
         self._service_dialog: Optional[ServiceSelectorDialog] = None
+        # 13.08.2026 (Runde 3d): Zuletzt eingestellter Grafikteiler
+        # Tree|Parameter des ServicePickers - Grundlage fuer Workspace-
+        # und Profil-Persistenz (service_picker_splitter).
+        self._picker_splitter: List[int] = []
         #: Anzeigenamen des aktiven Datenquellen-Filters (fuer den Button).
         #: Beim Profilwechsel zurueckgesetzt – Namen werden dann aus den
         #: persistierten feature_ids ueber das Model re-resolved.
@@ -443,6 +447,10 @@ class AnalyticsWindow(PersistentWindow):
                 self._on_picker_hashes_selected)
             self._service_dialog.destroyed.connect(
                 self._on_service_dialog_destroyed)
+            # 13.08.2026 (Runde 3d): Grafikteiler-Bewegung live merken
+            # (Workspace-/Profil-Persistenz).
+            self._service_dialog.splitter_changed.connect(
+                self._on_picker_splitter_changed)
         # Runde 9 (Bug 1): Modell explizit refreshen, damit der Baum
         # sicher aufgebaut ist - das initiale data_changed des Modells
         # lief VOR der Dialog-Erstellung (Dialog ist lazy), ein leerer
@@ -456,6 +464,15 @@ class AnalyticsWindow(PersistentWindow):
         self._service_dialog.apply_feature_ids(
             self._vm.params.get("feature_ids") or [],
             self._vm.params.get("instance_hashes") or [])
+        # 13.08.2026 (Runde 3d): Grafikteiler aus Workspace/Profil
+        # anwenden (letzter Sitzungszustand/Profil gewinnt).
+        try:
+            sp = (self._vm.workspace_layout or {}).get(
+                "service_picker_splitter")
+            if sp:
+                self._service_dialog.set_splitter_sizes(sp)
+        except Exception:
+            pass
         self._service_dialog.show()
         self._service_dialog.raise_()
         self._service_dialog.activateWindow()
@@ -464,6 +481,15 @@ class AnalyticsWindow(PersistentWindow):
     def _on_service_dialog_destroyed(self) -> None:
         """Setzt die Dialog-Referenz zurueck (zerstoert mit dem Parent)."""
         self._service_dialog = None
+
+    @Slot(int, int)
+    def _on_picker_splitter_changed(self, tree_w: int, panel_w: int) -> None:
+        """13.08.2026 (Runde 3d): Letzte Splitter-Position merken.
+
+        Wird bei jeder Splitter-Bewegung im ServicePicker gefeuert -
+        die Position fliesst in Workspace- und Profil-Payload ein
+        (service_picker_splitter)."""
+        self._picker_splitter = [int(tree_w or 0), int(panel_w or 0)]
 
     @Slot(list)
     def _on_picker_hashes_selected(self, instance_hashes: List[str]) -> None:
@@ -1082,6 +1108,17 @@ class AnalyticsWindow(PersistentWindow):
         # die Historie-Werte und beim Schliessen wird der falsche Zustand
         # persistiert).
         self._sync_profile_filters()
+        # 13.08.2026 (Runde 3d): Grafikteiler des offenen Picker-Dialogs
+        # aus dem Profil-Layout uebernehmen (Profilwechsel).
+        try:
+            if (self._service_dialog is not None
+                    and self._service_dialog.isVisible()):
+                sp = (self._vm.workspace_layout or {}).get(
+                    "service_picker_splitter")
+                if sp:
+                    self._service_dialog.set_splitter_sizes(sp)
+        except Exception:
+            pass
 
     def _sync_profile_filters(self) -> None:
         """Synchronisiert Symbol-/TF-Combos mit den VM-Parametern (Bugfix).
@@ -1167,6 +1204,9 @@ class AnalyticsWindow(PersistentWindow):
             "service_picker_open": bool(
                 self._service_dialog is not None
                 and self._service_dialog.isVisible()),
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter des
+            # ServicePickers im Profil mitpersistieren.
+            "service_picker_splitter": list(self._picker_splitter or []),
         }
 
     @Slot()
@@ -1361,6 +1401,10 @@ class AnalyticsWindow(PersistentWindow):
                     "service_picker_open": bool(
                         self._service_dialog is not None
                         and self._service_dialog.isVisible()),
+                    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter
+                    # des ServicePickers im Workspace mitpersistieren.
+                    "service_picker_splitter": list(
+                        self._picker_splitter or []),
                 },
             }
             self.state_manager.save_workspace_state(

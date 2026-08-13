@@ -320,7 +320,7 @@ class ServiceSelectorModel(QObject):
                     preset_name = str(p.get("preset_name") or "Default")
                     instance_hash = generate_instance_hash(
                         pid, params, preset_name=preset_name)
-                    per_hash = self._last_execution_dates_by_hash.get(
+                    per_hash = self._last_execution_datetimes_by_hash.get(
                         str(pid).lower(), {}) or {}
                     clones.append({
                         "preset_name": preset_name,
@@ -339,7 +339,7 @@ class ServiceSelectorModel(QObject):
                         # zeigen (User-Meldung). Eine Variante zeigt ein Datum
                         # erst, wenn sie unter ihrem EIGENEN Hash gelaufen ist.
                         "last_execution": per_hash.get(
-                            instance_hash, "--.--.--"),
+                            instance_hash, "--.--.-- --:--"),
                     })
                 if clones:
                     result[str(pid).lower()] = clones
@@ -841,7 +841,7 @@ class ServiceSelectorModel(QObject):
         plugins = self.get_plugins()
         badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
         last_executions: Dict[str, str] = {
-            pid: self.last_execution_date(pid) for pid in plugins}
+            pid: self.last_execution_datetime(pid) for pid in plugins}
         # 20.04 (Q7): Presets/Clones je Plugin durchreichen – Plugins MIT
         # Presets werden als Parent-Knoten mit Clone-Kindern gerendert,
         # archivierte Clones (is_archived) in den '📁 Archiv'-Ordner.

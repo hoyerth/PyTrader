@@ -568,8 +568,10 @@ class MasterTree(QTreeWidget):
             # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
-            last_exec = str(svc.get("last_execution") or "")
-            last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
+            # 13.08.2026 (Runde 3): last_execution traegt seit dem
+            # Datetime-Umbau 'DD.MM.JJ HH:MM' (Alt-Bestand 'DD.MM.JJ');
+            # der gemeinsame Normalisierer wandelt Fallbacks in 'nie'.
+            last_exec = self._fmt_last_exec(svc.get("last_execution"))
             # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
             # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
             # gespeichert (nur _duplicate_set_instance persistiert ihn) -
@@ -592,11 +594,13 @@ class MasterTree(QTreeWidget):
                         cfg.get("params") or {}) or ""
                 except Exception:
                     svc_hash = ""
-            # 13.08.2026 (Punkt 6, F6 + Punkt 2): Modus-Suffix am Service-
-            # Namen (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)'
-            # bzw. mit dem AKTUELLEN Modus dahinter).
-            mode_sfx = self._mode_suffix_resolved(
-                plugin_id, svc.get("params"), svc_hash)
+            # 13.08.2026 (Runde 3, neue Benennung): Service OHNE
+            # Varianten zeigt den AKTUELLEN Modus mit einem
+            # Minuszeichen dahinter (Format 'swing_momentum -
+            # MA_Peak_Hysteresis (13.08.26 10:48)' - die fruehere
+            # Doppel-Anzeige '[Modus] Modus' entfaellt).
+            mode = self._current_mode(plugin_id, svc.get("params"), svc_hash)
+            mode_sfx = f" - {mode}" if mode else ""
             svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
@@ -670,53 +674,66 @@ class MasterTree(QTreeWidget):
         except Exception:
             return ""
 
-    def _mode_suffix_resolved(
+    def _current_mode(
         self,
         plugin_id: str,
         params: Optional[Dict[str, Any]] = None,
         instance_hash: Optional[str] = None,
     ) -> str:
-        """'[Modus]'-Suffix mit dem AKTUELLEN Modus (13.08.2026, Punkt 2).
+        """AKTUELLER Modus eines Multi-Modus-Services (13.08.2026, R3).
 
-        Erweitert `_mode_suffix`: Die Preset-Params von Clones tragen den
-        'mode' haeufig NICHT (der Modus wird erst beim Run bestimmt) - der
-        reine `_mode_suffix` wuerde dann den Schema-DEFAULT zeigen. Hier
-        wird zusaetzlich der source_mode der LETZTEN Ausfuehrung je
-        instance_hash aus dem Feature-Store gelesen (via Model). Ist ein
-        echter Modus bekannt (params.mode oder Store), haengt er IMMER
-        hinter der Klammer: '[Default] AktuellerModus' (nur der reine
-        Klammer-Fallback ohne bekannten Modus bleibt ohne Anhang). Rein
-        lesend, Fehler defensiv.
+        Aufloesung in Reihenfolge: params['mode'] -> Feature-Store je
+        instance_hash (source_mode der letzten Ausfuehrung) ->
+        Plugin-Fallback (erster bekannter Store-Modus) -> Schema-Default.
+        Ein-Modus-Services / Services ohne Modus-Schema liefern '' (kein
+        Suffix, kein Rauschen im Baum). Die Formatierung (dash/bracket)
+        uebernimmt der Aufrufer. Rein lesend, Fehler defensiv.
         """
-        base = self._mode_suffix(plugin_id, params)
-        if not base:
+        try:
+            base = self._mode_suffix(plugin_id, params)
+            if not base:
+                return ""
+            mode = ""
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode and instance_hash and self.model is not None:
+                try:
+                    mode = str(
+                        self.model.source_mode_for_hash(plugin_id, instance_hash)
+                        or "").strip()
+                except Exception:
+                    mode = ""
+            # Flache Standalone-Services (ohne Clones) tragen im Tree keinen
+            # instance_hash - hier faellt die Aufloesung auf den Plugin-Fallback
+            # zurueck (erster bekannter Store-Modus des Plugins).
+            if not mode and not instance_hash and self.model is not None:
+                try:
+                    mode = str(
+                        self.model.source_mode_for_plugin(plugin_id)
+                        or "").strip()
+                except Exception:
+                    mode = ""
+            if not mode:
+                # Fallback: der Schema-Default gilt als aktueller Modus,
+                # solange weder Config noch Store einen echten liefern
+                # (z. B. nie gelaufene Variante).
+                mode = str(base).strip(" []")
+            return mode
+        except Exception:
             return ""
-        mode = ""
-        if isinstance(params, dict):
-            mode = str(params.get("mode") or "").strip()
-        if not mode and instance_hash and self.model is not None:
-            try:
-                mode = str(
-                    self.model.source_mode_for_hash(plugin_id, instance_hash)
-                    or "").strip()
-            except Exception:
-                mode = ""
-        # Flache Standalone-Services (ohne Clones) tragen im Tree keinen
-        # instance_hash - hier faellt die Aufloesung auf den Plugin-Fallback
-        # zurueck (erster bekannter Store-Modus des Plugins).
-        if not mode and not instance_hash and self.model is not None:
-            try:
-                mode = str(
-                    self.model.source_mode_for_plugin(plugin_id)
-                    or "").strip()
-            except Exception:
-                mode = ""
-        if not mode:
-            # Fallback: der Schema-Default gilt als aktueller Modus,
-            # solange weder Config noch Store einen echten liefern
-            # (z. B. nie gelaufene Variante).
-            mode = str(base).strip(" []")
-        return f"{base} {mode}"
+
+    @staticmethod
+    def _fmt_last_exec(value: Any) -> str:
+        """Normalisiert den Ausfuehrungszeitpunkt eines Baum-Knotens.
+
+        Akzeptiert 'DD.MM.JJ' (Alt-Bestand) und 'DD.MM.JJ HH:MM' (neu);
+        leere Werte und die Fallbacks '--.--.--' / '--.--.-- --:--' werden
+        zu 'nie' (kein '(Datum)'-Anhang).
+        """
+        value = str(value or "").strip()
+        if value and value not in ("--.--.--", "--.--.-- --:--"):
+            return value
+        return "nie"
 
     def update_mode_label(self, instance_id: str, plugin_id: str,
                           mode: str,
@@ -771,19 +788,23 @@ class MasterTree(QTreeWidget):
                     if str(item.data(0, ROLE_INSTANCE_ID) or "") != str(
                             instance_id or ""):
                         continue
-                self._set_label_mode(item, mode)
+                style = "bracket" if ntype == TYPE_CLONE else "dash"
+                self._set_label_mode(item, mode, style)
         except (RuntimeError, AttributeError):
             pass
 
     @staticmethod
-    def _set_label_mode(item, mode: str) -> None:
-        """Setzt den AKTUELLEN Modus im Label neu (13.08.2026, Punkt 2).
+    def _set_label_mode(item, mode: str, style: str = "dash") -> None:
+        """Setzt den AKTUELLEN Modus im Label neu (13.08.2026, Runde 3).
 
-        Entfernt ein vorhandenes '[x]' bzw. '[x] y' (angehaengter aktueller
-        Modus) und fuegt '[x] <neuerModus>' wieder ein - die Klammer (der
-        'Servicename'-Bezug) bleibt erhalten. '(Datum)' und '*' (Dirty)
-        bleiben erhalten; Preset-Namen mit Klammern (z. B. 'Default
-        (Kopie)') werden nicht zerstoert (das Datum wird am ENDE gesucht).
+        style='dash'    (Service/Standalone): 'name - Modus (Datum)' -
+                        ersetzt den Modus hinter dem Minuszeichen.
+        style='bracket' (Variante/Clone): 'name [servicename] Modus
+                        (Datum)' - ersetzt den Modus hinter der Klammer;
+                        der Klammer-Wert (Servicename) bleibt erhalten.
+        '(Datum)'/' (nie)' und '*' (Dirty) bleiben erhalten; Preset-Namen
+        mit Klammern (z. B. 'Default (Kopie)') werden nicht zerstoert
+        (das Datum wird am ENDE gesucht).
         """
         try:
             import re
@@ -799,16 +820,21 @@ class MasterTree(QTreeWidget):
             if text.endswith("*"):
                 star = "*"
                 text = text[:-1].rstrip()
-            # Bisherigen Klammer-Wert merken (bleibt erhalten).
-            bm = re.search(r"\[([^\]]*)\]", text)
-            bracket_val = bm.group(1) if bm else ""
-            # ' [x]' bzw. ' [x] y' entfernen (y = ein Token ohne Klammern).
-            stripped = re.sub(r"\s*\[[^\]]*\](?:\s+[^()\s]+)?", "",
-                              text).rstrip()
-            if bracket_val:
-                mode_sfx = f" [{bracket_val}] {mode}"
+            if style == "bracket":
+                bm = re.search(r"\[([^\]]*)\]", text)
+                bracket_val = bm.group(1) if bm else ""
+                # ' [servicename] Modus' entfernen (Klammer + ein Modus-
+                # Token dahinter), die Klammer wird neu eingefuegt.
+                stripped = re.sub(r"\s*\[[^\]]*\]\s*[^()\s]+$", "",
+                                  text).rstrip()
+                if bracket_val:
+                    mode_sfx = f" [{bracket_val}] {mode}"
+                else:
+                    mode_sfx = f" [{mode}]"
             else:
-                mode_sfx = f" [{mode}]"
+                # ' - Modus' entfernen und neu anfuegen (dash-Format).
+                stripped = re.sub(r"\s*-\s+[^()\s]+$", "", text).rstrip()
+                mode_sfx = f" - {mode}"
             item.setText(0, f"{stripped}{mode_sfx}{star}{date_part}")
         except (RuntimeError, AttributeError):
             pass
@@ -820,8 +846,7 @@ class MasterTree(QTreeWidget):
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
-        last_exec = str(child.get("last_execution") or "")
-        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
+        last_exec = self._fmt_last_exec(child.get("last_execution"))
         clones = child.get("clones") or []
         archived_parent = bool(child.get("archived"))
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
@@ -832,18 +857,18 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an ALLEN Plugin-Zeilen
-        # (auch Plugins MIT Clones - der Parent zeigt den Schema-Default-
-        # Modus, die Clone-Zeilen tragen ihren eigenen Modus; Ein-Modus-
-        # Services bleiben ohne Suffix).
-        # 13.08.2026 (Punkt 2, Live-Update-Format): Flache Standalone-
-        # Services (ohne Clones) zeigen wie Clones den AKTUELLEN Modus
-        # hinter der Klammer (Plugin-Fallback aus dem Store); Template-
-        # Parents MIT Clones nur den Schema-Default (kein eigener Modus).
-        mode_sfx = (self._mode_suffix_resolved(pid, None, "")
-                    if not clones else self._mode_suffix(pid, None))
-        plugin_label = (f"{display_pid}{mode_sfx}" if clones
-                        else f"{display_pid}{mode_sfx} ({last_exec})")
+        # 13.08.2026 (Runde 3c, neue Benennung):
+        #  - Flache Standalone-Services (ohne Clones): 'name - Modus
+        #    (Datum)' (Minuszeichen statt Doppel-Modus).
+        #  - Plugin-Parents MIT Clones (Ordnername): NUR der
+        #    Servicename - der Modus kann je Variante unterschiedlich
+        #    sein und steht an den Clone-Zeilen darunter.
+        if clones:
+            plugin_label = display_pid
+        else:
+            mode = self._current_mode(pid, None, "")
+            mode_sfx = f" - {mode}" if mode else ""
+            plugin_label = f"{display_pid}{mode_sfx} ({last_exec})"
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -885,14 +910,20 @@ class MasterTree(QTreeWidget):
         # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
         # Ausfuehrung dieser Variante direkt am Varianten-Namen:
         # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
-        last_exec = str(clone.get("last_execution") or "")
-        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
+        last_exec = self._fmt_last_exec(clone.get("last_execution"))
         prefix = "🔹" if archived else "🟢"
         # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
         # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
         # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
-        mode_sfx = self._mode_suffix_resolved(
-            plugin_id, clone.get("params"), instance_hash)
+        # 13.08.2026 (Runde 3, neue Benennung): Die Variante zeigt den
+        # SERVICENAMEN in eckigen Klammern (ohne srv_-Praefix), dahinter
+        # den AKTUELLEN Modus:
+        # '🟢 <Preset> [swing_volume_profile] Volume_Profile (13.08.26 10:48)'.
+        mode = self._current_mode(plugin_id, clone.get("params"),
+                                  instance_hash)
+        display_pid = (plugin_id[4:]
+                       if plugin_id.startswith("srv_") else plugin_id)
+        mode_sfx = f" [{display_pid}] {mode}" if mode else ""
         clone_item = QTreeWidgetItem(
             [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)

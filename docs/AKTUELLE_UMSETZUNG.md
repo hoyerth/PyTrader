@@ -1718,3 +1718,70 @@ def _on_mode_filter_changed(self) -> None:
 - **Testdateien:** verbleiben lokal in test/ (gitignored, Projekt-Konvention) - keine Commits.
 - **Offener Punkt (bewusst NICHT umgesetzt):** Clone-Modus-Anzeige fuer Varianten ohne params.mode greift auf den Schema-Default zurueck; die Abweichungs-Anzeige (Store-Modus) ist seit Runde 3 implementiert und greift bei naechster Variante mit anderem Modus automatisch.
 - **Commit:** (dieser Abschluss-Commit)
+
+
+# Implementierungs-Log 13.08.2026 - Runde 3 final: MasterTree-Benennung (F1-F5) + Grafikteiler-Persistenz (13.08.2026, nach Anwender-Freigabe)
+
+## Runde 3 final - MasterTree: neue Benennung (F1-F5, User-Vorgaben)
+
+- **F1 - Service ohne Varianten:** Doppel-Anzeige entfernt, Minuszeichen zwischen Service- und Modusname:
+  `swing_momentum - MA_Peak_Hysteresis (13.08.26 10:48)` (vorher `swing_momentum [MA_Peak_Hysteresis] MA_Peak_Hysteresis (13.08.26)`).
+- **F2 - Varianten/Clones:** Klammer = Servicename OHNE `srv_`-Praefix, dahinter der AKTUELLE Modus:
+  `🟢 <Preset> [swing_volume_profile] Volume_Profile (12.08.26 12:17)` (vorher `[Volume_Profile] Volume_Profile` - Modus doppelt).
+- **F3 - Plugin-Parent-Knoten (Ordner ueber den Varianten):** NUR der Servicename (ohne Modus - der Modus kann je Variante unterschiedlich sein und steht an den Clone-Zeilen):
+  `swing_volume_profile` (Runde 3b: `- Modus`, Runde 3c: final nur Servicename).
+- **F4 - Nie gelaufene Varianten:** Namensschema wird trotzdem ausgegeben, am Ende steht `(nie)`.
+- **F5 - Letzte Ausfuehrung mit Uhrzeit:** `(DD.MM.JJ HH:MM)` (z. B. `(13.08.26 10:48)`); Fallback bleibt `(nie)`.
+- **Bugfix 1c - Live-Update im Picker:** `param_columns.py` `_update_tree_mode_label` faellt auf `selector` zurueck (`_DialogParamHost` haelt den Selector unter `selector`, nicht `service_selector`) - Moduswechsel im ServiceSelectorDialog aktualisiert die Baumzeile SOFORT.
+
+### Aenderungen (Runde 3 final)
+
+- `serviceui/master_tree.py`:
+  - `_mode_suffix_resolved()` ersetzt durch `_current_mode(plugin_id, params, instance_hash)` (liefert nur den aufgeloesten Modus; Formatierung uebernimmt der Aufrufer). Aufloesungs-Kette unveraendert: params.mode -> source_mode_for_hash -> source_mode_for_plugin -> Schema-Default.
+  - Neuer Normalisierer `_fmt_last_exec(value)`: akzeptiert `DD.MM.JJ` (Alt-Bestand) und `DD.MM.JJ HH:MM` (neu); Fallbacks `--.--.--`/`--.--.-- --:--` -> `nie`.
+  - `_build_set_item()`: Set-Service-Label `{instance_id} - {Modus} ({last_exec})` (dash).
+  - `_build_plugin_item()`: flache Standalone `{name} - {Modus} ({last_exec})`; Plugin-Parents MIT Clones nur `{name}`.
+  - `_build_clone_item()`: `{prefix} {preset_name} [{display_pid}] {Modus} ({last_exec})` (bracket, Klammer = Servicename ohne srv_).
+  - `_set_label_mode(item, mode, style)`: style `dash`/`bracket` - Live-Update-Rewrite ersetzt nur den Modus hinter Minuszeichen bzw. hinter der Klammer (Klammerwert = Servicename bleibt erhalten); `(Datum)`/`*` bleiben erhalten.
+  - `update_mode_label()`: reicht den Knotentyp als style durch (Clone -> bracket, sonst dash).
+- `serviceui/param_columns.py`: `_update_tree_mode_label` - selector-Fallback fuer den Dialog-Host (Bugfix 1c).
+- `analytics/engine/service_selector_model.py`:
+  - `_load_plugin_presets()`: `last_execution` der Clones jetzt aus `_last_execution_datetimes_by_hash` (`DD.MM.JJ HH:MM`, Fallback `--.--.-- --:--`) statt nur Datum.
+  - `build_tree()`: `last_execution_datetime(pid)` (`DD.MM.JJ HH:MM`) statt `last_execution_date(pid)` fuer alle Baum-Zeilen.
+
+### Verifikation (headless, keine UI - Grundsatz 2)
+
+- `test/check_tree_mode_fix2.py` (46 Checks): reale Clone-Labels (Klammer = Servicename ohne srv_, Modus dahinter), `_current_mode` (Store-Modus gewinnt/params-Vorrang/Ein-Modus leer), `_set_label_mode` (dash/bracket, Dirty *, Datum, Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
+- `test/check_all_labels.py` / `check_clone_labels.py` / `check_tree_mode_fix.py`: rendern das neue Format auf echten Baum-Daten (z. B. `swing_momentum - MA_Peak_Hysteresis (13.08.26 10:48)`, `srv_swing 34566 [swing_volume_profile] Volume_Profile (12.08.26 12:17)`, Parents nur Servicename).
+- `test/check_punkte_1_8.py` (9 Checks): ALLE PASS (keine Regression).
+- `py_compile` aller geaenderten Quelldateien OK.
+
+## Runde 3d - Grafikteiler Tree|Parameter: Persistenz (Workspace + Profil + Historie)
+
+- **User-Anforderung:** Der vom Anwender zuletzt eingestellte Grafikteiler zwischen Tree und Parameter soll in der gesamten Historie gespeichert und restored werden - Workspace und Profil.
+- **Format:** Splitter-Breiten als Liste (Tree, Panel) - Persistenz in `global_settings` (Key `splitter_<dialog_key>`), im Analytics-Workspace-Payload und im Profil-Payload (Key `service_picker_splitter`).
+
+### Aenderungen (Runde 3d)
+
+- `state_manager.py`: neue Methoden `save_splitter_state(dialog_key, sizes)` / `get_splitter_state(dialog_key)` (global_settings, JSON-Liste).
+- `serviceui/service_selector_dialog.py` (ServicePicker Tree|Parameter):
+  - Neues Signal `splitter_changed(int, int)` - wird bei jeder `splitterMoved`-Bewegung ans AnalyticsWindow gemeldet (Live-Tracking, `_on_splitter_moved`).
+  - `_save_geometry()`: sichert die Splitter-Position zusaetzlich in global_settings (Historie); `_restore_geometry()`: stellt sie wieder her.
+  - Neue Methoden `current_splitter_sizes()` / `set_splitter_sizes(sizes)` (defensiv: nur 2 positive Werte, Tree-Minimum 180px respektiert).
+- `analytics/ui/analytics_win.py`:
+  - `_picker_splitter` merkt die letzte Position live (`_on_picker_splitter_changed`).
+  - `_current_ui_layout()`: `service_picker_splitter` im Profil-Payload (`set_ui_layout` -> `save_profile`/`create_profile`).
+  - `_save_workspace()`: `service_picker_splitter` im Workspace-Payload (+ global_settings-Backup).
+  - Restore: beim Oeffnen des Pickers wird `service_picker_splitter` aus `workspace_layout` angewendet; beim Profilwechsel wird ein offener Picker-Dialog sofort nachgezogen.
+- `serviceui/service_win.py` (MasterTree|Param-Box): `save_state()` sichert `main_splitter.sizes()` in der Fenster-Historie; `restore_state()` stellt sie wieder her.
+
+### Verifikation (headless, keine UI - Grundsatz 2)
+
+- `test/check_splitter_persist.py` (17 Checks): StateManager-Roundtrip (Temp-DB in test/), Dialog-Methoden gemockt (set/current/on_moved inkl. Tree-Minimum + Invalid-Guards), AnalyticsWindow-Payload-Inspektion (service_picker_splitter in Profil- und Workspace-Payload, splitter_changed verdrahtet, Restore beim Oeffnen), ServiceWindow-Historie (save/get_splitter_state) - ALLE PASS.
+- `test/check_tree_mode_fix2.py` (46 Checks): weiterhin ALLE PASS (keine Regression).
+- `py_compile` aller 7 geaenderten Quelldateien OK.
+
+## Commit (13.08.2026) - Runde 3 final + Grafikteiler-Persistenz
+
+- **Geaenderte Dateien (7):** `analytics/engine/service_selector_model.py`, `analytics/ui/analytics_win.py`, `serviceui/master_tree.py`, `serviceui/param_columns.py`, `serviceui/service_selector_dialog.py`, `serviceui/service_win.py`, `state_manager.py`.
+- **Testdateien:** verbleiben lokal in test/ (gitignored, Projekt-Konvention) - keine Commits.

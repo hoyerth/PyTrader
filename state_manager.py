@@ -607,3 +607,42 @@ class StateManager:
             if isinstance(data, dict):
                 return data
         return None
+
+    # =========================================================================
+    # Splitter-Persistenz (13.08.2026, Runde 3d): Grafikteiler Tree|Parameter
+    # -------------------------------------------------------------------------
+    # Speichert die zuletzt vom Anwender eingestellte Splitter-Position
+    # (z. B. MasterTree | Parameter-Panel) unter global_settings
+    # (Key 'splitter_<dialog_key>'). Sie wird beim erneuten Oeffnen des
+    # Fensters/Dialogs wiederhergestellt (Gesamt-Historie) und zusaetzlich
+    # ueber den Analytics-Workspace + Profil-Payload (service_picker_splitter)
+    # persistiert. dialog_key: z. B. "service_selector" / "win_service".
+    # =========================================================================
+    def save_splitter_state(self, dialog_key: str, sizes) -> None:
+        """Persistiert die Splitter-Position (Liste von Pixel-Breiten)."""
+        con = self._get_connection()
+        key = f"splitter_{dialog_key}"
+        try:
+            sizes = [int(x) for x in (sizes or [])]
+        except (TypeError, ValueError):
+            sizes = []
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [key, json.dumps(sizes)])
+
+    def get_splitter_state(self, dialog_key: str) -> Optional[List[int]]:
+        """Liest die gespeicherte Splitter-Position eines dialog_key (oder None)."""
+        con = self._get_connection()
+        key = f"splitter_{dialog_key}"
+        row = con.execute(
+            "SELECT value FROM global_settings WHERE key = ?", [key]).fetchone()
+        if row and row[0]:
+            data = _parse_json_field(row[0])
+            if isinstance(data, list):
+                try:
+                    return [int(x) for x in data]
+                except (TypeError, ValueError):
+                    return None
+        return None

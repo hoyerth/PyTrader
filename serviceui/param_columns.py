@@ -543,7 +543,12 @@ class ServiceParamColumnsMixin:
         mitgegeben, damit nur die GEWAEHLTE Variante aktualisiert wird.
         """
         try:
-            selector = getattr(self, "service_selector", None)
+            # 13.08.2026 (Runde 3, Bugfix): Der _DialogParamHost des
+            # ServiceSelectorDialog haelt den Selector unter 'selector'
+            # (nicht 'service_selector') - ohne Fallback blieb das
+            # Live-Update des Modus-Labels im Picker wirkungslos.
+            selector = (getattr(self, "service_selector", None)
+                        or getattr(self, "selector", None))
             tree = getattr(selector, "master_tree", None)
             if tree is None or not iid:
                 return

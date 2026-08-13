@@ -357,6 +357,10 @@ class ServiceSelectorDialog(QDialog):
     # Runde 10 (Bug 1): Varianten-granularer Filter - instance_hashes der
     # gecheckten Clone-Varianten (parallel zu selection_ids_requested).
     selection_hashes_requested = Signal(list)
+    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter verschoben
+    # (tree_width, panel_width) - das AnalyticsWindow merkt sich die
+    # Position fuer Workspace- und Profil-Persistenz.
+    splitter_changed = Signal(int, int)
 
     def __init__(
         self,
@@ -501,6 +505,11 @@ class ServiceSelectorDialog(QDialog):
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setCollapsible(1, False)
         self._splitter.setSizes([TREE_DEFAULT_WIDTH, 620])
+        # 13.08.2026 (Runde 3d): Splitter-Bewegung live melden
+        # (Workspace-/Profil-Persistenz im AnalyticsWindow);
+        # zusaetzlich sichert _save_geometry die Position in
+        # global_settings (Historie).
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
         body.addWidget(self._splitter, 1)
         root.addLayout(body, 1)
 
@@ -2430,6 +2439,49 @@ class ServiceSelectorDialog(QDialog):
         host._service_info_pids.clear()
 
     # ------------------------------------------------------------------
+    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter
+    # ------------------------------------------------------------------
+    def _on_splitter_moved(self, _pos: int, _index: int) -> None:
+        """Meldet die Splitter-Position an das AnalyticsWindow (Workspace/
+        Profil-Persistenz, Runde 3d)."""
+        try:
+            sizes = list(self._splitter.sizes())
+            if len(sizes) >= 2:
+                self.splitter_changed.emit(sizes[0], sizes[1])
+        except (RuntimeError, AttributeError):
+            pass
+
+    def current_splitter_sizes(self) -> List[int]:
+        """Aktuelle Splitter-Breiten (Tree, Panel) fuer Workspace/Profil."""
+        try:
+            sizes = list(self._splitter.sizes())
+            return [int(s) for s in sizes if str(s).strip().lstrip("-").isdigit()]
+        except (RuntimeError, AttributeError):
+            return []
+
+    def set_splitter_sizes(self, sizes) -> None:
+        """Wendet gespeicherte Splitter-Breiten an (Workspace/Profil).
+
+        Defensiv: nur 2 positive Werte; der Tree respektiert seine
+        Mindestbreite (selector.minimumWidth)."""
+        try:
+            if not sizes or not isinstance(sizes, (list, tuple)):
+                return
+            clean = [int(s) for s in sizes
+                     if str(s).strip().lstrip("-").isdigit() and int(s) > 0]
+            if len(clean) != 2:
+                return
+            try:
+                min_tree = self.selector.minimumWidth()
+            except (RuntimeError, AttributeError):
+                min_tree = 0
+            if clean[0] < min_tree:
+                clean[0] = min_tree
+            self._splitter.setSizes(clean)
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
     # Punkt 4: Geometrie-Persistenz (global_settings, IndicatorDialog-Muster)
     # ------------------------------------------------------------------
     def _restore_geometry(self) -> None:
@@ -2470,6 +2522,14 @@ class ServiceSelectorDialog(QDialog):
                     self.move(pos_x, pos_y)
             if w and h:
                 self.resize(max(int(w), self.minimumWidth()), int(h))
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter aus
+            # der Historie wiederherstellen (global_settings).
+            try:
+                sizes = sm.get_splitter_state(DIALOG_GEOMETRY_KEY)
+                if sizes:
+                    self.set_splitter_sizes(sizes)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2483,6 +2543,13 @@ class ServiceSelectorDialog(QDialog):
             s = self.size()
             sm.save_dialog_geometry(
                 DIALOG_GEOMETRY_KEY, p.x(), p.y(), s.width(), s.height())
+            # 13.08.2026 (Runde 3d): Grafikteiler mitpersistieren
+            # (Gesamt-Historie in global_settings).
+            try:
+                sm.save_splitter_state(
+                    DIALOG_GEOMETRY_KEY, self.current_splitter_sizes())
+            except Exception:
+                pass
         except Exception:
             pass
 

@@ -504,6 +504,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 self.width(), self.height())
         except Exception:
             pass
+        # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter in der
+        # Fenster-Historie sichern (Restore in restore_state).
+        try:
+            sp = getattr(self, "main_splitter", None)
+            if sp is not None:
+                self._state_manager.save_splitter_state(
+                    self.DIALOG_GEOMETRY_KEY, sp.sizes())
+        except Exception:
+            pass
         symbol = self.get_persistent_symbol()
         tf = self.get_persistent_timeframe()
         if symbol and tf:
@@ -560,6 +569,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                     pos_x, pos_y = 100, 100
                 self.move(pos_x, pos_y)
             self._restored_is_maximized = bool(geom.get("is_maximized", False))
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter aus
+            # der Historie wiederherstellen.
+            try:
+                sizes = self._state_manager.get_splitter_state(
+                    self.DIALOG_GEOMETRY_KEY)
+                sp = getattr(self, "main_splitter", None)
+                if sizes and sp is not None:
+                    clean = [int(s) for s in sizes
+                             if str(s).strip().lstrip("-").isdigit()
+                             and int(s) > 0]
+                    if len(clean) == 2:
+                        sp.setSizes(clean)
+            except Exception:
+                pass
         # Symbol/Timeframe aus instance_states
         all_inst = self._state_manager.load_all_instances()
         matched = next((i for i in all_inst if i.get("instance_id") == inst_id), None)
