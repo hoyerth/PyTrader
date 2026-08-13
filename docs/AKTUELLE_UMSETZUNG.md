@@ -1540,3 +1540,18 @@ def _on_mode_filter_changed(self) -> None:
   - `test/check_mode_filter_widget.py` (10 Checks): Items, enabled/disabled (Entscheidung 4), Reset auf all, `_on_mode_filter_changed`, Stale-Guard - PASS.
   - Bestehende Tests gruen: `check_analytics_mtffc.py` (13), `check_analytics_mtffc_win.py` (22), `check_field_pairs_db.py` (5), `check_field_selection.py` (19), `check_heatmap_field_checks.py`, `check_mtf_sort_binding.py` (21). `check_custom_range_sortmode.py` NICHT lauffaehig (externe DB-Sperre data/app_data.duckdb durch laufende App - unabhaengig von dieser Umsetzung).
 - **Commit:** ceb2351
+# Implementierungs-Log 21.03.20 - Bugfixing Runde: Layout / Modus-Dropdown / Service-Achse (13.08.2026)
+
+- **Bug 1 (Layout, Mauszeiger-Werteanzeige):** `analytics/ui/heatmap_widget.py` - `_label_info` (Werteanzeige) liegt jetzt VOR `_combo_field` in ctrl2 (Spacing 6), `_combo_field` behaelt Stretch 1 (wachst bis Canvas-Ende). Verifiziert: `test/check_bugfix_2132_layout.py` PASS (info=15, field=17, stretch=1).
+- **Bug 2 (Modus-Dropdown zeigte nur DB-geschriebene Modi):** `analytics/engine/analytics_repository.py` - neue `_registry_source_modes()` (classmethod) liest `parameter_schema["mode"]["options"]` der aktiven Services (PluginRegistry-Singleton, in-Memory) und merged per `dict.fromkeys`-UNION in `source_modes` (DB-Modi zuerst, dann Registry-Modi sortiert); `has_source_mode_services = bool(has_sm or registry_modes)`; `Set`-Import ergaenzt.
+- **Bug 3 (Service-Achse mit Modus-Suffix):**
+  - `analytics/engine/feature_store_reader.py`: `DIM_MAPPINGS["service_id"]` = `LOWER(feature_id) || '::' || COALESCE(json_extract_string(feature_data, '$.source_mode'), '')` (source_mode case-original); `fetch_generic_heatmap` neuer Parameter `extra_service_modes: Optional[List[str]] = None` ergaenzt fehlende `{feature_id}::{mode}`-Kombinationen als Achsenpunkte (nur service_id-Dimension, leere Zellen = fill).
+  - `analytics/engine/analytics_repository.py`: neue `_registry_service_mode_pairs()` (liefert `{plugin_id_lower}::{mode}`), `_registry_source_modes` darauf refactored; `get_generic_heatmap` reicht `extra_service_modes` durch NUR bei `service_mode` in ("", "all", "alle").
+  - `analytics/engine/analytics_view_model.py`: `resolve_service_label` parst `::`-Suffix, haengt `' / {Modus}'` nur bei nicht-leerem Modus an (auch im Exception-Fallback).
+  - Verifiziert: `test/check_bugfix_2132.py` (8 PASS: 3 Achsenpunkte, grid leerer Suffix, 4 Matrix-Spalten, Modus-Filter begrenzt auf 1), `test/check_bugfix_2132_label.py` (5 PASS).
+- **Verifikation (headless, keine UI):**
+  - `py_compile` aller 4 geaenderten Quelldateien + Testdatei OK.
+  - `test/check_mode_filter_db.py` (25 Checks, inkl. 3 neuer Registry-Payload-Checks), `test/check_bugfix_2132.py` (8), `test/check_bugfix_2132_label.py` (5), `test/check_bugfix_2132_layout.py`, `test/check_mode_filter_worker.py` (6), `test/check_mode_filter_vm.py` (11), `test/check_mode_filter_widget.py` (10) - ALLE PASS.
+  - `test/check_mode_filter_db.py`: Payload-Erwartung von exakt auf "enthaelt" umgestellt (Bugfix 2 liefert zusaetzlich Registry-Modi der realen Plugins).
+  - Temporaere Patch-Skripte (`test/_fix_bug*.py`) nach Verifikation geloescht.
+- **Commit:** ce534c5
