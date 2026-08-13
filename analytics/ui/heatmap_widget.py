@@ -998,7 +998,9 @@ class HeatmapWidget(QWidget):
         # bleiben erlaubt. Ist SUM gerade aktiv und das Feld preisartig,
         # wird implizit auf AVG gewechselt (VM-Config + Refresh idempotent).
         active_field = self._field_key(self._combo_field.currentData())
-        price_like = self._is_price_like_key(active_field)
+        # 13.08.2026 (Punkt 5, F5): Modul-Funktion (kein self.) - die
+        # Helfer ist als reine Funktion definiert (SRP, kein Widget-Zustand).
+        price_like = _is_price_like_key(active_field)
         sum_idx = self._combo_agg.findData("sum")
         if sum_idx >= 0:
             _sum_item = self._combo_agg.model().item(sum_idx)
