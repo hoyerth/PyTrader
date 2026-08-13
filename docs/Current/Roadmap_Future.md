@@ -77,3 +77,27 @@ Damit es auch in Zukunft so zukunftssicher bleibt, solltest du bei der Umsetzung
 3. **1-Minute Fair Value Gap (FVG) Entries:** Entries on 1-minute timeframes consistently outperformed 5-minute setups [[17:20](https://www.google.com/search?q=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DKML09tRtHM8%26t%3D1040)].
 4. **High Frequency / Execution Volume:** The edge per trade is small; profitability comes from higher trade frequency rather than low-frequency selectivity [[17:27](https://www.google.com/search?q=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DKML09tRtHM8%26t%3D1047)].
 5. **Core Model Analogy:** Strip away the ICT terminology, and the surviving profitable framework is essentially a **mean-reversion strategy** on a 1-minute chart [[17:54](https://www.google.com/search?q=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DKML09tRtHM8%26t%3D1074)].
+
+
+---
+
+# 21.04 Multi-DB Architecture & Data Management
+## Strategy: Domain-Driven Split via DuckDB
+Split storage into 4 isolated `.db` files to prevent file-locking, maximize IOPS, and isolate test data. Native cross-DB joins via `ATTACH DATABASE`.
+## DB Schema Split
+1. `master_config.db` (Lightweight): Mastertree hierarchy, service configs, parameter presets, instance hashes, archive text logs.
+2. `market_data.db` (Static Read-Only): Raw OHLCV (M1-Daily), tick histories, L2 DOM snapshots.
+3. `analytics_runs.db` (High-Volume Dynamic): Generated signals, sweep results, metrics, heatmap densities. Targeted by "Delete Data Only".
+4. `ml_feature_store.db` (ML Optimized): Fractional diffs, Z-scores, Garman-Klass vols, trained probability matrices.
+## Text Architecture: 20.05
+                   [PyTrader Core / Execution Engine]
+                                   │
+      ┌────────────────┬───────────┴───────────┬────────────────┐
+      ▼                ▼                       ▼                ▼
+┌──────────────┐┌──────────────┐       ┌──────────────┐ ┌──────────────┐
+│ market_data  ││master_config │       │analytics_runs│ │ml_feature_st │
+│     .db      ││     .db      │       │     .db      │ │     .db      │
+└──────────────┘└──────────────┘       └──────────────┘ └──────────────┘
+ (OHLCV/Ticks)  (Tree/Configs/          (Signals/Sweeps/ (ML Features/
+                 Archive Logs)           Data Clear)      Prob-Matrices)
+

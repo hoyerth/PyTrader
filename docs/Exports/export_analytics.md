@@ -733,7 +733,23 @@ class AnalyticsRepository:
         21.03.20-Bugfix 2: UNION-Quelle fuer das Modus-Dropdown (alle
         waehlbaren Modi statt nur der DB-geschriebenen). Abgeleitet aus
         `_registry_service_mode_pairs` (eine Registry-Sammlung).
+
+        13.08.2026 (Punkt 2, Antwort b): KEIN pauschaler Registry-Fallback
+        mehr bei leerer Auswahl - ohne konkrete feature_ids (nichts
+        gecheckt) liefert die UNION eine leere Menge. Das Modus-Dropdown
+        zeigt damit keine Modi unselektierter Services (die DB-Quelle
+        `fetch_available_source_modes` filtert bereits auf feature_ids).
+        Die Heatmap-Achse (`get_generic_heatmap` -> extra_service_modes)
+        nutzt weiterhin den vollen Registry-Satz ueber
+        `_registry_service_mode_pairs` (F1: Achsenpunkte fuer noch nicht
+        berechnete Modi).
         """
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        if not wanted:
+            return set()
         pairs = cls._registry_service_mode_pairs(feature_ids, feature_id)
         modes: Set[str] = set()
         for p in pairs:
@@ -1571,8 +1587,14 @@ class AnalyticsViewModel(QObject):
 
         Chronologische Lichtsaeulen zeitgleicher Signale (Hauptansicht).
         Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        21.03.21 (Hotspot-Orchestrierung): Der Preset setzt den
+        Modus-Filter auf `"all"` zurueck - Confluence/Hotspots sind
+        die Haeufung ueber ALLE Modi hinweg (Kapitel §3.2-Standard).
+        Idempotent: `set_service_mode("all")` ist ein early-return,
+        wenn kein Modus-Filter aktiv ist.
         """
         self._set_heatmap_all_timeframes(False)
+        self.set_service_mode("all")
         self.set_heatmap_config("date", "service_id", "", "confluence_count")
 
     def apply_smart_preset_session(self) -> None:
@@ -5021,6 +5043,48 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_source_modes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Letzter source_mode je (feature_id, instance_hash).
+
+        13.08.2026 (Punkt 2, MasterTree-Modus): Die Clone-/Varianten-Labels
+        sollen den AKTUELLEN Modus zeigen. Da die Preset-Params haeufig
+        KEINEN 'mode'-Key enthalten (der Modus wird erst beim Run bestimmt),
+        wird hier der source_mode der JEWEILS LETZTEN Ausfuehrung je
+        (feature_id, instance_hash) gelesen (JSON-Key in feature_data,
+        DuckDB arg_max(..., bar_time)). Read-only, ueber ALLE Symbole/
+        Timeframes; case-insensitiv wie die Datums-Geschwister.
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: source_mode} - leer
+            bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       arg_max(json_extract_string(
+                           feature_data, '$.source_mode'), bar_time) AS mode
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                  AND json_extract_string(feature_data, '$.source_mode')
+                      IS NOT NULL
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_source_modes_by_hash fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            out.setdefault(str(r[0]), {})[str(r[1])] = str(r[2])
+        return out
+
     def fetch_last_execution_datetimes_by_hash(
         self,
     ) -> Dict[str, Dict[str, str]]:
@@ -5899,6 +5963,10 @@ class AnalyticsWindow(PersistentWindow):
         # ServiceSelectorModel ist injizierbar (Headless-Tests); der Dialog
         # wird lazy erzeugt (nicht-modal) und beim Schliessen zerstört.
         self._service_dialog: Optional[ServiceSelectorDialog] = None
+        # 13.08.2026 (Runde 3d): Zuletzt eingestellter Grafikteiler
+        # Tree|Parameter des ServicePickers - Grundlage fuer Workspace-
+        # und Profil-Persistenz (service_picker_splitter).
+        self._picker_splitter: List[int] = []
         #: Anzeigenamen des aktiven Datenquellen-Filters (fuer den Button).
         #: Beim Profilwechsel zurueckgesetzt – Namen werden dann aus den
         #: persistierten feature_ids ueber das Model re-resolved.
@@ -6105,6 +6173,10 @@ class AnalyticsWindow(PersistentWindow):
                 self._on_picker_hashes_selected)
             self._service_dialog.destroyed.connect(
                 self._on_service_dialog_destroyed)
+            # 13.08.2026 (Runde 3d): Grafikteiler-Bewegung live merken
+            # (Workspace-/Profil-Persistenz).
+            self._service_dialog.splitter_changed.connect(
+                self._on_picker_splitter_changed)
         # Runde 9 (Bug 1): Modell explizit refreshen, damit der Baum
         # sicher aufgebaut ist - das initiale data_changed des Modells
         # lief VOR der Dialog-Erstellung (Dialog ist lazy), ein leerer
@@ -6118,6 +6190,15 @@ class AnalyticsWindow(PersistentWindow):
         self._service_dialog.apply_feature_ids(
             self._vm.params.get("feature_ids") or [],
             self._vm.params.get("instance_hashes") or [])
+        # 13.08.2026 (Runde 3d): Grafikteiler aus Workspace/Profil
+        # anwenden (letzter Sitzungszustand/Profil gewinnt).
+        try:
+            sp = (self._vm.workspace_layout or {}).get(
+                "service_picker_splitter")
+            if sp:
+                self._service_dialog.set_splitter_sizes(sp)
+        except Exception:
+            pass
         self._service_dialog.show()
         self._service_dialog.raise_()
         self._service_dialog.activateWindow()
@@ -6126,6 +6207,15 @@ class AnalyticsWindow(PersistentWindow):
     def _on_service_dialog_destroyed(self) -> None:
         """Setzt die Dialog-Referenz zurueck (zerstoert mit dem Parent)."""
         self._service_dialog = None
+
+    @Slot(int, int)
+    def _on_picker_splitter_changed(self, tree_w: int, panel_w: int) -> None:
+        """13.08.2026 (Runde 3d): Letzte Splitter-Position merken.
+
+        Wird bei jeder Splitter-Bewegung im ServicePicker gefeuert -
+        die Position fliesst in Workspace- und Profil-Payload ein
+        (service_picker_splitter)."""
+        self._picker_splitter = [int(tree_w or 0), int(panel_w or 0)]
 
     @Slot(list)
     def _on_picker_hashes_selected(self, instance_hashes: List[str]) -> None:
@@ -6327,6 +6417,12 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
+        # 13.08.2026 (Punkt 3, Bugfix Profile): Profil-Combo (Wechsel) und
+        # Speichern-Button waren NICHT verdrahtet - Profilwechsel und Save
+        # wirkten nicht. Verdrahtung ergaenzt (IoC, Signale statt direkter
+        # Aufrufe; _profile_combo_syncing-Guard verhindert Rekursion).
+        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
+        self.btn_profile_save.clicked.connect(self._on_profile_save)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
         # 21.03.11 (Bug 3): Nach abgeschlossenem Service-Run (der Worker
         # emittiert `service_set_changed` einmalig nach der ALLE-TFs-/
@@ -6738,6 +6834,17 @@ class AnalyticsWindow(PersistentWindow):
         # die Historie-Werte und beim Schliessen wird der falsche Zustand
         # persistiert).
         self._sync_profile_filters()
+        # 13.08.2026 (Runde 3d): Grafikteiler des offenen Picker-Dialogs
+        # aus dem Profil-Layout uebernehmen (Profilwechsel).
+        try:
+            if (self._service_dialog is not None
+                    and self._service_dialog.isVisible()):
+                sp = (self._vm.workspace_layout or {}).get(
+                    "service_picker_splitter")
+                if sp:
+                    self._service_dialog.set_splitter_sizes(sp)
+        except Exception:
+            pass
 
     def _sync_profile_filters(self) -> None:
         """Synchronisiert Symbol-/TF-Combos mit den VM-Parametern (Bugfix).
@@ -6823,6 +6930,9 @@ class AnalyticsWindow(PersistentWindow):
             "service_picker_open": bool(
                 self._service_dialog is not None
                 and self._service_dialog.isVisible()),
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter des
+            # ServicePickers im Profil mitpersistieren.
+            "service_picker_splitter": list(self._picker_splitter or []),
         }
 
     @Slot()
@@ -6908,6 +7018,21 @@ class AnalyticsWindow(PersistentWindow):
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
         # Profil persistieren (save_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())
+        # 13.08.2026 (Punkt 3, Teil 2, Bugfix Profile): Filterleisten-Zustand
+        # explizit in die VM-Params uebernehmen, damit save_profile den
+        # aktuell ANGEZEIGTEN Stand persistiert (data_tf/agg_tf/range/sort_mode
+        # aus der sources-Sektion). Idempotent - die VM-Setter sind No-Ops,
+        # wenn sich nichts geaendert hat (kein zusaetzlicher Query-Refresh).
+        try:
+            self._vm.set_data_tf(self.mtf_bar.current_data_tf())
+            self._vm.set_agg_tf(self.mtf_bar.current_agg_tf())
+            self._vm.set_sort_mode(self.mtf_bar.current_sort_mode())
+            preset = self.mtf_bar.current_range_preset()
+            if preset:
+                f, t = self.mtf_bar.current_range_epochs()
+                self._vm.set_range(f, t, preset)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Profil-Filter-Sync: {e}")
         self._vm.save_profile()
 
     @Slot()
@@ -7002,6 +7127,10 @@ class AnalyticsWindow(PersistentWindow):
                     "service_picker_open": bool(
                         self._service_dialog is not None
                         and self._service_dialog.isVisible()),
+                    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter
+                    # des ServicePickers im Workspace mitpersistieren.
+                    "service_picker_splitter": list(
+                        self._picker_splitter or []),
                 },
             }
             self.state_manager.save_workspace_state(
@@ -8651,12 +8780,13 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
-        # 20.02.01 (E8): Mindestbreite erhoeht (laengere Achsen-Beschriftungen).
-        self._combo_x.setMinimumWidth(160)
+        # 13.08.2026 (Punkt 1): X-/Y-Achse kompakter (160->110), damit die
+        # Zoom-X-/Zoom-Y-Slider in Zeile 1 wieder sichtbar bleiben.
+        self._combo_x.setMinimumWidth(110)
         for d in HEATMAP_DIMENSIONS:
             self._combo_x.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_y = QComboBox()
-        self._combo_y.setMinimumWidth(160)
+        self._combo_y.setMinimumWidth(110)
         for d in HEATMAP_DIMENSIONS:
             self._combo_y.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_agg = QComboBox()
@@ -8696,16 +8826,11 @@ class HeatmapWidget(QWidget):
         # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
         self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
 
-        ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("X-Achse:"))
-        ctrl.addWidget(self._combo_x)
-        ctrl.addWidget(QLabel("Y-Achse:"))
-        ctrl.addWidget(self._combo_y)
-        # 21.01 (E7, 11.08.2026): Die 4 Smart-Preset-Buttons wurden
-        # ENTFERNT – die Presets sind ausschliesslich ueber das
-        # 'Ansicht'-Dropdown der HeatmapPage erreichbar (heatmap_page.py,
-        # _combo_mode / _apply_selected_preset).
-        ctrl.addStretch(1)
+        # 13.08.2026 (Punkt 5): Layout-Restrukturierung - der bisherige
+        # 1-Zeiler (ctrl: X-Achse/Y-Achse) und das 2-zeilige QGridLayout
+        # (ctrl2) werden durch zwei buendige Zeilen (row1/row2, Aufbau
+        # weiter unten nach der Widget-Erzeugung) ersetzt - alle Controls
+        # bleiben unveraendert erhalten.
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
@@ -8724,6 +8849,10 @@ class HeatmapWidget(QWidget):
         self._label_info.setStyleSheet("color: #808080;")
         for s in (self._slider_zoom_x, self._slider_zoom_y):
             s.setRange(5, 100)
+            # 13.08.2026 (Punkt 1): Mindestbreite + Expanding - die Slider
+            # werden sonst in der vollen Zeile 1 auf 0 gedrueckt/unsichtbar.
+            s.setMinimumWidth(70)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             # 09.08.2026 (User-Meldung 2): Richtung getauscht – rechts
             # (hoher Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out.
             # 5 = volle Achse (links), 100 = maximale Vergroesserung (rechts).
@@ -8732,40 +8861,37 @@ class HeatmapWidget(QWidget):
             s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
                          "links = Zoom-Out.")
 
-        # 21.03.20-Bugfix 1+2: Zwei-zeiliges QGridLayout. Zeile 0 traegt die
-        # Werteanzeige (_label_info) EINE ZEILE UEBER der Steuerleiste,
-        # linksbuendig auf Hoehe des Feld-Dropdowns (Spalte des 'Feld:'-
-        # Labels). Bug 2: Modus-Dropdown steht JETZT VOR der Aggregation.
-        # 'Feld' (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
-        ctrl2 = QGridLayout()
-        ctrl2.setHorizontalSpacing(6)
-        ctrl2.setVerticalSpacing(2)
-        _c = 0
-        ctrl2.addWidget(self._chk_candle, 1, _c); _c += 1
-        ctrl2.addWidget(self._label_overlay_tf, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Zoom X:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._slider_zoom_x, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Zoom Y:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._slider_zoom_y, 1, _c); _c += 1
-        # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
-        # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
-        # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
-        ctrl2.addWidget(QWidget(), 1, _c); _c += 1
-        ctrl2.setColumnMinimumWidth(_c - 1, 15)
-        # 21.03.20-Bugfix 2: Modus-Dropdown VOR der Aggregation (Tausch).
-        ctrl2.addWidget(QLabel("Modus:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._combo_mode_filter, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Aggregation:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._combo_agg, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Feld:"), 1, _c); _c += 1
-        _field_col = _c
-        ctrl2.addWidget(self._combo_field, 1, _c); _c += 1
-        ctrl2.setColumnStretch(_field_col, 1)
-        # 21.03.20-Bugfix 1: Werteanzeige eine Zeile ueber der Steuerleiste
-        # (linksbuendig auf Hoehe des Feld-Dropdowns) - die Zeile bleibt
-        # ruhiger, weil das Label nicht mehr rechts am Ende wackelt.
-        ctrl2.addWidget(self._label_info, 0, _field_col,
-                        1, 1, Qt.AlignLeft)
+        # 13.08.2026 (Punkt 5): Zwei klare, buendige Steuer-Zeilen.
+        # Zeile 1: [x] Kerzen-Overlay | X-Achse | Y-Achse | Zoom X | Zoom Y |
+        #          Modus | Aggregation (gleiche Controls wie bisher).
+        # Zeile 2: 'Ergebnisparameter:' (Feld-Dropdown, CheckableComboBox)
+        #          stretcht bis zum Canvas-Ende (Expanding + Stretch 1).
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row1.addWidget(self._chk_candle)
+        row1.addWidget(self._label_overlay_tf)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("X-Achse:"))
+        row1.addWidget(self._combo_x)
+        row1.addWidget(QLabel("Y-Achse:"))
+        row1.addWidget(self._combo_y)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("Zoom X:"))
+        row1.addWidget(self._slider_zoom_x)
+        row1.addWidget(QLabel("Zoom Y:"))
+        row1.addWidget(self._slider_zoom_y)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("Modus:"))
+        row1.addWidget(self._combo_mode_filter)
+        row1.addWidget(QLabel("Aggregation:"))
+        row1.addWidget(self._combo_agg)
+        row1.addStretch(1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(QLabel("Ergebnisparameter:"))
+        row2.addWidget(self._combo_field, 1)
+        row2.addWidget(self._label_info)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -8859,8 +8985,8 @@ class HeatmapWidget(QWidget):
         self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
 
         lay = QVBoxLayout(self)
-        lay.addLayout(ctrl)
-        lay.addLayout(ctrl2)
+        lay.addLayout(row1)
+        lay.addLayout(row2)
         lay.addWidget(self._plot_hm, 1)
 
         # --- Signale ---

@@ -25,195 +25,149 @@
 
 ---
 
-# 21.03.21 – Confluence-Analyse & Hotspot-Orchestrierung (Multi-Service & Multi-Modus Häufung)
+# 21.03.22 – Full Market-Data Sync Button (ServiceWindow)
+
+## 🎯 Zielstellung & Fachliche Motivation
+Für umfassende Analysen im `ServiceWindow` müssen alle in `market_data.duckdb` gespeicherten **Symbol:Timeframe-Paare** auf den neuesten Stand gebracht werden. Ein manueller Button oben rechts in der `top_row` stößt den vollständigen Sync aller lokal vorhandenen Paare an. Während dieses Vorgangs pausiert der automatische 45-Sekunden-Sync.
 
 ---
 
-## 🎯 1. Zielstellung & Fachliche Motivation
+## ✅ Entscheidungen & Antworten auf IDE-Rückfragen (13.08.2026)
 
-Das Ziel dieser Erweiterung ist die optische Erkennung von **Signal-Häufungen (Hotspots / Lichtsäulen)** über verschiedene Services, Parameter-Varianten und Berechnungsmodi hinweg.
-
-Bisherige Kennzahlen-Analysen (wie Mittelwerte oder Einzel-Filter) verkleinern die Ergebnismenge auf isolierte Werte und verdecken das eigentliche Confluence-Muster. Das Kapitel 21.03.21 spezifiziert die Entkopplung von Einzel-Wert-Analysen hin zu einer echten **Multi-Service-Überlappung**.
-
----
-
-## 🔍 2. Problemstellung & Ursachenanalyse
-
-| Problem in der Praxis | Technische Ursache im Bestand |
-| --- | --- |
-| **Einzel-Filter verzerren Häufung** | Strikte Filter auf genau *einen* Service oder *einen* Modus isolieren Datenpunkte und verhindern das Erkennen von Signal-Überschneidungen.
-
- |
-| **Mittelwert-Aggregation (`AVG`) ungeeignet** | Ein Mittelwert über ein $5$-Minuten-Raster berechnet die durchschnittliche Stärke eines Ticks, zeigt aber nicht die *Anzahl* der zusammengelaufenen Indikatoren.
-
- |
-| **Starres Feld-Dropdown** | Bei reinen Signal-Zählungen ist die Auswahl eines konkreten JSON-Feldes (z. B. `strength_value`) mathematisch irrelevant und verwirrt den Anwender.
-
- |
+1. **Einbindung in `serviceui/service_win.py`:** Es existieren KEINE Methoden `_build_ui()` / `_wire_events()` – Layout-Aufbau (Zeilen 184–395) und Signal-Verdrahtung (ab Zeile 410) passieren direkt im `__init__`. Button-Erzeugung daher direkt im `__init__` im `top_row`-Block NACH `self.top_row.addWidget(self.main_splitter)` (Zeile 365), rechtsbündig via `self.top_row.addStretch(1)` + `addWidget`. Signal-Verdrahtung `clicked.connect(...)` im bestehenden Connect-Block ab Zeile 410.
+2. **`sync_market_data(target_pairs=None)`:** Signatur `sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None)`. Bei übergebenem `target_pairs` (nicht `None`) wird **exakt über diese `(symbol, timeframe)`-Paare** iteriert; bei `None`/leer greift der **Fallback auf das bisherige Standard-Raster** (`SYMBOLS` × `get_timeframes()`). Der Delta-Sync-Abgleich mit `get_latest_timestamp(symbol, tf)` bleibt pro Paar voll erhalten (inkrementelles Laden).
+3. **Signal & Typing:** `sync_completed = Signal(set)` wird übernommen (voll kompatibel mit `main.py`, das ein Set empfängt). `from typing import Optional, Set, Tuple` im `DataSyncWorker` ergänzen.
+4. **DB-Zugriffsmuster im Repository:** Generell `DbPool.get(self.db_path)` nutzen (Thread-local, kein manuelles `close()`, konsistent mit `get_symbol_precision` und projektweiten Standards).
+5. **Headless-Testbarkeit (Akzeptanzkriterium 2):** `sync_market_data` bzw. der `DataSyncWorker` wird im Test gemockt (Monkeypatching) – **kein echter MT5-Netzwerk-Sync**. Der Test verifiziert rein synchron die Signal-Emission (`service_run_started` vor Start, `service_run_finished` nach `sync_completed`) sowie die Button-Deaktivierung/Aktivierung.
+6. **Formatierung:** Rechtsbündige Platzierung in `top_row` bestätigt; entbehrliche Casts (`str(r[0])`) entfallen zugunsten des Filters `if r[0] and r[1]`.
 
 ---
 
-## 🏗️ 3. Architektur- & Bedienkonzept
+## 🛠️ Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### 3.1 Das 3-Ebenen-Bedienmodell für Confluence
+### Schritt 1: Paar-Abfrage im Repository (`repositories/market_data_repository.py`)
 
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. SERVICE PICKER: Multi-Select active                                                │
-│    [x] srv_trend_breakout  [x] srv_swing_structure  [x] srv_proximity                  │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-                                           │
-                                           ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 2. HEATMAP-WIDGET STEUERZEILE                                                           │
-│    [ Aggregation: Confluence (COUNT DISTINCT) ▾ ]  [ Modus: 🌐 Alle Modi (Confluence) ▾ ] │
-│    [ Feld: (deaktiviert / alle Felder) ▾ ]                                             │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-                                           │
-                                           ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 3. VISUELLE HOTSPOT-HEATMAP (Diskrete Farbskala E7)                                     │
-│    0 Services = Hellgrau  |  1 Service = Gelb  |  2 = Cyan  |  3–4 = Orange  |  5+ = Rot  │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+Ergänze `repositories/market_data_repository.py` um die Abfrage aller gespeicherten Paare (Muster: `DbPool.get`, kein manuelles `close()`, Filter auf nicht-leere Werte statt Casts):
+
+# repositories/market_data_repository.py
+
+def get_all_stored_symbol_tf_pairs(self) -> Set[Tuple[str, str]]:
+    """Liefert alle (symbol, timeframe)-Paare, für die bereits Daten in ohlcv_bars existieren."""
+    from db_service import DbPool
+    con = DbPool.get(self.db_path)
+    try:
+        rows = con.execute("""
+            SELECT DISTINCT UPPER(symbol), UPPER(timeframe)
+            FROM ohlcv_bars
+            WHERE symbol IS NOT NULL AND timeframe IS NOT NULL
+        """).fetchall()
+        return {(r[0], r[1]) for r in rows if r[0] and r[1]}
+    except Exception as e:
+        print(f"WARN [MarketDataRepository] Pair-Abfrage fehlgeschlagen: {e}")
+        return set()
+
+---
+
+### Schritt 2: `DataSyncWorker` erweitern (`workers/data_sync_worker.py`)
+
+Erweitere den Konstruktor von `DataSyncWorker`, um ein optionales `pairs`-Set zu akzeptieren (Typing `Optional` ergänzen, Signal `Signal(set)`):
+
+# workers/data_sync_worker.py
+
+from typing import Optional, Set, Tuple
+# ...
+class DataSyncWorker(QThread):
+    sync_completed = Signal(set)
+
+    def __init__(self, pairs: Optional[Set[Tuple[str, str]]] = None, parent=None):
+        super().__init__(parent)
+        self.pairs = pairs
+
+    def run(self):
+        # Wenn pairs übergeben wurden, werden nur diese synchronisiert
+        updated = sync_market_data(target_pairs=self.pairs)
+        self.sync_completed.emit(updated)
+
+---
+
+### Schritt 2b: `sync_market_data(target_pairs=None)` erweitern (`data_sync/mt5_sync_service.py`)
+
+- **Signatur:** `sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None)`
+- **Logik:**
+  - Ist `target_pairs` übergeben (nicht `None`), wird **exakt über diese `(symbol, timeframe)`-Paare** iteriert (statt über das Standard-Raster).
+  - Ist `target_pairs` `None` (oder leer), greift der **Fallback auf das bisherige Standard-Raster** (`SYMBOLS` × `get_timeframes()`).
+  - Der Delta-Sync-Abgleich mit `get_latest_timestamp(symbol, tf)` bleibt pro Paar voll erhalten (inkrementelles Laden).
+
+---
+
+### Schritt 3: Button & Einbindung in `serviceui/service_win.py`
+
+In `serviceui/service_win.py` direkt im `__init__` (kein `_build_ui()`/`_wire_events()` – Aufbau und Verdrahtung passieren dort):
+
+# serviceui/service_win.py (in __init__, top_row-Block NACH self.top_row.addWidget(self.main_splitter), Zeile ~365)
+
+self.btn_sync_all_market = QPushButton("🔄 Sync Alle Daten")
+self.btn_sync_all_market.setToolTip(
+    "Aktualisiert ALLE in market_data.duckdb gespeicherten Symbol:Timeframe-Paare aus MT5."
+)
+self.top_row.addStretch(1)
+self.top_row.addWidget(self.btn_sync_all_market)
+
+# serviceui/service_win.py (in __init__, bestehender Connect-Block ab Zeile ~410)
+
+self.btn_sync_all_market.clicked.connect(self._on_sync_all_market_clicked)
 
 
-### 3.2 Modus-Dropdown (`_combo_mode`) im Confluence-Kontext
+# Neue Handler-Methoden:
+@Slot()
+def _on_sync_all_market_clicked(self) -> None:
+    """Startet den Full-Sync aller in market_data.duckdb vorhandenen Symbol:TF-Paare."""
+    if hasattr(self, "_sync_worker") and self._sync_worker is not None and self._sync_worker.isRunning():
+        return
 
-* **Standard-Einstellung:** `🌐 Alle Modi (Confluence)` (`service_mode = "all"`).
-* **Verhalten:** Das System filtert nicht auf einen einzelnen Berechnungsmodus (`source_mode`), sondern fasst alle im Service Picker gecheckten Services und deren aktive Modi in einer gemeinsamen Matrix zusammen.
-* **Fokussierter Modus:** Eine konkrete Modus-Auswahl (z. B. `ZigZag_ATR`) erfolgt nur, wenn gezielt isolierte Modus-Überlappungen analysiert werden sollen.
+    from repositories.market_data_repository import MarketDataRepository
+    all_pairs = MarketDataRepository().get_all_stored_symbol_tf_pairs()
 
+    if not all_pairs:
+        return
 
+    # 45s-Auto-Sync pausieren via Concurrency-Guard
+    from config.event_bus import event_bus
+    event_bus.service_run_started.emit()
 
-### 3.3 Status des Feld-Dropdowns (`_combo_field`) bei Confluence
+    self.btn_sync_all_market.setEnabled(False)
+    self.btn_sync_all_market.setText("⏳ Sync läuft...")
 
-* **Regel:** Sobald als Aggregation **`confluence_count`** oder **`count`** gewählt ist, wird das Feld-Dropdown **deaktiviert (ausgegraut)**.
-* **Begründung:** Bei Zählungen untersucht die Engine das Vorhandensein von Signalen (Rows/Services). Ein konkretes Datenfeld wird nur bei Wert-Aggregationen (`AVG`, `SUM`, `MIN`, `MAX`) benötigt.
+    from workers.data_sync_worker import DataSyncWorker
+    self._sync_worker = DataSyncWorker(pairs=all_pairs, parent=self)
+    self._sync_worker.sync_completed.connect(self._on_sync_all_completed)
+    self._sync_worker.finished.connect(self._sync_worker.deleteLater)
+    self._sync_worker.start()
 
+@Slot(set)
+def _on_sync_all_completed(self, updated_pairs) -> None:
+    """Nach Abschluss des Full-Syncs: Auto-Sync fortsetzen & UI refreshen."""
+    from config.event_bus import event_bus
+    event_bus.service_run_finished.emit()
+
+    self.btn_sync_all_market.setEnabled(True)
+    self.btn_sync_all_market.setText("🔄 Sync Alle Daten")
+
+    self._refresh_badge_bar()
+    if hasattr(self, "service_selector"):
+        self.service_selector.refresh()
 
 
 ---
 
-## 🧮 4. Aggregations-Typen im Vergleich
+## 📊 Akzeptanzkriterien für die Validierung (`test/test.py`)
 
-Für die visuelle Darstellung von Häufungen werden drei spezifische Aggregations-Verfahren unterstützt:
-
-### 1. Standard-Confluence (`confluence_count` / `COUNT DISTINCT`)
-
-* **SQL:** `COUNT(DISTINCT feature_id)`
-* **Bedeutung:** Zählt exakt, wie viele *unterschiedliche* Services/Plugins im Zeit-/Preis-Raster ein Signal geliefert haben.
-* **Einsatz:** Primäre Standard-Analyse für Hotspots.
-
-### 2. Gewichtete Confluence (`weighted_confluence`)
-
-* **Formel:** $\text{Score} = \sum (W_{\text{Service}} \cdot \text{Signal})$ mit $W_{\text{D1}} = 3.0, W_{\text{H4}} = 2.0, W_{\text{M1}} = 1.0$.
-* **Bedeutung:** Übergeordnete Makro-Signale wiegen schwerer als Mikro-Signale.
-* **Einsatz:** Verhindert, dass reine M1-Rauschen-Häufungen dominieren.
-
-### 3. Intensitäts-Confluence (`intensity_confluence`)
-
-* **Formel:** $\text{Score} = \sum (\text{strength\_value}_{\text{Service\_i}})$.
-* **Bedeutung:** Summiert die berechnete Signalstärke aller beteiligten Services.
-* **Einsatz:** Unterscheidet zwischen schwachen Konsolidierungs-Hits und hoch-dynamischen Impuls-Überlappungen.
-
+1. **Pair-Query-Test:** `MarketDataRepository().get_all_stored_symbol_tf_pairs()` liefert alle in `ohlcv_bars` vertretenen Paare als Set von Tuples zurück.
+2. **Signal-Emission-Test (headless via Mock):** `sync_market_data` bzw. der `DataSyncWorker` wird gemockt (Monkeypatching) – **kein echter MT5-Netzwerk-Sync**. Der Test verifiziert rein synchron, dass `event_bus.service_run_started` VOR dem Start des Workers und `event_bus.service_run_finished` NACH `sync_completed` emittiert wird.
+3. **UI-State-Test (headless via Mock):** `btn_sync_all_market` schaltet während der Ausführung auf `enabled=False` und nach `sync_completed` wieder auf `enabled=True`.
 
 ---
 
-## 🛠️ 5. Schritt-für-Schritt Umsetzungsanleitung für die IDE
+## 📝 Implementierungs-Log
 
-### Schritt 1: Reader-Erweiterung für `COUNT DISTINCT` (`analytics/engine/feature_store_reader.py`)
-
-In `fetch_generic_heatmap()` die Aggregation für Confluence absichern:
-
-# analytics/engine/feature_store_reader.py
-
-if agg_key == "confluence_count":
-    # Zählt die Anzahl unterschiedlicher Services pro Raster-Zelle
-    agg_sql = "COUNT(DISTINCT feature_id) AS val"
-elif agg_key == "count":
-    agg_sql = "COUNT(*) AS val"
-
-### Schritt 2: Deaktivierungs-Steuerung im UI-Widget (`analytics/ui/heatmap_widget.py`)
-
-In `_update_controls()` des `HeatmapWidget` die Feld-Freigabe an die Aggregation koppeln[cite: 5]:
-
-# analytics/ui/heatmap_widget.py
-
-def _update_controls(self) -> None:
-    agg = str(self._combo_agg.currentData() or "confluence_count")
-    is_value_agg = agg in ("avg", "sum", "min", "max")
-    
-    # Feld-Dropdown nur aktivieren, wenn eine Wert-Aggregation gewählt ist
-    self._combo_field.setEnabled(is_value_agg)
-    if not is_value_agg:
-        self._combo_field.setToolTip("Bei Confluence/Count-Aggregation nicht erforderlich.")
-
-
-### Schritt 3: ViewModel-Anpassung für Multi-Modus-Freigabe (`analytics/engine/analytics_view_model.py`)
-
-Sicherstellen, dass `service_mode = "all"` bei Confluence-Queries keine `source_mode`-Einschränkung in SQL einfügt[cite: 5]:
-
-# analytics/engine/analytics_view_model.py
-
-def apply_smart_preset_confluence(self) -> None:
-    """Schaltet auf Multi-Service-Confluence um."""
-    self.set_service_mode("all")  # Alle Modi einbeziehen
-    self.set_heatmap_config("date", "service_id", "", "confluence_count")
-
----
-
-## 📊 6. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
-
-1. **Confluence-Distinct-Test:** Bei 3 verschiedenen Services, die auf derselben Bar feuern, liefert `fetch_generic_heatmap(..., agg="confluence_count")` exakt den Wert $3.0$ für die Zelle[cite: 5].
-2. **Multi-Modus-Inklusion-Test:** Bei `service_mode = "all"` enthält das SQL-Ergebnis Signale aus *allen* aktiven Modi der gewählten Services (kein Ausschluss einzelner Modi)[cite: 5].
-3. **Control-State-Test:** Bei Auswahl von `agg = "confluence_count"` schaltet die UI `_combo_field` auf `enabled = False`[cite: 5].
-
----
-
-# 21.03.21 – Entscheidungsprotokoll & Umsetzungs-Spezifikation (13.08.2026 20:06)
-
-## 1. Review-Ergebnis (Kapitel vs. Ist-Stand)
-
-| Kapitel-Abschnitt | Status im Bestand |
-| --- | --- |
-| §4.1 / §5 Schritt 1: `COUNT(DISTINCT feature_id)` | ✅ vorhanden (`analytics/engine/feature_store_reader.py` Z. 1283-1286, `HEATMAP_AGGREGATIONS` Z. 117) |
-| §5 Schritt 2 / §3.3: Feld-Dropdown-Deaktivierung (F7) | ✅ vorhanden (`analytics/ui/heatmap_widget.py` `_update_controls` / `_VALUE_AGGS`) |
-| §5 Schritt 3: `apply_smart_preset_confluence()` | ⚠️ vorhanden, aber OHNE `set_service_mode("all")` |
-| §3.2 Modus-Dropdown Standard "all" | ✅ vorhanden als `_combo_mode_filter` / „[Alle Modi]" (data "all") |
-| §4.2 `weighted_confluence` | ❌ nicht vorhanden |
-| §4.3 `intensity_confluence` | ❌ nicht vorhanden (Datenbasis `strength_value` existiert in `srv_swing_*`) |
-| E7-Farbskala | ⚠️ vorhanden, aber daten-gebunden (0..vmax, „Meldung 7") statt fest 0..5 |
-| §6 AK1 (Distinct-Count) | ✅ test.py „37 b1" (2 Services → 2.0) |
-| §6 AK2 (Modus-"all"-Inklusion) | ❌ kein Test vorhanden |
-| §6 AK3 (Control-State) | ✅ test.py „20.03.02 o) F7" |
-
-## 2. Entscheidungen (Benutzer-Freigabe + fachliche Bewertung)
-
-1. **Vorgehen: Option (a)** – Bestand nutzen und ergänzen; keine Neu-Implementierung bereits vorhandener Funktionalität.
-2. **`weighted_confluence`: NICHT umsetzen (zurückgestellt).** Fachliche Begründung: Der Confluence-Preset läuft mit `all_timeframes=False` (genau EIN Timeframe). Die TF-Gewichte (D1=3.0/H4=2.0/M1=1.0) wären damit konstant → `weighted_confluence` degeneriert zu `confluence_count × Konstante` und liefert keinerlei Zusatzinformation. Eine sinnvolle Umsetzung erfordert eine Multi-TF-Query (`all_timeframes=True`), was außerhalb des Scopes dieses Kapitels liegt (dort existiert bereits das Preset „Service-Timeframe" mit `count`).
-3. **`intensity_confluence`: NICHT als eigene Aggregation.** Fachliche Begründung: Die Intensitäts-Analyse ist bereits vollständig über die bestehende Kombination „Aggregation = `SUM` + Feld = `strength_value`" abgedeckt (`srv_swing_momentum`, `srv_swing_structure`, `srv_swing_volume_profile` schreiben den Key). Eine eigene Aggregation wäre nur ein Alias mit fixem Feld, würde aber die §3.3-Feld-Logik brechen (bei Zählungen deaktiviert; bei einer Wert-Aggregation wäre ein implizit fixes Feld inkonsistent) und Services ohne `strength_value` (z. B. `srv_trend_breakout`, `srv_proximity`) still ausblenden → irreführend. Wert-Aggregationen nutzen ohnehin die Viridis-Skala (`heatmap_widget.py` Z. 1638ff), die für Summenwerte kalibriert ist; die diskrete E7-Konfluenz-Skala bleibt Zählungen vorbehalten.
-4. **`apply_smart_preset_confluence()`: `set_service_mode("all")` ergänzen (JA).** Fachliche Begründung: Der Kern des Kapitels ist die Hotspot-Orchestrierung über ALLE Modi hinweg (§3.2-Standard = "all"). Hat der Nutzer vorher einen konkreten Modus gefiltert, muss der Preset diesen zurücksetzen, sonst zeigt „[? Signal-Confluence]" still nur den gefilterten Modus (widerspricht der Kapitel-Spezifikation).
-5. **AK2-Test ergänzen (JA).** Fachliche Begründung: Die Modus-Inklusion bei `service_mode = "all"` ist das Kernverhalten von §3.2/§6 AK2 und aktuell ungetestet.
-6. **E7-Farbskala: Verhalten beibehalten** (daten-gebundene Levels 0..vmax, „Meldung 7" vom 11.08.2026). Nur Kapiteltext wird an das Ist-Verhalten angepasst – die feste 0..5-Skala ist überholt.
-7. **Naming: Anpassung an den IST-Stand** – `_combo_mode_filter` / „[Alle Modi]" (data "all") statt Kapitel-`_combo_mode` / „🌐 Alle Modi (Confluence)"; funktional gleichwertig.
-
-## 3. Umsetzungs-Spezifikation (Coding – wird NUR auf manuellen Startbefehl ausgeführt)
-
-### Schritt A: Preset-Reset des Modus-Filters (`analytics/engine/analytics_view_model.py`)
-In `apply_smart_preset_confluence()` VOR `set_heatmap_config(...)` ergänzen:
-- `self.set_service_mode("all")` – bereits idempotent (early-return bei aktuellem `"all"`); bei echter Änderung Dirty-Flag + Refresh von `QUERY_FEATURES` und allen Datenquellen (Tabelle, beide Heatmaps, Scatter, Verteilung).
-
-### Schritt B: AK2-Headless-Test (`test/test.py`)
-- Temporäre `analytics.duckdb` (im Unterordner `test/`!) mit `feature_store`-Rows inkl. top-level `source_mode` (z. B. 2 Services × je 2 Modi = 4 Zeilen auf derselben Bar).
-- `fetch_generic_heatmap(..., x_dim="date", y_dim="hour", agg="count", service_mode="all")` → Zellenwert exakt `4.0` (alle Modi inkludiert, kein `source_mode`-WHERE).
-- `fetch_generic_heatmap(..., agg="count", service_mode="<Modus1>")` → Zellenwert exakt `2.0` (nur ein Modus je Service).
-- Kein UI-Test (Regel 4), reiner Reader-Test.
-
-## 4. Implementierungs-Log (Doku-Teil, erledigt)
-
-- **13.08.2026 20:06:** Kapitel 21.03.21 gründlich gegen den Ist-Stand analysiert (Review-Tabelle); Entscheidungsprotokoll + Umsetzungs-Spezifikation (Schritt A/B) in `docs/AKTUELLE_UMSETZUNG.md` dokumentiert; Git-Commit `phase21_step1` gesetzt. **Kein Coding ausgeführt** – Umsetzung wartet auf den manuellen Startbefehl des Anwenders.
-- **13.08.2026 20:35 (Umsetzung, manueller Startbefehl):**
-  - **Schritt A:** `apply_smart_preset_confluence()` in `analytics/engine/analytics_view_model.py` setzt jetzt VOR der Heatmap-Konfiguration `set_service_mode("all")` – Confluence-Preset resetet den Modus-Filter auf „Alle Modi" (idempotent, early-return bei bereits `"all"`). Docstring ergänzt (21.03.21 Hotspot-Orchestrierung).
-  - **Schritt B:** AK2-Headless-Test in `test/test.py` (Block „37 k1/k2"): Temp-`analytics.duckdb` im `test/`-Ordner mit 2 Services × 2 Modi (`source_mode` top-level) auf derselben Bar → `service_mode="all"` liefert Zellwert `4.0`, `service_mode="ModeA"` liefert `2.0`.
-  - **Validierung (headless, `.venv`):** `py_compile` beider Dateien OK; `test/test.py` → `[PASS] 37 k1` + `[PASS] 37 k2`. Übrige FAILs im Harness sind vorbestehende Schema-Diskrepanzen (Test-Tabellen ohne `instance_hash`-Spalte, „Binder Error") in unveränderten Code-Pfaden (Tests 32/36/20.03.02/20.03.03/39/37 e1/g1/g2/j1) – nicht durch diese Änderung verursacht.
-  - Git-Commit `phase21_step2` (Umsetzung) gesetzt.
-
+**13.08.2026 (Entscheidungen zu IDE-Rückfragen):** Kapitel 21.03.22 um den Abschnitt „Entscheidungen & Antworten auf IDE-Rückfragen" erweitert und die Schritte 1–3 sowie die Akzeptanzkriterien entsprechend präzisiert: (1) Einbindung direkt im `__init__` statt `_build_ui()`/`_wire_events()`; (2) `sync_market_data(target_pairs=None)` mit exakter Paar-Iteration und Fallback auf `SYMBOLS` × `get_timeframes()`; (3) `Signal(set)` + `Optional`-Import im `DataSyncWorker`; (4) DB-Muster `DbPool.get` ohne manuelles `close()`; (5) Headless-Test via Monkeypatch (kein echter MT5-Sync); (6) Casts entfallen, Filter `if r[0] and r[1]`. **Noch kein Coding – Umsetzung wartet auf manuellen Befehl.**

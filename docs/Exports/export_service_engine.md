@@ -590,6 +590,10 @@ class ServiceSelectorModel(QObject):
         # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
         self._last_execution_datetimes_by_hash = (
             self._load_last_execution_datetimes_by_hash())
+        # 13.08.2026 (Punkt 2, MasterTree-Modus): source_mode je
+        # (feature_id, instance_hash) - Grundlage der Clone-Labels mit dem
+        # AKTUELLEN Modus (wenn die Preset-Params keinen 'mode' tragen).
+        self._source_modes_by_hash = self._load_source_modes_by_hash()
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -695,7 +699,7 @@ class ServiceSelectorModel(QObject):
                     preset_name = str(p.get("preset_name") or "Default")
                     instance_hash = generate_instance_hash(
                         pid, params, preset_name=preset_name)
-                    per_hash = self._last_execution_dates_by_hash.get(
+                    per_hash = self._last_execution_datetimes_by_hash.get(
                         str(pid).lower(), {}) or {}
                     clones.append({
                         "preset_name": preset_name,
@@ -714,7 +718,7 @@ class ServiceSelectorModel(QObject):
                         # zeigen (User-Meldung). Eine Variante zeigt ein Datum
                         # erst, wenn sie unter ihrem EIGENEN Hash gelaufen ist.
                         "last_execution": per_hash.get(
-                            instance_hash, "--.--.--"),
+                            instance_hash, "--.--.-- --:--"),
                     })
                 if clones:
                     result[str(pid).lower()] = clones
@@ -859,6 +863,63 @@ class ServiceSelectorModel(QObject):
         per_hash = self._last_execution_datetimes_by_hash.get(
             str(plugin_id).lower(), {}) or {}
         return per_hash.get(str(instance_hash), "--.--.-- --:--")
+
+    def _load_source_modes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest den letzten source_mode je (feature_id, instance_hash).
+
+        13.08.2026 (Punkt 2, MasterTree-Modus): Delegate an den
+        FeatureStoreReader (fetch_source_modes_by_hash). Der source_mode
+        einer Variante liegt als JSON-Key in feature_data; die Preset-Params
+        tragen den 'mode' oft NICHT (der Modus wird erst beim Run bestimmt).
+        Defensiv: Fehler -> leer (Clone-Labels zeigen dann den Schema-
+        Default).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_source_modes_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] source_mode je Variante "
+                  f"nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def source_mode_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Aktueller source_mode einer Parameter-Variante (13.08.2026).
+
+        Liefert den source_mode der LETZTEN Ausfuehrung der Variante aus
+        dem feature_store - leer, wenn die Variante nie gelaufen ist (der
+        Aufrufer faellt dann auf den Schema-Default zurueck). Rein lesend
+        aus dem Refresh-Zustand.
+        """
+        if not plugin_id or not instance_hash:
+            return ""
+        per_hash = (getattr(self, "_source_modes_by_hash", {}) or {}).get(
+            str(plugin_id).lower(), {}) or {}
+        return str(per_hash.get(str(instance_hash), "") or "")
+
+    def source_mode_for_plugin(
+        self, plugin_id: str
+    ) -> str:
+        """Aktueller source_mode eines FLACHEN Standalone-Plugins (13.08.2026).
+
+        Flache Plugins (ohne Clones) tragen im MasterTree keinen
+        instance_hash - hier wird der erste bekannte Store-Modus des
+        Plugins geliefert (deterministisch nach Hash-Sortierung). Leer,
+        wenn das Plugin nie gelaufen ist. Rein lesend aus dem
+        Refresh-Zustand.
+        """
+        if not plugin_id:
+            return ""
+        per_hash = (getattr(self, "_source_modes_by_hash", {}) or {}).get(
+            str(plugin_id).lower(), {}) or {}
+        for h in sorted(per_hash):
+            m = str(per_hash.get(h) or "").strip()
+            if m:
+                return m
+        return ""
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -1159,7 +1220,7 @@ class ServiceSelectorModel(QObject):
         plugins = self.get_plugins()
         badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
         last_executions: Dict[str, str] = {
-            pid: self.last_execution_date(pid) for pid in plugins}
+            pid: self.last_execution_datetime(pid) for pid in plugins}
         # 20.04 (Q7): Presets/Clones je Plugin durchreichen – Plugins MIT
         # Presets werden als Parent-Knoten mit Clone-Kindern gerendert,
         # archivierte Clones (is_archived) in den '📁 Archiv'-Ordner.
@@ -2579,22 +2640,10 @@ class MasterTree(QTreeWidget):
             # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
-            last_exec = str(svc.get("last_execution") or "")
-            last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
-            # 13.08.2026 (Punkt 6, F6): Modus-Suffix am Service-Namen
-            # (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)').
-            mode_sfx = self._mode_suffix(plugin_id, svc.get("params"))
-            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
-            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
-            # eine Kennzeichnung (is_archived=True -> non-checkable).
-            svc_archived = bool(svc.get("is_archived"))
-            if svc_archived:
-                svc_label = f"🔹 {svc_label}"
-            svc_item = QTreeWidgetItem([svc_label, ""])
-            svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
-            svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
-            svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
-            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            # 13.08.2026 (Runde 3): last_execution traegt seit dem
+            # Datetime-Umbau 'DD.MM.JJ HH:MM' (Alt-Bestand 'DD.MM.JJ');
+            # der gemeinsame Normalisierer wandelt Fallbacks in 'nie'.
+            last_exec = self._fmt_last_exec(svc.get("last_execution"))
             # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
             # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
             # gespeichert (nur _duplicate_set_instance persistiert ihn) -
@@ -2604,7 +2653,8 @@ class MasterTree(QTreeWidget):
             # Instanzen). Hier wird der fehlende Hash on-the-fly aus den
             # Params berechnet (identisch zum Reader-Set-Pfad
             # generate_instance_hash(pid, params)) - heilt Alt-Bestand ohne
-            # DB-Migration.
+            # DB-Migration. (Block hierher vorgezogen, damit der Modus-
+            # Suffix den Hash fuer die Store-Aufloesung nutzen kann.)
             svc_hash = str(svc.get("instance_hash") or "")
             if not svc_hash and self.model is not None:
                 try:
@@ -2616,6 +2666,24 @@ class MasterTree(QTreeWidget):
                         cfg.get("params") or {}) or ""
                 except Exception:
                     svc_hash = ""
+            # 13.08.2026 (Runde 3, neue Benennung): Service OHNE
+            # Varianten zeigt den AKTUELLEN Modus mit einem
+            # Minuszeichen dahinter (Format 'swing_momentum -
+            # MA_Peak_Hysteresis (13.08.26 10:48)' - die fruehere
+            # Doppel-Anzeige '[Modus] Modus' entfaellt).
+            mode = self._current_mode(plugin_id, svc.get("params"), svc_hash)
+            mode_sfx = f" - {mode}" if mode else ""
+            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
+            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
+            # eine Kennzeichnung (is_archived=True -> non-checkable).
+            svc_archived = bool(svc.get("is_archived"))
+            if svc_archived:
+                svc_label = f"🔹 {svc_label}"
+            svc_item = QTreeWidgetItem([svc_label, ""])
+            svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
+            svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
+            svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
+            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
             svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)
             if svc_archived or archived_set:
                 svc_item.setData(0, ROLE_ARCHIVED, True)
@@ -2678,6 +2746,171 @@ class MasterTree(QTreeWidget):
         except Exception:
             return ""
 
+    def _current_mode(
+        self,
+        plugin_id: str,
+        params: Optional[Dict[str, Any]] = None,
+        instance_hash: Optional[str] = None,
+    ) -> str:
+        """AKTUELLER Modus eines Multi-Modus-Services (13.08.2026, R3).
+
+        Aufloesung in Reihenfolge: params['mode'] -> Feature-Store je
+        instance_hash (source_mode der letzten Ausfuehrung) ->
+        Plugin-Fallback (erster bekannter Store-Modus) -> Schema-Default.
+        Ein-Modus-Services / Services ohne Modus-Schema liefern '' (kein
+        Suffix, kein Rauschen im Baum). Die Formatierung (dash/bracket)
+        uebernimmt der Aufrufer. Rein lesend, Fehler defensiv.
+        """
+        try:
+            base = self._mode_suffix(plugin_id, params)
+            if not base:
+                return ""
+            mode = ""
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode and instance_hash and self.model is not None:
+                try:
+                    mode = str(
+                        self.model.source_mode_for_hash(plugin_id, instance_hash)
+                        or "").strip()
+                except Exception:
+                    mode = ""
+            # Flache Standalone-Services (ohne Clones) tragen im Tree keinen
+            # instance_hash - hier faellt die Aufloesung auf den Plugin-Fallback
+            # zurueck (erster bekannter Store-Modus des Plugins).
+            if not mode and not instance_hash and self.model is not None:
+                try:
+                    mode = str(
+                        self.model.source_mode_for_plugin(plugin_id)
+                        or "").strip()
+                except Exception:
+                    mode = ""
+            if not mode:
+                # Fallback: der Schema-Default gilt als aktueller Modus,
+                # solange weder Config noch Store einen echten liefern
+                # (z. B. nie gelaufene Variante).
+                mode = str(base).strip(" []")
+            return mode
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _fmt_last_exec(value: Any) -> str:
+        """Normalisiert den Ausfuehrungszeitpunkt eines Baum-Knotens.
+
+        Akzeptiert 'DD.MM.JJ' (Alt-Bestand) und 'DD.MM.JJ HH:MM' (neu);
+        leere Werte und die Fallbacks '--.--.--' / '--.--.-- --:--' werden
+        zu 'nie' (kein '(Datum)'-Anhang).
+        """
+        value = str(value or "").strip()
+        if value and value not in ("--.--.--", "--.--.-- --:--"):
+            return value
+        return "nie"
+
+    def update_mode_label(self, instance_id: str, plugin_id: str,
+                          mode: str,
+                          instance_hash: Optional[str] = None) -> None:
+        """13.08.2026 (Punkt 2, Live-Update): Modus-Suffix der Zeilen
+        sofort auf den neuen Modus setzen (ohne Baum-Neuaufbau).
+
+        Betrifft Set-Service-Zeilen (instance_id), die GEWAEHLTE Clone-
+        Zeile (instance_hash) und flache Standalone-Plugin-Zeilen
+        (plugin_id). Der '(Datum)'-Anhang und ein '*' (Dirty) bleiben
+        erhalten. Plugin-Parents MIT Clones bleiben unveraendert (sie
+        zeigen nur den Schema-Default des Templates).
+        """
+        mode = str(mode or "").strip()
+        if not mode:
+            return
+        # Ein-Modus-Services / Services ohne Modus-Schema: kein Suffix.
+        if not self._mode_suffix(plugin_id, None):
+            return
+        pid_l = str(plugin_id or "").strip().lower()
+        hash_l = str(instance_hash or "")
+        # Bei Clone-/Plugin-Bearbeitung ist instance_id == plugin_id (das
+        # Panel nutzt die Plugin-ID als iid); bei Set-Services sind sie
+        # verschieden - darueber wird der Zeilen-Scope bestimmt.
+        plugin_scope = (str(instance_id or "").strip().lower() == pid_l)
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                ntype = item.data(0, ROLE_NODE_TYPE)
+                if plugin_scope:
+                    if ntype == TYPE_CLONE:
+                        if str(item.data(0, ROLE_PLUGIN_ID) or ""
+                               ).strip().lower() != pid_l:
+                            continue
+                        if hash_l and str(item.data(0, ROLE_INSTANCE_HASH)
+                                          or "") != hash_l:
+                            continue
+                    elif ntype == TYPE_PLUGIN:
+                        # Nur flache Blatt-Zeilen (Standalone ohne Clones);
+                        # Template-Parents behalten ihren Default-Suffix.
+                        if item.childCount() > 0:
+                            continue
+                        if str(item.data(0, ROLE_PLUGIN_ID) or ""
+                               ).strip().lower() != pid_l:
+                            continue
+                    else:
+                        continue
+                else:
+                    if ntype != TYPE_SERVICE:
+                        continue
+                    if str(item.data(0, ROLE_INSTANCE_ID) or "") != str(
+                            instance_id or ""):
+                        continue
+                style = "bracket" if ntype == TYPE_CLONE else "dash"
+                self._set_label_mode(item, mode, style)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @staticmethod
+    def _set_label_mode(item, mode: str, style: str = "dash") -> None:
+        """Setzt den AKTUELLEN Modus im Label neu (13.08.2026, Runde 3).
+
+        style='dash'    (Service/Standalone): 'name - Modus (Datum)' -
+                        ersetzt den Modus hinter dem Minuszeichen.
+        style='bracket' (Variante/Clone): 'name [servicename] Modus
+                        (Datum)' - ersetzt den Modus hinter der Klammer;
+                        der Klammer-Wert (Servicename) bleibt erhalten.
+        '(Datum)'/' (nie)' und '*' (Dirty) bleiben erhalten; Preset-Namen
+        mit Klammern (z. B. 'Default (Kopie)') werden nicht zerstoert
+        (das Datum wird am ENDE gesucht).
+        """
+        try:
+            import re
+            text = item.text(0) or ""
+            # Trailing '(Datum)'/' (nie)' abtrennen (am Ende - Preset-
+            # Klammern im Namen bleiben unberuehrt).
+            m = re.search(r"\s*\(([^()]*)\)\s*$", text)
+            date_part = ""
+            if m:
+                date_part = f" ({m.group(1)})"
+                text = text[:m.start()].rstrip()
+            star = ""
+            if text.endswith("*"):
+                star = "*"
+                text = text[:-1].rstrip()
+            if style == "bracket":
+                bm = re.search(r"\[([^\]]*)\]", text)
+                bracket_val = bm.group(1) if bm else ""
+                # ' [servicename] Modus' entfernen (Klammer + ein Modus-
+                # Token dahinter), die Klammer wird neu eingefuegt.
+                stripped = re.sub(r"\s*\[[^\]]*\]\s*[^()\s]+$", "",
+                                  text).rstrip()
+                if bracket_val:
+                    mode_sfx = f" [{bracket_val}] {mode}"
+                else:
+                    mode_sfx = f" [{mode}]"
+            else:
+                # ' - Modus' entfernen und neu anfuegen (dash-Format).
+                stripped = re.sub(r"\s*-\s+[^()\s]+$", "", text).rstrip()
+                mode_sfx = f" - {mode}"
+            item.setText(0, f"{stripped}{mode_sfx}{star}{date_part}")
+        except (RuntimeError, AttributeError):
+            pass
+
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
         pid = child.get("plugin_id") or ""
@@ -2685,8 +2918,7 @@ class MasterTree(QTreeWidget):
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
-        last_exec = str(child.get("last_execution") or "")
-        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
+        last_exec = self._fmt_last_exec(child.get("last_execution"))
         clones = child.get("clones") or []
         archived_parent = bool(child.get("archived"))
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
@@ -2697,11 +2929,18 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an flachen Plugin-Zeilen
-        # (Plugins MIT Clones zeigen den Modus an den Clone-Zeilen).
-        mode_sfx = "" if clones else self._mode_suffix(pid, None)
-        plugin_label = (display_pid if clones
-                        else f"{display_pid}{mode_sfx} ({last_exec})")
+        # 13.08.2026 (Runde 3c, neue Benennung):
+        #  - Flache Standalone-Services (ohne Clones): 'name - Modus
+        #    (Datum)' (Minuszeichen statt Doppel-Modus).
+        #  - Plugin-Parents MIT Clones (Ordnername): NUR der
+        #    Servicename - der Modus kann je Variante unterschiedlich
+        #    sein und steht an den Clone-Zeilen darunter.
+        if clones:
+            plugin_label = display_pid
+        else:
+            mode = self._current_mode(pid, None, "")
+            mode_sfx = f" - {mode}" if mode else ""
+            plugin_label = f"{display_pid}{mode_sfx} ({last_exec})"
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -2743,13 +2982,20 @@ class MasterTree(QTreeWidget):
         # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
         # Ausfuehrung dieser Variante direkt am Varianten-Namen:
         # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
-        last_exec = str(clone.get("last_execution") or "")
-        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
+        last_exec = self._fmt_last_exec(clone.get("last_execution"))
         prefix = "🔹" if archived else "🟢"
         # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
         # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
         # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
-        mode_sfx = self._mode_suffix(plugin_id, clone.get("params"))
+        # 13.08.2026 (Runde 3, neue Benennung): Die Variante zeigt den
+        # SERVICENAMEN in eckigen Klammern (ohne srv_-Praefix), dahinter
+        # den AKTUELLEN Modus:
+        # '🟢 <Preset> [swing_volume_profile] Volume_Profile (13.08.26 10:48)'.
+        mode = self._current_mode(plugin_id, clone.get("params"),
+                                  instance_hash)
+        display_pid = (plugin_id[4:]
+                       if plugin_id.startswith("srv_") else plugin_id)
+        mode_sfx = f" [{display_pid}] {mode}" if mode else ""
         clone_item = QTreeWidgetItem(
             [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
@@ -5086,6 +5332,11 @@ class ServiceParamColumnsMixin:
                 else:
                     cfg.setdefault("params", {})[key] = value
         self._mark_service_dirty(iid)
+        # 13.08.2026 (Punkt 2, Live-Update): Modus-Aenderung aktualisiert
+        # den Modus-Text im MasterTree SOFORT (Services + Clones), nicht
+        # erst nach dem Speichern (data_changed -> _populate).
+        if key == "mode":
+            self._update_tree_mode_label(iid, str(value or ""))
 
     def _mark_service_dirty(self, iid: str) -> None:
         """Versieht den Service-Knoten im MasterTree mit einem '*' (und
@@ -5106,6 +5357,36 @@ class ServiceParamColumnsMixin:
             return
         try:
             tree.set_instance_dirty(iid, True)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _update_tree_mode_label(self, iid: str, mode: str) -> None:
+        """Live-Update des Modus-Suffixes im MasterTree (13.08.2026).
+
+        Bei Aenderung des Modus-Dropdowns wird der Label-Text der
+        betroffenen Zeile(n) SOFORT angepasst (ohne Baum-Neuaufbau) -
+        fuer Set-Services (instance_id) und Clones/Plugins (plugin_id).
+        Bei Clones wird der instance_hash des bearbeiteten Presets
+        mitgegeben, damit nur die GEWAEHLTE Variante aktualisiert wird.
+        """
+        try:
+            # 13.08.2026 (Runde 3, Bugfix): Der _DialogParamHost des
+            # ServiceSelectorDialog haelt den Selector unter 'selector'
+            # (nicht 'service_selector') - ohne Fallback blieb das
+            # Live-Update des Modus-Labels im Picker wirkungslos.
+            selector = (getattr(self, "service_selector", None)
+                        or getattr(self, "selector", None))
+            tree = getattr(selector, "master_tree", None)
+            if tree is None or not iid:
+                return
+            definition = getattr(self, "_current_set_definition", None) or {}
+            cfg = (definition.get("services") or {}).get(iid) or {}
+            plugin_id = str(cfg.get("plugin_id") or iid)
+            preset = getattr(self, "_current_preset_editing", None) or {}
+            inst_hash = ""
+            if isinstance(preset, dict):
+                inst_hash = str(preset.get("instance_hash") or "")
+            tree.update_mode_label(str(iid), plugin_id, str(mode), inst_hash)
         except (RuntimeError, AttributeError):
             pass
 
@@ -6279,6 +6560,10 @@ class ServiceSelectorDialog(QDialog):
     # Runde 10 (Bug 1): Varianten-granularer Filter - instance_hashes der
     # gecheckten Clone-Varianten (parallel zu selection_ids_requested).
     selection_hashes_requested = Signal(list)
+    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter verschoben
+    # (tree_width, panel_width) - das AnalyticsWindow merkt sich die
+    # Position fuer Workspace- und Profil-Persistenz.
+    splitter_changed = Signal(int, int)
 
     def __init__(
         self,
@@ -6423,6 +6708,11 @@ class ServiceSelectorDialog(QDialog):
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setCollapsible(1, False)
         self._splitter.setSizes([TREE_DEFAULT_WIDTH, 620])
+        # 13.08.2026 (Runde 3d): Splitter-Bewegung live melden
+        # (Workspace-/Profil-Persistenz im AnalyticsWindow);
+        # zusaetzlich sichert _save_geometry die Position in
+        # global_settings (Historie).
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
         body.addWidget(self._splitter, 1)
         root.addLayout(body, 1)
 
@@ -8352,6 +8642,49 @@ class ServiceSelectorDialog(QDialog):
         host._service_info_pids.clear()
 
     # ------------------------------------------------------------------
+    # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter
+    # ------------------------------------------------------------------
+    def _on_splitter_moved(self, _pos: int, _index: int) -> None:
+        """Meldet die Splitter-Position an das AnalyticsWindow (Workspace/
+        Profil-Persistenz, Runde 3d)."""
+        try:
+            sizes = list(self._splitter.sizes())
+            if len(sizes) >= 2:
+                self.splitter_changed.emit(sizes[0], sizes[1])
+        except (RuntimeError, AttributeError):
+            pass
+
+    def current_splitter_sizes(self) -> List[int]:
+        """Aktuelle Splitter-Breiten (Tree, Panel) fuer Workspace/Profil."""
+        try:
+            sizes = list(self._splitter.sizes())
+            return [int(s) for s in sizes if str(s).strip().lstrip("-").isdigit()]
+        except (RuntimeError, AttributeError):
+            return []
+
+    def set_splitter_sizes(self, sizes) -> None:
+        """Wendet gespeicherte Splitter-Breiten an (Workspace/Profil).
+
+        Defensiv: nur 2 positive Werte; der Tree respektiert seine
+        Mindestbreite (selector.minimumWidth)."""
+        try:
+            if not sizes or not isinstance(sizes, (list, tuple)):
+                return
+            clean = [int(s) for s in sizes
+                     if str(s).strip().lstrip("-").isdigit() and int(s) > 0]
+            if len(clean) != 2:
+                return
+            try:
+                min_tree = self.selector.minimumWidth()
+            except (RuntimeError, AttributeError):
+                min_tree = 0
+            if clean[0] < min_tree:
+                clean[0] = min_tree
+            self._splitter.setSizes(clean)
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
     # Punkt 4: Geometrie-Persistenz (global_settings, IndicatorDialog-Muster)
     # ------------------------------------------------------------------
     def _restore_geometry(self) -> None:
@@ -8392,6 +8725,14 @@ class ServiceSelectorDialog(QDialog):
                     self.move(pos_x, pos_y)
             if w and h:
                 self.resize(max(int(w), self.minimumWidth()), int(h))
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter aus
+            # der Historie wiederherstellen (global_settings).
+            try:
+                sizes = sm.get_splitter_state(DIALOG_GEOMETRY_KEY)
+                if sizes:
+                    self.set_splitter_sizes(sizes)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -8405,6 +8746,13 @@ class ServiceSelectorDialog(QDialog):
             s = self.size()
             sm.save_dialog_geometry(
                 DIALOG_GEOMETRY_KEY, p.x(), p.y(), s.width(), s.height())
+            # 13.08.2026 (Runde 3d): Grafikteiler mitpersistieren
+            # (Gesamt-Historie in global_settings).
+            try:
+                sm.save_splitter_state(
+                    DIALOG_GEOMETRY_KEY, self.current_splitter_sizes())
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -9659,6 +10007,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 self.width(), self.height())
         except Exception:
             pass
+        # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter in der
+        # Fenster-Historie sichern (Restore in restore_state).
+        try:
+            sp = getattr(self, "main_splitter", None)
+            if sp is not None:
+                self._state_manager.save_splitter_state(
+                    self.DIALOG_GEOMETRY_KEY, sp.sizes())
+        except Exception:
+            pass
         symbol = self.get_persistent_symbol()
         tf = self.get_persistent_timeframe()
         if symbol and tf:
@@ -9715,6 +10072,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                     pos_x, pos_y = 100, 100
                 self.move(pos_x, pos_y)
             self._restored_is_maximized = bool(geom.get("is_maximized", False))
+            # 13.08.2026 (Runde 3d): Grafikteiler Tree|Parameter aus
+            # der Historie wiederherstellen.
+            try:
+                sizes = self._state_manager.get_splitter_state(
+                    self.DIALOG_GEOMETRY_KEY)
+                sp = getattr(self, "main_splitter", None)
+                if sizes and sp is not None:
+                    clean = [int(s) for s in sizes
+                             if str(s).strip().lstrip("-").isdigit()
+                             and int(s) > 0]
+                    if len(clean) == 2:
+                        sp.setSizes(clean)
+            except Exception:
+                pass
         # Symbol/Timeframe aus instance_states
         all_inst = self._state_manager.load_all_instances()
         matched = next((i for i in all_inst if i.get("instance_id") == inst_id), None)
