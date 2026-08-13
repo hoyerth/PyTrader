@@ -1752,6 +1752,52 @@ class ServiceSelectorDialog(QDialog):
         except Exception:
             pass
 
+    def _merge_live_param_values(self, definition: Dict[str, Any]) -> None:
+        """13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox.
+
+        Der Picker-Run nutzt sonst die GESPEICHERTE Set-/Plugin-Definition
+        (set_repo.get_set / variant_run_entries + _plugin_config). Wurden
+        in der Parameterbox Werte geaendert, ohne zu speichern (inkl.
+        Modus), gingen sie bei der Ausfuehrung verloren - Wurzel von Bug 4
+        (MA_Slope_Change landete nie im Store, weil der Run mit
+        default_params -> erstem Mode-Eintrag lief). Hier werden die LIVE-
+        Control-Werte der aktuellen Parameterbox in die Run-Definition
+        uebernommen (nur fuer DIESEN Run, keine Persistenz).
+
+        Match: exakte instance_id (Set-Service/Standalone ohne Presets);
+        bei Clone-Runs (instance_id = '<pid>#<hash>') zusaetzlich per
+        plugin_id, sofern in der Definition genau EIN Service matcht
+        (mehrere Varianten = mehrdeutig, dann keine Uebernahme).
+        """
+        host = getattr(self, "_param_host", None)
+        if host is None:
+            return
+        controls = getattr(host, "_service_param_controls", None) or {}
+        if not controls:
+            return
+        services = definition.get("services") or {}
+        for (iid, key), ctrl in controls.items():
+            cfg = services.get(iid)
+            if not isinstance(cfg, dict):
+                matches = [c for c in services.values()
+                           if isinstance(c, dict)
+                           and str(c.get("plugin_id") or "") == str(iid)]
+                if len(matches) == 1:
+                    cfg = matches[0]
+                else:
+                    continue
+            try:
+                value = host._ctrl_value(ctrl)
+            except (RuntimeError, AttributeError):
+                continue
+            if key == "lookback":
+                try:
+                    cfg["lookback"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                cfg.setdefault("params", {})[key] = value
+
     def _on_run_service(self, set_id: str, service_id: str) -> None:
         """'▶️ Diesen Service ausführen' (Picker-MasterTree)."""
         if not set_id or not service_id:
@@ -1783,6 +1829,11 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox-
+        # Werte (inkl. Modus) vor der Ausfuehrung - sonst liefe der Run mit
+        # der GESPEICHERTEN Definition (Aenderungen ohne Speichern gehen
+        # verloren).
+        self._merge_live_param_values(definition)
         self._start_run_worker(service_id, definition, instance_id=service_id)
 
     def _on_run_set(self, set_id: str) -> None:
@@ -1815,6 +1866,9 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (sichtbare Set-Service-Spalten), bevor das ganze Set laeuft.
+        self._merge_live_param_values(definition)
         self._start_run_worker(set_id, definition, instance_id=None)
 
     def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
@@ -1865,6 +1919,10 @@ class ServiceSelectorDialog(QDialog):
             "execution_order": [e[0] for e in entries],
             "services": {e[0]: e[1] for e in entries},
         }
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (inkl. Modus - Bug 4: der Run nutzte sonst default_params und
+        # lief immer mit dem ersten Mode-Eintrag).
+        self._merge_live_param_values(definition)
         self._start_run_worker(
             plugin_id, definition,
             instance_id=entries[0][0] if single else None)

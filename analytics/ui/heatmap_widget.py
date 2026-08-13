@@ -133,6 +133,27 @@ _VIRIDIS = "viridis"
 # E6: Wert-Aggregationen benoetigen einen numerischen feature_data-JSON-Key.
 _VALUE_AGGS = ("avg", "sum", "min", "max")
 
+# 13.08.2026 (Punkt 5, F5): Preisartige feature_data-Keys - SUM ueber
+# Preise erzeugt unsinnig hohe Legendenwerte (z. B. SILVER ~43k/Tag bei
+# 5-Min-Summen) und wird fuer diese Felder deaktiviert. Signal-Felder
+# (strength_value) bleiben erlaubt. Abgleich mit den Output-Schemata der
+# srv_*-Plugins (price, reference_price, poc_price, vah_price, val_price,
+# lvn_price, grid_price, vwap_price, vwap_lower, atr_value, lower_band,
+# lower_level, prox_level1..6).
+_PRICE_LIKE_KEY_HINTS = (
+    "price",      # Preisfelder (price, *price, reference_price)
+    "vwap_lower",  # VWAP-Band-Unterkante
+    "atr_value",  # ATR-Magnitude (Punkte)
+    "band",       # lower_band (Trend-Breakout)
+    "level",      # lower_level / prox_level* (Grid-Level)
+)
+
+
+def _is_price_like_key(key: str) -> bool:
+    """True fuer preisartige feature_data-Keys (13.08.2026, F5)."""
+    k = str(key or "").lower()
+    return any(h in k for h in _PRICE_LIKE_KEY_HINTS) if k else False
+
 # Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
 _DAY_SECONDS = 86400
 _HALF_DAY = 43200.0
@@ -972,6 +993,22 @@ class HeatmapWidget(QWidget):
         self._slider_zoom_x.setEnabled(True)
         self._slider_zoom_y.setEnabled(True)
         is_value_agg = agg in _VALUE_AGGS
+        # 13.08.2026 (Punkt 5, F5): SUM fuer preisartige Felder sperren
+        # (unsinnig hohe Legendenwerte); Signal-Felder (strength_value)
+        # bleiben erlaubt. Ist SUM gerade aktiv und das Feld preisartig,
+        # wird implizit auf AVG gewechselt (VM-Config + Refresh idempotent).
+        active_field = self._field_key(self._combo_field.currentData())
+        price_like = self._is_price_like_key(active_field)
+        sum_idx = self._combo_agg.findData("sum")
+        if sum_idx >= 0:
+            _sum_item = self._combo_agg.model().item(sum_idx)
+            if _sum_item is not None:
+                _sum_item.setEnabled(not price_like)
+        if price_like and agg == "sum":
+            self._set_combo_data(self._combo_agg, "avg")
+            agg = "avg"
+            is_value_agg = True
+            self._apply_config()
         self._combo_field.setEnabled(is_value_agg)
         if is_value_agg:
             self._combo_field.setToolTip(
@@ -1130,7 +1167,14 @@ class HeatmapWidget(QWidget):
         """
         if self._syncing or self._view_model is None:
             return
+        # 13.08.2026 (Punkt 4, F4): Vor der Reconciliation das AKTIVE Feld
+        # merken - wird es abgehakt, wechselt die Aggregations-/Anzeige-
+        # auswahl implizit auf das naechste angehakte Feld (genau EIN Feld
+        # wird aggregiert/angezeigt; die angehakten Paare bestimmen die
+        # Verfuegbarkeit).
+        prev_ud = str(self._combo_field.currentData() or "")
         self._reconcile_sammel_checks()
+        new_ud = str(self._combo_field.currentData() or "")
         # 12.08.2026 (Option A, Bug 1/2): Die angehakten Items bestimmen die
         # (Service|Parameter)-Paare (`set_field_selection`) - An/Abwaehlen
         # eines Parameters aendert die Grafik auch bei unveraenderter
@@ -1143,6 +1187,13 @@ class HeatmapWidget(QWidget):
         else:
             ids = self._checked_field_service_ids()
             self._view_model.set_feature_ids(ids)
+        # P4 (F4): Das aktive Feld wurde abgehakt -> die Auswahl ist auf das
+        # naechste angehakte Feld nachgezogen (_sync_field_current_after_-
+        # checks in _reconcile_sammel_checks, blockSignals) -> die
+        # Konfiguration/der Refresh wird hier explizit nachgezogen, damit
+        # das neue Feld auch aggregiert/angezeigt wird.
+        if new_ud and new_ud != prev_ud:
+            self._apply_config()
 
     def _reconcile_sammel_checks(self) -> None:
         """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
@@ -2582,19 +2633,19 @@ class HeatmapWidget(QWidget):
             v50 = vmin + 0.50 * span
             v75 = vmin + 0.75 * span
             fmt = lambda v: _format_legend_value(v, span)
+            # 13.08.2026 (Punkt 2, F2): Viridis-Operatoren VOR der Zahl,
+            # kein 'x' mehr - eindeutige Schwellen-Angaben
+            # (<= v25, >= v25, >= v50, >= v75, >= vmax).
             self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
-                                    "< {}".format(fmt(v25)))
+                                    "<= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
-                                    "{} ≤ x < {}".format(fmt(v25),
-                                                              fmt(v50)))
+                                    ">= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
-                                    "{} ≤ x < {}".format(fmt(v50),
-                                                              fmt(v75)))
+                                    ">= {}".format(fmt(v50)))
             self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
-                                    "{} ≤ x ≤ {}".format(fmt(v75),
-                                                                  fmt(vmax)))
+                                    ">= {}".format(fmt(v75)))
             self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
-                                    "≥ {}".format(fmt(vmax)))
+                                    ">= {}".format(fmt(vmax)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:

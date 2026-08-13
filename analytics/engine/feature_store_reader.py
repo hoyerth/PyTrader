@@ -143,6 +143,32 @@ TF_SECONDS = {
     "W1": 604800, "MN1": 2592000,
 }
 
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# Pill-Strips (TfStatusBadgeBar), TF-Dropdowns und Verfuegbarkeitslisten.
+# Reihenfolge entspricht der broker-ueblichen Skala M1..MN1 inkl. M2/M10
+# (vorher lieferte `ORDER BY timeframe` die ALPHABETISCHE Reihenfolge:
+# D1, H1, H4, M1, M10, M15, M30, M5, MN1, W1 - falsch im UI).
+CANONICAL_TIMEFRAME_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def canonical_tf_sort(tfs) -> List[str]:
+    """Sortiert Timeframe-Strings kanonisch fein -> grob (13.08.2026, F3).
+
+    Bekannte TFs folgen CANONICAL_TIMEFRAME_ORDER; unbekannte TFs
+    (z. B. neue Broker-TFs) landen deterministisch am Ende. Defensiv
+    gegen None/leer (ruft beide Stellen: fetch_service_tf_status und
+    get_available_timeframes).
+    """
+    order = {tf: i for i, tf in enumerate(CANONICAL_TIMEFRAME_ORDER)}
+    return sorted(
+        (str(t).strip().upper() for t in (tfs or [])
+         if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(tf, 10 ** 6), tf),
+    )
+
 
 class FeatureStoreReader:
     """Kapselt rein lesend DuckDB-Abfragen auf den feature_store."""
@@ -1730,7 +1756,11 @@ class FeatureStoreReader:
                 except (AttributeError, ValueError):
                     last_run = ""
             out[str(tf_raw).upper()] = {"count": int(cnt), "last_run": last_run}
-        return out
+        # 13.08.2026 (Punkt 3, F3): Sortierte Rueckgabe (kanonisch fein ->
+        # grob) - die Pill-Strips aller drei Fenster (AnalyticsWindow,
+        # ServicePicker, ServiceWindow) rendern die TFs damit korrekt
+        # sortiert statt alphabetisch.
+        return {tf: out[tf] for tf in canonical_tf_sort(out)}
 
     def fetch_last_execution_dates_by_hash(
         self,
@@ -1886,9 +1916,11 @@ class FeatureStoreReader:
             rows = con.execute("""
                 SELECT DISTINCT timeframe FROM feature_store
                 WHERE LOWER(symbol) = LOWER(?)
-                ORDER BY timeframe
             """, [symbol]).fetchall()
-            return [str(r[0]) for r in rows if r[0] is not None]
+            # 13.08.2026 (Punkt 3, F3): Kanonische Sortierung statt
+            # `ORDER BY timeframe` (alphabetisch).
+            return canonical_tf_sort(
+                [str(r[0]) for r in rows if r[0] is not None])
         except Exception as e:
             print(f"WARN [FeatureStoreReader] get_available_timeframes "
                   f"fehlgeschlagen: {e}")

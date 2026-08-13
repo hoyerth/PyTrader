@@ -28,6 +28,25 @@ _STYLE_ERROR = ("background-color: #b04343; color: #ffffff; "
 _STYLE_HINT = ("background-color: #2c3e2c; color: #9fcf9f; "
                "border-radius: 3px; border: 1px solid #4a7a4a;")
 
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# die Pill-Badges. Die Reader-Rueckgabe (fetch_service_tf_status) ist seit
+# 13.08.2026 bereits kanonisch sortiert; diese Sortierung sichert das
+# Widget zusaetzlich DEFENSIV gegen unsortierte Alt-Daten/Test-Aufrufer ab.
+_TF_CANONICAL_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def _sort_tfs_canonical(tfs: list) -> list:
+    """Kanonische TF-Reihenfolge (unbekannte TFs am Ende, alphabetisch)."""
+    order = {tf: i for i, tf in enumerate(_TF_CANONICAL_ORDER)}
+    return sorted(
+        (str(t) for t in (tfs or [])
+        if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(str(tf).upper(), 10 ** 6), str(tf)),
+    )
+
 
 class TfStatusBadgeBar(QWidget):
     """Pill-Badges je Timeframe eines Services (21.01b, Schritt 2).
@@ -77,10 +96,15 @@ class TfStatusBadgeBar(QWidget):
         for extra in self._errors:
             if extra not in known_tfs:
                 known_tfs.append(extra)
-        self._rebuild(known_tfs)
+        # 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob).
+        self._rebuild(_sort_tfs_canonical(known_tfs))
 
     def _rebuild(self, tfs: list) -> None:
         """Erzeugt/entfernt Badge-Labels so, dass `tfs` angezeigt werden."""
+        # 13.08.2026 (Punkt 3, F3): Defensive kanonische Sortierung - das
+        # Widget rendert TFs unabhaengig von der Aufrufer-Reihenfolge
+        # korrekt (fein -> grob).
+        tfs = _sort_tfs_canonical(tfs)
         wanted = set(tfs)
         # Entfernen nicht mehr benoetigter Badges
         for tf in list(self._labels.keys()):

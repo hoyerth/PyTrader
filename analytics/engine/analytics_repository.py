@@ -291,9 +291,13 @@ class AnalyticsRepository:
         # gecachten Reader-Basis-Scan (EIN DB-Scan; der QUERY_FEATURES-
         # Leichtpfad liefert identische Metadaten OHNE die teure
         # Heatmap-Pivot-Aggregation).
+        # 13.08.2026 (Punkte 1b+8, F1/F8): `service_mode` wird jetzt DURCH-
+        # gereicht - vorher ueberschrieb das QUERY_HEATMAP_GENERIC-Payload
+        # die modus-gefilterte Feld-Liste aus QUERY_FEATURES (die
+        # Parameter-Box zeigte die falschen/ungefilterten Keys).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes, service_mode=service_mode)
         # Numerische Keys aus den Metadaten (ohne count/confluence_count) –
         # Grundlage des E6-Fallbacks fuer Wert-Aggregationen.
         avail_filtered = [m for m in metrics
@@ -306,18 +310,29 @@ class AnalyticsRepository:
         if use_agg in ("avg", "sum", "min", "max"):
             if use_field not in avail_filtered:
                 use_field = avail_filtered[0] if avail_filtered else ""
-        # 21.03.20-Bugfix 3: Fehlende Registry-Modi als Achsenpunkte -
-        # NUR bei deaktivem Modus-Filter (alle Modi); bei konkretem
-        # service_mode filtert die WHERE-Bedingung auf genau diesen
-        # Modus und die Achse bleibt darauf begrenzt.
+        # 21.03.20-Bugfix 3: Fehlende Registry-Modi als Achsenpunkte.
+        # 13.08.2026 (Punkt 1a, F1): Die Ergaenzung greift JETZT AUCH bei
+        # konkretem Modus-Filter - die Registry-Paare werden dann auf den
+        # gewaehlten Modus gefiltert. Vorher blieb die service_id-Achse bei
+        # konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt
+        # (ein noch nicht berechneter Modus erzeugte KEINEN Achsenpunkt,
+        # obwohl der Modus im Dropdown waehlbar war).
         extra_service_modes = None
-        if str(service_mode or "").strip().lower() in ("", "all", "alle"):
-            try:
+        mode_raw = str(service_mode or "").strip()
+        mode_key = mode_raw.lower()
+        try:
+            if mode_key in ("", "all", "alle"):
                 extra_service_modes = sorted(
                     self._registry_service_mode_pairs(
                         feature_ids, feature_id))
-            except Exception:
-                extra_service_modes = None
+            elif mode_raw:
+                extra_service_modes = sorted(
+                    p for p in self._registry_service_mode_pairs(
+                        feature_ids, feature_id)
+                    if "::" in p
+                    and p.rsplit("::", 1)[1].strip().lower() == mode_key)
+        except Exception:
+            extra_service_modes = None
         try:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,

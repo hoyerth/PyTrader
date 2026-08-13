@@ -570,7 +570,10 @@ class MasterTree(QTreeWidget):
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "")
             last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
-            svc_label = f"{svc.get('instance_id')} ({last_exec})"
+            # 13.08.2026 (Punkt 6, F6): Modus-Suffix am Service-Namen
+            # (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)').
+            mode_sfx = self._mode_suffix(plugin_id, svc.get("params"))
+            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
             svc_archived = bool(svc.get("is_archived"))
@@ -616,11 +619,53 @@ class MasterTree(QTreeWidget):
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
-            self._apply_badge(svc_item, plugin_id, svc.get("badge") or "")
+            self._apply_badge(
+                svc_item, plugin_id, svc.get("badge") or "",
+                params=svc.get("params"))
             set_item.addChild(svc_item)
         if self._checkable:
             self._apply_set_state(set_item)
         return set_item
+
+    @staticmethod
+    def _mode_suffix(plugin_id: str,
+                     params: Optional[Dict[str, Any]] = None) -> str:
+        """'[{Modus}]'-Suffix fuer MasterTree-Labels (13.08.2026, Punkt 6, F6).
+
+        Nur fuer Multi-Modus-Services: parameter_schema['mode']['options']
+        enthaelt MEHR ALS EINEN Eintrag (z. B. srv_swing_momentum mit
+        MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet). Ein-
+        Modus-Services bleiben ohne Suffix (kein Rauschen im Baum). Der
+        Modus kommt aus den params der Instanz (Clone/Set-Service) bzw.
+        aus dem Schema-Default (flache Plugin-Zeile ohne eigene params).
+        Rein lesend (PluginRegistry-Singleton), Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+            plugins = getattr(reg, "plugins", None) or {}
+            pid_l = str(plugin_id or "").strip().lower()
+            plugin = None
+            for k, v in plugins.items():
+                if str(k).strip().lower() == pid_l:
+                    plugin = v
+                    break
+            if plugin is None:
+                return ""
+            schema = getattr(plugin, "parameter_schema", None) or {}
+            mode_cfg = schema.get("mode") or {}
+            options = [str(o).strip() for o in (mode_cfg.get("options") or [])
+                       if str(o).strip()]
+            if len(options) <= 1:
+                return ""
+            mode = ""
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode:
+                mode = str(mode_cfg.get("default") or "").strip()
+            return f" [{mode}]" if mode else ""
+        except Exception:
+            return ""
 
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
@@ -641,7 +686,11 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        plugin_label = display_pid if clones else f"{display_pid} ({last_exec})"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an flachen Plugin-Zeilen
+        # (Plugins MIT Clones zeigen den Modus an den Clone-Zeilen).
+        mode_sfx = "" if clones else self._mode_suffix(pid, None)
+        plugin_label = (display_pid if clones
+                        else f"{display_pid}{mode_sfx} ({last_exec})")
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -686,16 +735,22 @@ class MasterTree(QTreeWidget):
         last_exec = str(clone.get("last_execution") or "")
         last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         prefix = "🔹" if archived else "🟢"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
+        # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
+        # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
+        mode_sfx = self._mode_suffix(plugin_id, clone.get("params"))
         clone_item = QTreeWidgetItem(
-            [f"{prefix} {preset_name} ({last_exec})", ""])
+            [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
         clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
         clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
         clone_item.setData(0, ROLE_PRESET_NAME, preset_name)
         if archived:
             clone_item.setData(0, ROLE_ARCHIVED, True)
-        # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
+        # Tooltip: Plugin/Preset + Modus + Parameter + Doc-Log (F6c).
         tooltip = f"Plugin: {plugin_id}\nPreset: {preset_name}"
+        if mode_sfx:
+            tooltip += f"\nModus:{mode_sfx}"
         params = clone.get("params") or {}
         if isinstance(params, dict) and params:
             try:
@@ -723,7 +778,8 @@ class MasterTree(QTreeWidget):
         return clone_item
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
-                     badge: str) -> None:
+                     badge: str,
+                     params: Optional[Dict[str, Any]] = None) -> None:
         """Setzt die Darstellung eines Service-/Plugin-Items (Spalte 0/1).
 
         * Spalte 1: KEIN Badge-Text mehr (Bugfix 05.08.2026) – den Platz
@@ -748,6 +804,12 @@ class MasterTree(QTreeWidget):
                        else f"im {name}")
         else:
             tooltip = ""
+        # 13.08.2026 (Punkt 6, F6c): Modus auch im Tooltip (falls die
+        # Instanz-Params verfuegbar sind - Set-Service-/Clone-Zeile).
+        mode_sfx = self._mode_suffix(plugin_id, params)
+        if mode_sfx:
+            tooltip = (f"{tooltip}\nModus:{mode_sfx}"
+                       if tooltip else f"Modus:{mode_sfx}")
         item.setToolTip(0, tooltip)
         item.setToolTip(1, tooltip)
 
