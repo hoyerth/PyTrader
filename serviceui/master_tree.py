@@ -570,20 +570,6 @@ class MasterTree(QTreeWidget):
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "")
             last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
-            # 13.08.2026 (Punkt 6, F6): Modus-Suffix am Service-Namen
-            # (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)').
-            mode_sfx = self._mode_suffix(plugin_id, svc.get("params"))
-            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
-            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
-            # eine Kennzeichnung (is_archived=True -> non-checkable).
-            svc_archived = bool(svc.get("is_archived"))
-            if svc_archived:
-                svc_label = f"🔹 {svc_label}"
-            svc_item = QTreeWidgetItem([svc_label, ""])
-            svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
-            svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
-            svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
-            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
             # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
             # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
             # gespeichert (nur _duplicate_set_instance persistiert ihn) -
@@ -593,7 +579,8 @@ class MasterTree(QTreeWidget):
             # Instanzen). Hier wird der fehlende Hash on-the-fly aus den
             # Params berechnet (identisch zum Reader-Set-Pfad
             # generate_instance_hash(pid, params)) - heilt Alt-Bestand ohne
-            # DB-Migration.
+            # DB-Migration. (Block hierher vorgezogen, damit der Modus-
+            # Suffix den Hash fuer die Store-Aufloesung nutzen kann.)
             svc_hash = str(svc.get("instance_hash") or "")
             if not svc_hash and self.model is not None:
                 try:
@@ -605,6 +592,22 @@ class MasterTree(QTreeWidget):
                         cfg.get("params") or {}) or ""
                 except Exception:
                     svc_hash = ""
+            # 13.08.2026 (Punkt 6, F6 + Punkt 2): Modus-Suffix am Service-
+            # Namen (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)'
+            # bzw. mit dem AKTUELLEN Modus dahinter).
+            mode_sfx = self._mode_suffix_resolved(
+                plugin_id, svc.get("params"), svc_hash)
+            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
+            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
+            # eine Kennzeichnung (is_archived=True -> non-checkable).
+            svc_archived = bool(svc.get("is_archived"))
+            if svc_archived:
+                svc_label = f"🔹 {svc_label}"
+            svc_item = QTreeWidgetItem([svc_label, ""])
+            svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
+            svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
+            svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
+            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
             svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)
             if svc_archived or archived_set:
                 svc_item.setData(0, ROLE_ARCHIVED, True)
@@ -667,6 +670,149 @@ class MasterTree(QTreeWidget):
         except Exception:
             return ""
 
+    def _mode_suffix_resolved(
+        self,
+        plugin_id: str,
+        params: Optional[Dict[str, Any]] = None,
+        instance_hash: Optional[str] = None,
+    ) -> str:
+        """'[Modus]'-Suffix mit dem AKTUELLEN Modus (13.08.2026, Punkt 2).
+
+        Erweitert `_mode_suffix`: Die Preset-Params von Clones tragen den
+        'mode' haeufig NICHT (der Modus wird erst beim Run bestimmt) - der
+        reine `_mode_suffix` wuerde dann den Schema-DEFAULT zeigen. Hier
+        wird zusaetzlich der source_mode der LETZTEN Ausfuehrung je
+        instance_hash aus dem Feature-Store gelesen (via Model). Ist ein
+        echter Modus bekannt (params.mode oder Store), haengt er IMMER
+        hinter der Klammer: '[Default] AktuellerModus' (nur der reine
+        Klammer-Fallback ohne bekannten Modus bleibt ohne Anhang). Rein
+        lesend, Fehler defensiv.
+        """
+        base = self._mode_suffix(plugin_id, params)
+        if not base:
+            return ""
+        mode = ""
+        if isinstance(params, dict):
+            mode = str(params.get("mode") or "").strip()
+        if not mode and instance_hash and self.model is not None:
+            try:
+                mode = str(
+                    self.model.source_mode_for_hash(plugin_id, instance_hash)
+                    or "").strip()
+            except Exception:
+                mode = ""
+        # Flache Standalone-Services (ohne Clones) tragen im Tree keinen
+        # instance_hash - hier faellt die Aufloesung auf den Plugin-Fallback
+        # zurueck (erster bekannter Store-Modus des Plugins).
+        if not mode and not instance_hash and self.model is not None:
+            try:
+                mode = str(
+                    self.model.source_mode_for_plugin(plugin_id)
+                    or "").strip()
+            except Exception:
+                mode = ""
+        if not mode:
+            # Fallback: der Schema-Default gilt als aktueller Modus,
+            # solange weder Config noch Store einen echten liefern
+            # (z. B. nie gelaufene Variante).
+            mode = str(base).strip(" []")
+        return f"{base} {mode}"
+
+    def update_mode_label(self, instance_id: str, plugin_id: str,
+                          mode: str,
+                          instance_hash: Optional[str] = None) -> None:
+        """13.08.2026 (Punkt 2, Live-Update): Modus-Suffix der Zeilen
+        sofort auf den neuen Modus setzen (ohne Baum-Neuaufbau).
+
+        Betrifft Set-Service-Zeilen (instance_id), die GEWAEHLTE Clone-
+        Zeile (instance_hash) und flache Standalone-Plugin-Zeilen
+        (plugin_id). Der '(Datum)'-Anhang und ein '*' (Dirty) bleiben
+        erhalten. Plugin-Parents MIT Clones bleiben unveraendert (sie
+        zeigen nur den Schema-Default des Templates).
+        """
+        mode = str(mode or "").strip()
+        if not mode:
+            return
+        # Ein-Modus-Services / Services ohne Modus-Schema: kein Suffix.
+        if not self._mode_suffix(plugin_id, None):
+            return
+        pid_l = str(plugin_id or "").strip().lower()
+        hash_l = str(instance_hash or "")
+        # Bei Clone-/Plugin-Bearbeitung ist instance_id == plugin_id (das
+        # Panel nutzt die Plugin-ID als iid); bei Set-Services sind sie
+        # verschieden - darueber wird der Zeilen-Scope bestimmt.
+        plugin_scope = (str(instance_id or "").strip().lower() == pid_l)
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                ntype = item.data(0, ROLE_NODE_TYPE)
+                if plugin_scope:
+                    if ntype == TYPE_CLONE:
+                        if str(item.data(0, ROLE_PLUGIN_ID) or ""
+                               ).strip().lower() != pid_l:
+                            continue
+                        if hash_l and str(item.data(0, ROLE_INSTANCE_HASH)
+                                          or "") != hash_l:
+                            continue
+                    elif ntype == TYPE_PLUGIN:
+                        # Nur flache Blatt-Zeilen (Standalone ohne Clones);
+                        # Template-Parents behalten ihren Default-Suffix.
+                        if item.childCount() > 0:
+                            continue
+                        if str(item.data(0, ROLE_PLUGIN_ID) or ""
+                               ).strip().lower() != pid_l:
+                            continue
+                    else:
+                        continue
+                else:
+                    if ntype != TYPE_SERVICE:
+                        continue
+                    if str(item.data(0, ROLE_INSTANCE_ID) or "") != str(
+                            instance_id or ""):
+                        continue
+                self._set_label_mode(item, mode)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @staticmethod
+    def _set_label_mode(item, mode: str) -> None:
+        """Setzt den AKTUELLEN Modus im Label neu (13.08.2026, Punkt 2).
+
+        Entfernt ein vorhandenes '[x]' bzw. '[x] y' (angehaengter aktueller
+        Modus) und fuegt '[x] <neuerModus>' wieder ein - die Klammer (der
+        'Servicename'-Bezug) bleibt erhalten. '(Datum)' und '*' (Dirty)
+        bleiben erhalten; Preset-Namen mit Klammern (z. B. 'Default
+        (Kopie)') werden nicht zerstoert (das Datum wird am ENDE gesucht).
+        """
+        try:
+            import re
+            text = item.text(0) or ""
+            # Trailing '(Datum)'/' (nie)' abtrennen (am Ende - Preset-
+            # Klammern im Namen bleiben unberuehrt).
+            m = re.search(r"\s*\(([^()]*)\)\s*$", text)
+            date_part = ""
+            if m:
+                date_part = f" ({m.group(1)})"
+                text = text[:m.start()].rstrip()
+            star = ""
+            if text.endswith("*"):
+                star = "*"
+                text = text[:-1].rstrip()
+            # Bisherigen Klammer-Wert merken (bleibt erhalten).
+            bm = re.search(r"\[([^\]]*)\]", text)
+            bracket_val = bm.group(1) if bm else ""
+            # ' [x]' bzw. ' [x] y' entfernen (y = ein Token ohne Klammern).
+            stripped = re.sub(r"\s*\[[^\]]*\](?:\s+[^()\s]+)?", "",
+                              text).rstrip()
+            if bracket_val:
+                mode_sfx = f" [{bracket_val}] {mode}"
+            else:
+                mode_sfx = f" [{mode}]"
+            item.setText(0, f"{stripped}{mode_sfx}{star}{date_part}")
+        except (RuntimeError, AttributeError):
+            pass
+
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
         pid = child.get("plugin_id") or ""
@@ -686,10 +832,17 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an flachen Plugin-Zeilen
-        # (Plugins MIT Clones zeigen den Modus an den Clone-Zeilen).
-        mode_sfx = "" if clones else self._mode_suffix(pid, None)
-        plugin_label = (display_pid if clones
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an ALLEN Plugin-Zeilen
+        # (auch Plugins MIT Clones - der Parent zeigt den Schema-Default-
+        # Modus, die Clone-Zeilen tragen ihren eigenen Modus; Ein-Modus-
+        # Services bleiben ohne Suffix).
+        # 13.08.2026 (Punkt 2, Live-Update-Format): Flache Standalone-
+        # Services (ohne Clones) zeigen wie Clones den AKTUELLEN Modus
+        # hinter der Klammer (Plugin-Fallback aus dem Store); Template-
+        # Parents MIT Clones nur den Schema-Default (kein eigener Modus).
+        mode_sfx = (self._mode_suffix_resolved(pid, None, "")
+                    if not clones else self._mode_suffix(pid, None))
+        plugin_label = (f"{display_pid}{mode_sfx}" if clones
                         else f"{display_pid}{mode_sfx} ({last_exec})")
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
@@ -738,7 +891,8 @@ class MasterTree(QTreeWidget):
         # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
         # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
         # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
-        mode_sfx = self._mode_suffix(plugin_id, clone.get("params"))
+        mode_sfx = self._mode_suffix_resolved(
+            plugin_id, clone.get("params"), instance_hash)
         clone_item = QTreeWidgetItem(
             [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)

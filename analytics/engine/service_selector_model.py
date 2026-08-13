@@ -211,6 +211,10 @@ class ServiceSelectorModel(QObject):
         # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
         self._last_execution_datetimes_by_hash = (
             self._load_last_execution_datetimes_by_hash())
+        # 13.08.2026 (Punkt 2, MasterTree-Modus): source_mode je
+        # (feature_id, instance_hash) - Grundlage der Clone-Labels mit dem
+        # AKTUELLEN Modus (wenn die Preset-Params keinen 'mode' tragen).
+        self._source_modes_by_hash = self._load_source_modes_by_hash()
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -480,6 +484,63 @@ class ServiceSelectorModel(QObject):
         per_hash = self._last_execution_datetimes_by_hash.get(
             str(plugin_id).lower(), {}) or {}
         return per_hash.get(str(instance_hash), "--.--.-- --:--")
+
+    def _load_source_modes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest den letzten source_mode je (feature_id, instance_hash).
+
+        13.08.2026 (Punkt 2, MasterTree-Modus): Delegate an den
+        FeatureStoreReader (fetch_source_modes_by_hash). Der source_mode
+        einer Variante liegt als JSON-Key in feature_data; die Preset-Params
+        tragen den 'mode' oft NICHT (der Modus wird erst beim Run bestimmt).
+        Defensiv: Fehler -> leer (Clone-Labels zeigen dann den Schema-
+        Default).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_source_modes_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] source_mode je Variante "
+                  f"nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def source_mode_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Aktueller source_mode einer Parameter-Variante (13.08.2026).
+
+        Liefert den source_mode der LETZTEN Ausfuehrung der Variante aus
+        dem feature_store - leer, wenn die Variante nie gelaufen ist (der
+        Aufrufer faellt dann auf den Schema-Default zurueck). Rein lesend
+        aus dem Refresh-Zustand.
+        """
+        if not plugin_id or not instance_hash:
+            return ""
+        per_hash = (getattr(self, "_source_modes_by_hash", {}) or {}).get(
+            str(plugin_id).lower(), {}) or {}
+        return str(per_hash.get(str(instance_hash), "") or "")
+
+    def source_mode_for_plugin(
+        self, plugin_id: str
+    ) -> str:
+        """Aktueller source_mode eines FLACHEN Standalone-Plugins (13.08.2026).
+
+        Flache Plugins (ohne Clones) tragen im MasterTree keinen
+        instance_hash - hier wird der erste bekannte Store-Modus des
+        Plugins geliefert (deterministisch nach Hash-Sortierung). Leer,
+        wenn das Plugin nie gelaufen ist. Rein lesend aus dem
+        Refresh-Zustand.
+        """
+        if not plugin_id:
+            return ""
+        per_hash = (getattr(self, "_source_modes_by_hash", {}) or {}).get(
+            str(plugin_id).lower(), {}) or {}
+        for h in sorted(per_hash):
+            m = str(per_hash.get(h) or "").strip()
+            if m:
+                return m
+        return ""
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-

@@ -665,6 +665,12 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
+        # 13.08.2026 (Punkt 3, Bugfix Profile): Profil-Combo (Wechsel) und
+        # Speichern-Button waren NICHT verdrahtet - Profilwechsel und Save
+        # wirkten nicht. Verdrahtung ergaenzt (IoC, Signale statt direkter
+        # Aufrufe; _profile_combo_syncing-Guard verhindert Rekursion).
+        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
+        self.btn_profile_save.clicked.connect(self._on_profile_save)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
         # 21.03.11 (Bug 3): Nach abgeschlossenem Service-Run (der Worker
         # emittiert `service_set_changed` einmalig nach der ALLE-TFs-/
@@ -1246,6 +1252,21 @@ class AnalyticsWindow(PersistentWindow):
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
         # Profil persistieren (save_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())
+        # 13.08.2026 (Punkt 3, Teil 2, Bugfix Profile): Filterleisten-Zustand
+        # explizit in die VM-Params uebernehmen, damit save_profile den
+        # aktuell ANGEZEIGTEN Stand persistiert (data_tf/agg_tf/range/sort_mode
+        # aus der sources-Sektion). Idempotent - die VM-Setter sind No-Ops,
+        # wenn sich nichts geaendert hat (kein zusaetzlicher Query-Refresh).
+        try:
+            self._vm.set_data_tf(self.mtf_bar.current_data_tf())
+            self._vm.set_agg_tf(self.mtf_bar.current_agg_tf())
+            self._vm.set_sort_mode(self.mtf_bar.current_sort_mode())
+            preset = self.mtf_bar.current_range_preset()
+            if preset:
+                f, t = self.mtf_bar.current_range_epochs()
+                self._vm.set_range(f, t, preset)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Profil-Filter-Sync: {e}")
         self._vm.save_profile()
 
     @Slot()

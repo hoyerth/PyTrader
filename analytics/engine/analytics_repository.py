@@ -703,7 +703,23 @@ class AnalyticsRepository:
         21.03.20-Bugfix 2: UNION-Quelle fuer das Modus-Dropdown (alle
         waehlbaren Modi statt nur der DB-geschriebenen). Abgeleitet aus
         `_registry_service_mode_pairs` (eine Registry-Sammlung).
+
+        13.08.2026 (Punkt 2, Antwort b): KEIN pauschaler Registry-Fallback
+        mehr bei leerer Auswahl - ohne konkrete feature_ids (nichts
+        gecheckt) liefert die UNION eine leere Menge. Das Modus-Dropdown
+        zeigt damit keine Modi unselektierter Services (die DB-Quelle
+        `fetch_available_source_modes` filtert bereits auf feature_ids).
+        Die Heatmap-Achse (`get_generic_heatmap` -> extra_service_modes)
+        nutzt weiterhin den vollen Registry-Satz ueber
+        `_registry_service_mode_pairs` (F1: Achsenpunkte fuer noch nicht
+        berechnete Modi).
         """
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        if not wanted:
+            return set()
         pairs = cls._registry_service_mode_pairs(feature_ids, feature_id)
         modes: Set[str] = set()
         for p in pairs:

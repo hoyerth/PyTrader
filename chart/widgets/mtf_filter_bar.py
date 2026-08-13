@@ -23,7 +23,7 @@ emittiert Signale; die eigentliche Verarbeitung (Boundary, Kaskade, Guards)
 liegt in den Engine-Modulen (21.03.02-21.03.05).
 """
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -272,6 +272,31 @@ class MtfFilterBarWidget(QWidget):
             return "tf"
         return "date"
 
+    # 13.08.2026 (Punkt 3, Teil 2, Bugfix Profile): Oeffentliche Lesemethoden
+    # fuer den aktuellen Range-Zustand. Werden vom AnalyticsWindow beim
+    # Profil-Speichern genutzt, um den ANGEZEIGTEN Filterleisten-Stand explizit
+    # in die VM-Params zu uebernehmen (defensiver Sync vor save_profile()).
+    def current_range_preset(self) -> str:
+        """Aktiver Range-Preset-Name (z. B. '7d')."""
+        return self._range_combo.currentText()
+
+    def current_range_epochs(self) -> Tuple[int, int]:
+        """Wanduhr-Epochs (from_ts, to_ts) fuer den aktuellen Preset.
+
+        Gleiche Logik wie `_on_range_changed`: Referenzpunkt ist der
+        injizierte `now_provider` (im Analytics der letzte Datenpunkt
+        MAX(bar_time)), defensiv time.time(). None/leerer Preset -> 24h.
+        """
+        preset = self.current_range_preset()
+        try:
+            now = int(self._now_provider())
+        except (TypeError, ValueError):
+            now = int(_now_epoch())
+        seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
+                   "90d": 90 * 86400, "Year": 365 * 86400}.get(
+                       preset, 86400)
+        return now - seconds, now
+
     # 21.03.12 (Analytics-Integration): Externe Filterwerte anwenden (z. B.
     # Profil-/Workspace-Restore des AnalyticsWindow). Setzt die Combos mit
     # blockSignals und emittiert die Signale danach EXPLIZIT. None = Eintrag
@@ -382,16 +407,11 @@ class MtfFilterBarWidget(QWidget):
         None/Fehler (z. B. noch kein Symbol/Timeframe gewaehlt) -> time.time().
         21.03.15 (Bug 3): Preset-Satz 24h/7d/30d/90d/Year; 'Year' = letzte
         365 Tage (kein Jahresbeginn-Fenster mehr). Das benutzerdefinierte
-        Von-/Bis-Panel ist entfallen.
+        Von-/Bis-Panel ist entfallen. 13.08.2026 (Punkt 3): Die Epoch-
+        Berechnung wurde in `current_range_epochs()` extrahiert (wird auch
+        vom Profil-Save-Sync des AnalyticsWindow genutzt).
         """
-        try:
-            now = int(self._now_provider())
-        except (TypeError, ValueError):
-            now = int(_now_epoch())
-        seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
-                   "90d": 90 * 86400, "Year": 365 * 86400}.get(
-                       preset, 86400)
-        f, t = now - seconds, now
+        f, t = self.current_range_epochs()
         self.range_changed.emit(preset, f, t)
 
     def _on_sort_changed(self, _text: str) -> None:

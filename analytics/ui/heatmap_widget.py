@@ -611,12 +611,13 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
-        # 20.02.01 (E8): Mindestbreite erhoeht (laengere Achsen-Beschriftungen).
-        self._combo_x.setMinimumWidth(160)
+        # 13.08.2026 (Punkt 1): X-/Y-Achse kompakter (160->110), damit die
+        # Zoom-X-/Zoom-Y-Slider in Zeile 1 wieder sichtbar bleiben.
+        self._combo_x.setMinimumWidth(110)
         for d in HEATMAP_DIMENSIONS:
             self._combo_x.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_y = QComboBox()
-        self._combo_y.setMinimumWidth(160)
+        self._combo_y.setMinimumWidth(110)
         for d in HEATMAP_DIMENSIONS:
             self._combo_y.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_agg = QComboBox()
@@ -656,16 +657,11 @@ class HeatmapWidget(QWidget):
         # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
         self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
 
-        ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("X-Achse:"))
-        ctrl.addWidget(self._combo_x)
-        ctrl.addWidget(QLabel("Y-Achse:"))
-        ctrl.addWidget(self._combo_y)
-        # 21.01 (E7, 11.08.2026): Die 4 Smart-Preset-Buttons wurden
-        # ENTFERNT – die Presets sind ausschliesslich ueber das
-        # 'Ansicht'-Dropdown der HeatmapPage erreichbar (heatmap_page.py,
-        # _combo_mode / _apply_selected_preset).
-        ctrl.addStretch(1)
+        # 13.08.2026 (Punkt 5): Layout-Restrukturierung - der bisherige
+        # 1-Zeiler (ctrl: X-Achse/Y-Achse) und das 2-zeilige QGridLayout
+        # (ctrl2) werden durch zwei buendige Zeilen (row1/row2, Aufbau
+        # weiter unten nach der Widget-Erzeugung) ersetzt - alle Controls
+        # bleiben unveraendert erhalten.
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
@@ -684,6 +680,10 @@ class HeatmapWidget(QWidget):
         self._label_info.setStyleSheet("color: #808080;")
         for s in (self._slider_zoom_x, self._slider_zoom_y):
             s.setRange(5, 100)
+            # 13.08.2026 (Punkt 1): Mindestbreite + Expanding - die Slider
+            # werden sonst in der vollen Zeile 1 auf 0 gedrueckt/unsichtbar.
+            s.setMinimumWidth(70)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             # 09.08.2026 (User-Meldung 2): Richtung getauscht – rechts
             # (hoher Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out.
             # 5 = volle Achse (links), 100 = maximale Vergroesserung (rechts).
@@ -692,40 +692,37 @@ class HeatmapWidget(QWidget):
             s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
                          "links = Zoom-Out.")
 
-        # 21.03.20-Bugfix 1+2: Zwei-zeiliges QGridLayout. Zeile 0 traegt die
-        # Werteanzeige (_label_info) EINE ZEILE UEBER der Steuerleiste,
-        # linksbuendig auf Hoehe des Feld-Dropdowns (Spalte des 'Feld:'-
-        # Labels). Bug 2: Modus-Dropdown steht JETZT VOR der Aggregation.
-        # 'Feld' (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
-        ctrl2 = QGridLayout()
-        ctrl2.setHorizontalSpacing(6)
-        ctrl2.setVerticalSpacing(2)
-        _c = 0
-        ctrl2.addWidget(self._chk_candle, 1, _c); _c += 1
-        ctrl2.addWidget(self._label_overlay_tf, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Zoom X:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._slider_zoom_x, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Zoom Y:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._slider_zoom_y, 1, _c); _c += 1
-        # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
-        # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
-        # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
-        ctrl2.addWidget(QWidget(), 1, _c); _c += 1
-        ctrl2.setColumnMinimumWidth(_c - 1, 15)
-        # 21.03.20-Bugfix 2: Modus-Dropdown VOR der Aggregation (Tausch).
-        ctrl2.addWidget(QLabel("Modus:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._combo_mode_filter, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Aggregation:"), 1, _c); _c += 1
-        ctrl2.addWidget(self._combo_agg, 1, _c); _c += 1
-        ctrl2.addWidget(QLabel("Feld:"), 1, _c); _c += 1
-        _field_col = _c
-        ctrl2.addWidget(self._combo_field, 1, _c); _c += 1
-        ctrl2.setColumnStretch(_field_col, 1)
-        # 21.03.20-Bugfix 1: Werteanzeige eine Zeile ueber der Steuerleiste
-        # (linksbuendig auf Hoehe des Feld-Dropdowns) - die Zeile bleibt
-        # ruhiger, weil das Label nicht mehr rechts am Ende wackelt.
-        ctrl2.addWidget(self._label_info, 0, _field_col,
-                        1, 1, Qt.AlignLeft)
+        # 13.08.2026 (Punkt 5): Zwei klare, buendige Steuer-Zeilen.
+        # Zeile 1: [x] Kerzen-Overlay | X-Achse | Y-Achse | Zoom X | Zoom Y |
+        #          Modus | Aggregation (gleiche Controls wie bisher).
+        # Zeile 2: 'Ergebnisparameter:' (Feld-Dropdown, CheckableComboBox)
+        #          stretcht bis zum Canvas-Ende (Expanding + Stretch 1).
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row1.addWidget(self._chk_candle)
+        row1.addWidget(self._label_overlay_tf)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("X-Achse:"))
+        row1.addWidget(self._combo_x)
+        row1.addWidget(QLabel("Y-Achse:"))
+        row1.addWidget(self._combo_y)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("Zoom X:"))
+        row1.addWidget(self._slider_zoom_x)
+        row1.addWidget(QLabel("Zoom Y:"))
+        row1.addWidget(self._slider_zoom_y)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("Modus:"))
+        row1.addWidget(self._combo_mode_filter)
+        row1.addWidget(QLabel("Aggregation:"))
+        row1.addWidget(self._combo_agg)
+        row1.addStretch(1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(QLabel("Ergebnisparameter:"))
+        row2.addWidget(self._combo_field, 1)
+        row2.addWidget(self._label_info)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -819,8 +816,8 @@ class HeatmapWidget(QWidget):
         self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
 
         lay = QVBoxLayout(self)
-        lay.addLayout(ctrl)
-        lay.addLayout(ctrl2)
+        lay.addLayout(row1)
+        lay.addLayout(row2)
         lay.addWidget(self._plot_hm, 1)
 
         # --- Signale ---

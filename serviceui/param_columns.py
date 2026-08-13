@@ -505,6 +505,11 @@ class ServiceParamColumnsMixin:
                 else:
                     cfg.setdefault("params", {})[key] = value
         self._mark_service_dirty(iid)
+        # 13.08.2026 (Punkt 2, Live-Update): Modus-Aenderung aktualisiert
+        # den Modus-Text im MasterTree SOFORT (Services + Clones), nicht
+        # erst nach dem Speichern (data_changed -> _populate).
+        if key == "mode":
+            self._update_tree_mode_label(iid, str(value or ""))
 
     def _mark_service_dirty(self, iid: str) -> None:
         """Versieht den Service-Knoten im MasterTree mit einem '*' (und
@@ -525,6 +530,31 @@ class ServiceParamColumnsMixin:
             return
         try:
             tree.set_instance_dirty(iid, True)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _update_tree_mode_label(self, iid: str, mode: str) -> None:
+        """Live-Update des Modus-Suffixes im MasterTree (13.08.2026).
+
+        Bei Aenderung des Modus-Dropdowns wird der Label-Text der
+        betroffenen Zeile(n) SOFORT angepasst (ohne Baum-Neuaufbau) -
+        fuer Set-Services (instance_id) und Clones/Plugins (plugin_id).
+        Bei Clones wird der instance_hash des bearbeiteten Presets
+        mitgegeben, damit nur die GEWAEHLTE Variante aktualisiert wird.
+        """
+        try:
+            selector = getattr(self, "service_selector", None)
+            tree = getattr(selector, "master_tree", None)
+            if tree is None or not iid:
+                return
+            definition = getattr(self, "_current_set_definition", None) or {}
+            cfg = (definition.get("services") or {}).get(iid) or {}
+            plugin_id = str(cfg.get("plugin_id") or iid)
+            preset = getattr(self, "_current_preset_editing", None) or {}
+            inst_hash = ""
+            if isinstance(preset, dict):
+                inst_hash = str(preset.get("instance_hash") or "")
+            tree.update_mode_label(str(iid), plugin_id, str(mode), inst_hash)
         except (RuntimeError, AttributeError):
             pass
 

@@ -1809,6 +1809,48 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_source_modes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Letzter source_mode je (feature_id, instance_hash).
+
+        13.08.2026 (Punkt 2, MasterTree-Modus): Die Clone-/Varianten-Labels
+        sollen den AKTUELLEN Modus zeigen. Da die Preset-Params haeufig
+        KEINEN 'mode'-Key enthalten (der Modus wird erst beim Run bestimmt),
+        wird hier der source_mode der JEWEILS LETZTEN Ausfuehrung je
+        (feature_id, instance_hash) gelesen (JSON-Key in feature_data,
+        DuckDB arg_max(..., bar_time)). Read-only, ueber ALLE Symbole/
+        Timeframes; case-insensitiv wie die Datums-Geschwister.
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: source_mode} - leer
+            bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       arg_max(json_extract_string(
+                           feature_data, '$.source_mode'), bar_time) AS mode
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                  AND json_extract_string(feature_data, '$.source_mode')
+                      IS NOT NULL
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_source_modes_by_hash fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            out.setdefault(str(r[0]), {})[str(r[1])] = str(r[2])
+        return out
+
     def fetch_last_execution_datetimes_by_hash(
         self,
     ) -> Dict[str, Dict[str, str]]:

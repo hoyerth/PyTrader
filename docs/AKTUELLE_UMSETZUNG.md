@@ -1678,3 +1678,35 @@ def _on_mode_filter_changed(self) -> None:
   - `test/check_heatmap_e2e.py` (8 Checks, neu): echte temp-DuckDB + echter AnalyticsViewModel + echter Async-Worker - Stack Index 1 vor und nach Request, generisches Image (2x3), currentWidget = HeatmapWidget, Page-Overlay 0 - ALLE PASS.
   - Regression gruen: `test/check_heatmap_render.py` (12), `test/check_punkte_1_8.py` (9).
 - **Commit:** 529ef6b
+
+# Implementierungs-Log 13.08.2026 - Bugfixing Runde 1-3: Profile / Heatmap-Layout / MasterTree-Modus-Labels (13.08.2026)
+
+## Runde 1 - 5 Punkte (Bugfixing-Modus)
+
+- **1. Custom-Range:** entfaellt bewusst (bereits am 21.03.15 entfernt) - keine Aenderung.
+- **2. Modus-Dropdown:** `analytics/engine/analytics_repository.py` `_registry_service_mode_pairs` zunaechst mit Guard bei leerer Auswahl. KORRIGIERT in Runde 3 (Guard an die richtige Stelle verschoben, s. u.).
+- **3. Profile kaputt:** `analytics/ui/analytics_win.py` - `_wire_controls()` verdrahtet `combo_profile.currentIndexChanged -> _on_profile_selected` und `btn_profile_save.clicked -> _on_profile_save`; `_on_profile_save()` synchronisiert die Filterleiste defensiv (data_tf/agg_tf/sort_mode/range via `mtf_bar.current_range_*()`). `chart/widgets/mtf_filter_bar.py`: neue Methoden `current_range_preset()`/`current_range_epochs()`, `_on_range_changed` nutzt die Extraktion.
+- **4. W1/MN1:** DB-Check zeigt Daten vorhanden (SILVER: W1=1377, MN1=318) - kein Code-Bug.
+- **5. Heatmap-Layout:** `analytics/ui/heatmap_widget.py` - 2-zeiliges Layout (row1: Kerzen-Overlay/X/Y/ZoomX/ZoomY/Modus/Aggregation; row2: 'Ergebnisparameter:' + `_combo_field` stretch).
+
+## Runde 2 - Kosmetik (13.08.2026)
+
+- **Heatmap-Breiten:** `_combo_x`/`_combo_y` `setMinimumWidth(160->110)`; Zoom-Slider `setMinimumWidth(70)` + `Expanding`-Policy (sichtbar).
+- **MasterTree Plugin-Parents:** `serviceui/master_tree.py` `_build_plugin_item` - `mode_sfx` jetzt auch an Plugin-Parents MIT Clones (`f"{display_pid}{mode_sfx}"`).
+
+## Runde 3 - MasterTree: aktueller Modus in eckiger Klammer + dahinter (13.08.2026, final)
+
+- **User-Anforderung:** In eckigen Klammern steht bei den Clones der Servicename (richtig), aber dahinter muss auch der Name des AKTUELLEN Modus stehen - zusaetzlich Live-Update im Tree bei Modus-Aenderung (Services + Clones).
+- **Format-Entscheidung (final):** Die Klammer bleibt (Schema-Default/params-Modus = 'Servicename'-Bezug). Der aktuelle Modus haengt IMMER dahinter: `[Default] AktuellerModus`. Aufloesungs-Kette: `params.mode` -> `source_mode_for_hash` (Feature-Store, letzte Ausfuehrung je instance_hash) -> `source_mode_for_plugin` (flache Standalone-Plugins) -> Schema-Default (nie gelaufene Variante). Ein-Modus-Services bleiben ohne Suffix.
+- **Aenderungen:**
+  - `analytics/engine/feature_store_reader.py`: neue Methode `fetch_source_modes_by_hash()` -> `Dict[feature_id_lower, {instance_hash: source_mode}]` (arg_max(json_extract_string(feature_data, '$.source_mode'), bar_time) ueber alle Symbole/TFs, SENTINEL_NATIVE-Filter).
+  - `analytics/engine/service_selector_model.py`: `_load_source_modes_by_hash()` in `refresh()`; neue Methoden `source_mode_for_hash(plugin_id, hash)` + `source_mode_for_plugin(plugin_id)`.
+  - `serviceui/master_tree.py`: `_mode_suffix_resolved()` haengt den aktuellen Modus IMMER hinter der Klammer an; `update_mode_label(instance_id, plugin_id, mode, instance_hash)` live ohne Baum-Neuaufbau (Scope: Clone per Hash, Set-Service per instance_id, flaches Plugin per plugin_id; Template-Parents MIT Clones bleiben unveraendert); `_set_label_mode()` robustes Label-Rewrite (Preset-Klammern wie 'Default (Kopie)', '*'/Datum bleiben erhalten); `_build_set_item()` berechnet den Hash VOR dem Suffix (Store-Aufloesung); `_build_plugin_item()` nutzt fuer flache Plugins `_mode_suffix_resolved`.
+  - `serviceui/param_columns.py`: `_update_tree_mode_label()` reicht den instance_hash des bearbeiteten Presets (`_current_preset_editing`) an `tree.update_mode_label` durch.
+  - `analytics/engine/analytics_repository.py` (Guard-Korrektur Runde 1): Der 'kein Registry-Fallback bei leerer Auswahl'-Guard gehoert NICHT in `_registry_service_mode_pairs` (Heatmap-Achse braucht den Fallback fuer F1) - er sitzt jetzt korrekt in `_registry_source_modes` (Modus-Dropdown wird bei leerer Auswahl leer; die Achse behaelt den vollen Registry-Satz).
+- **Verifikation (headless, keine UI):**
+  - `test/check_tree_mode_fix2.py` (neu, 38 Checks): reale Clone-Labels (Klammer + aktueller Modus dahinter), Abweichungs-Fall (Fake-Model: `[Supertrend_ATR] Donchian_Keltner_Breakout`), `_set_label_mode` (6 Label-Varianten inkl. Dirty/Datum/Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/alle-Clones-Fallback/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
+  - `test/check_punkte_1_8.py` (9 Checks): ALLE PASS (F1-Achse wieder gruen nach Guard-Korrektur).
+  - `py_compile` aller 5 geaenderten Quelldateien OK.
+  - Datenlage (read-only): 5 Multi-Modus-Services; alle aktuellen Store-Modi == Schema-Default (z. B. srv_trend_breakout -> Supertrend_ATR) - die Abweichungs-Anzeige greift, sobald eine Variante mit anderem Modus laeuft.
+- **Commit:** (siehe Git-Log)
