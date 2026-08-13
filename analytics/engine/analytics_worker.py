@@ -277,6 +277,9 @@ class AnalyticsAsyncWorker(QThread):
                 presets_data=p.get("presets_data") or None,
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                # 21.03.20-Bugfix 3: Modus-Filter fuer die Feld-Metadaten
+                # (modus-spezifische Ergebnis-Parameter im Feld-Dropdown).
+                service_mode=service_mode,
             )
 
         raise ValueError(

@@ -146,6 +146,8 @@ class AnalyticsRepository:
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> tuple:
         """Verfuegbare Feld-Metriken + Quellen-Zuordnung (Feld-Dropdown).
 
@@ -185,9 +187,28 @@ class AnalyticsRepository:
             # Varianten-Hashes.
             by_service = self.reader.feature_keys_by_service(
                 symbol, timeframe, numeric_only=True,
-                feature_id=feature_id, feature_ids=feature_ids)
+                feature_id=feature_id, feature_ids=feature_ids,
+                service_mode=service_mode)
         except Exception:
             by_service = {}
+        # 21.03.20-Bugfix 3: Modus-Fallback - ist ein Modus gewaehlt, aber
+        # noch nicht in der DB berechnet (leere modus-gefilterte Keys),
+        # werden die nicht-technischen output_schema-Keys der selektierten
+        # Services als Ergebnis-Parameter vorgeschlagen (Param-Box bleibt
+        # nutzbar; der konkrete Modus kann danach berechnet/ausgefuehrt
+        # werden). Muster _registry_service_mode_pairs (Registry, rein
+        # lesend, Fehler defensiv).
+        use_mode = (str(service_mode or "").strip()
+                    if str(service_mode or "").strip().lower()
+                    not in ("all", "alle") else "")
+        if use_mode and not by_service:
+            try:
+                fallback_keys = self._registry_output_keys(
+                    feature_ids, feature_id)
+            except Exception:
+                fallback_keys = {}
+            if fallback_keys:
+                by_service = fallback_keys
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
@@ -619,6 +640,44 @@ class AnalyticsRepository:
         return out
 
     @classmethod
+    def _registry_output_keys(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Nicht-technische output_schema-Keys je Service (Registry).
+
+        21.03.20-Bugfix 3: Fallback fuer die Parameter-Box (Feld-Dropdown),
+        wenn der gewaehlte Modus noch nicht in der DB berechnet wurde
+        (leere modus-gefilterte field_sources). `output_schema`-Felder mit
+        `technical: True` (System-Metrik) werden ausgeschlossen. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return {}
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Dict[str, List[str]] = {}
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "output_schema", None) or {}
+                keys = [k for k, v in schema.items()
+                        if k and not (v or {}).get("technical")]
+                if keys:
+                    out[str(pid)] = sorted(keys)
+        except Exception:
+            pass
+        return out
+
+    @classmethod
     def _registry_source_modes(
         cls,
         feature_ids: Optional[List[str]],
@@ -647,6 +706,8 @@ class AnalyticsRepository:
         # Metadaten (metrics/field_sources) im QUERY_FEATURES-Leichtpfad.
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
 
@@ -669,7 +730,8 @@ class AnalyticsRepository:
         # denselben Reader-Basis-Scan wie die Heatmap (cache-served).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes,
+            service_mode=service_mode)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
         # 21.03.20 (Analytics Modus-Filter): source_modes +

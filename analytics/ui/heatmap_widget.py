@@ -96,6 +96,7 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -381,6 +382,13 @@ class _HeatmapAxis(pg.AxisItem):
         (LWC `Q_`): Jahres-/Monatsmarken werden immer gesetzt, feinere
         Marken fuellen die Luecken.
         """
+        # 21.03.20-Bugfix 5: Date-Epochs sind Wanduhr-Sekunden seit 1970
+        # (positiv). Negative/riesige Werte (z. B. zusammengefallener
+        # Auto-Range nach 'Keine Daten' -> [-0.5, 0.5]) wuerden in
+        # _date_marks zu datetime.fromtimestamp(-86400) fuehren und auf
+        # Windows/Python 3.14 OSError 22 werfen. Clampen verhindert das.
+        lo = max(0.0, float(lo))
+        hi = max(0.0, float(hi))
         span = hi - lo
         if span <= 0:
             return []
@@ -411,7 +419,14 @@ class _HeatmapAxis(pg.AxisItem):
         d1 = int(math.floor(hi / _DAY_SECONDS)) * _DAY_SECONDS
         d = d0
         while d <= d1:
-            dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            # 21.03.20-Bugfix 5: fromtimestamp kann auf Windows OSError 22
+            # fuer ungueltige (negative/riesige) Epochs werfen - ungueltige
+            # Marken ueberspringen statt zu crashen.
+            try:
+                dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            except (OSError, ValueError, OverflowError):
+                d += _DAY_SECONDS
+                continue
             if dt.month == 1 and dt.day == 1:
                 w = 70
             elif dt.day == 1:
@@ -656,32 +671,40 @@ class HeatmapWidget(QWidget):
             s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
                          "links = Zoom-Out.")
 
-        ctrl2 = QHBoxLayout()
-        ctrl2.addWidget(self._chk_candle)
-        ctrl2.addWidget(self._label_overlay_tf)
-        ctrl2.addWidget(QLabel("Zoom X:"))
-        ctrl2.addWidget(self._slider_zoom_x)
-        ctrl2.addWidget(QLabel("Zoom Y:"))
-        ctrl2.addWidget(self._slider_zoom_y)
+        # 21.03.20-Bugfix 1+2: Zwei-zeiliges QGridLayout. Zeile 0 traegt die
+        # Werteanzeige (_label_info) EINE ZEILE UEBER der Steuerleiste,
+        # linksbuendig auf Hoehe des Feld-Dropdowns (Spalte des 'Feld:'-
+        # Labels). Bug 2: Modus-Dropdown steht JETZT VOR der Aggregation.
+        # 'Feld' (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
+        ctrl2 = QGridLayout()
+        ctrl2.setHorizontalSpacing(6)
+        ctrl2.setVerticalSpacing(2)
+        _c = 0
+        ctrl2.addWidget(self._chk_candle, 1, _c); _c += 1
+        ctrl2.addWidget(self._label_overlay_tf, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom X:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_x, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom Y:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_y, 1, _c); _c += 1
         # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
         # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
         # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
-        ctrl2.addSpacing(15)
-        ctrl2.addWidget(QLabel("Aggregation:"))
-        ctrl2.addWidget(self._combo_agg)
-        ctrl2.addSpacing(10)
-        ctrl2.addWidget(QLabel("Modus:"))
-        ctrl2.addWidget(self._combo_mode_filter)
-        ctrl2.addSpacing(10)
-        # 21.03.20-Bugfix 1: Werteanzeige (_label_info) UEBER dem
-        # Feld-Dropdown platzieren - die Zeile bleibt ruhiger, weil
-        # das Label nicht mehr rechts am Ende wackelt; 'Feld'
-        # (Stretch 1) waechst bis zum Ende des Canvas.
-        ctrl2.addWidget(QLabel("Feld:"))
-        ctrl2.addSpacing(6)
-        ctrl2.addWidget(self._label_info)
-        ctrl2.addSpacing(6)
-        ctrl2.addWidget(self._combo_field, 1)
+        ctrl2.addWidget(QWidget(), 1, _c); _c += 1
+        ctrl2.setColumnMinimumWidth(_c - 1, 15)
+        # 21.03.20-Bugfix 2: Modus-Dropdown VOR der Aggregation (Tausch).
+        ctrl2.addWidget(QLabel("Modus:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_mode_filter, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Aggregation:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_agg, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Feld:"), 1, _c); _c += 1
+        _field_col = _c
+        ctrl2.addWidget(self._combo_field, 1, _c); _c += 1
+        ctrl2.setColumnStretch(_field_col, 1)
+        # 21.03.20-Bugfix 1: Werteanzeige eine Zeile ueber der Steuerleiste
+        # (linksbuendig auf Hoehe des Feld-Dropdowns) - die Zeile bleibt
+        # ruhiger, weil das Label nicht mehr rechts am Ende wackelt.
+        ctrl2.addWidget(self._label_info, 0, _field_col,
+                        1, 1, Qt.AlignLeft)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -1512,12 +1535,32 @@ class HeatmapWidget(QWidget):
         self._sync_combos_from_payload(data)
         agg = str(data.get("agg") or "count")
 
+        # 21.03.20-Bugfix 4: Achsen-Labels VOR dem Leer-Check konfigurieren -
+        # auch bei 'Keine Daten' (gewaehlter Modus ohne DB-Rows) muss die
+        # Service-Beschriftung (inkl. ' / {Modus}') auf der Achse
+        # aktualisiert werden (vorher blieb der alte Zustand stehen).
+        x_labels = data.get("x_labels") or []
+        y_labels = data.get("y_labels") or []
+        if x_dim == "service_id" and self._view_model is not None:
+            x_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in x_labels]
+        if y_dim == "service_id" and self._view_model is not None:
+            y_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in y_labels]
+        self._axis_x.configure(x_dim, x_labels)
+        self._axis_y.configure(y_dim, y_labels)
+
         if matrix.size == 0:
             self._n_cols = self._n_rows = 0
             self._x_axis = []
             self._y_axis = []
             self._image.clear()
-            self._label_info.setText("Keine Daten")
+            # 21.03.20-Bugfix 4: 'Keine Daten'-Hinweis mit Modus-Kontext
+            # (erklaert, dass der gewaehlte Modus keine DB-Rows hat).
+            _mode_txt = str(self._combo_mode_filter.currentData() or "all")
+            self._label_info.setText(
+                "Keine Daten"
+                + (f" fuer Modus '{_mode_txt}'" if _mode_txt != "all" else ""))
             self._legend.hide()  # 21.01 Bugfix 2: keine Legende ohne Daten
             self._grid_lines.setData([], [])  # 21.01 R3: keine Teiler
             self._clear_overlay()
@@ -1590,20 +1633,6 @@ class HeatmapWidget(QWidget):
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a): Senkrechte Teiler je
         # Dateneinheit (TF-Bar-Intervall) an der X-Achse (date).
         self._update_grid_lines()
-
-        # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
-        # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
-        x_labels = data.get("x_labels") or []
-        y_labels = data.get("y_labels") or []
-        if x_dim == "service_id" and self._view_model is not None:
-            x_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in x_labels]
-        if y_dim == "service_id" and self._view_model is not None:
-            y_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in y_labels]
-        # Dynamische Achsen konfigurieren (Bugfix 5+6).
-        self._axis_x.configure(x_dim, x_labels)
-        self._axis_y.configure(y_dim, y_labels)
 
         # 20.02.01 (E4): Achsen-Label der Tageszeit mit UTC-Offset –
         # DST-robust aus dem neuesten Datumswert der Daten abgeleitet
@@ -2494,7 +2523,7 @@ class HeatmapWidget(QWidget):
                 time_txt = (f"{days[d_day.weekday()]} {d_day.day:02d}."
                             f"{d_day.month:02d}.{d_day.year % 100:02d} "
                             f"{d_time.hour:02d}:{d_time.minute:02d}  →  ")
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, OSError):
                 time_txt = ""
         if not in_bounds:
             self._label_info.setText(

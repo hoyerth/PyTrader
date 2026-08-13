@@ -275,6 +275,10 @@ class FeatureStoreReader:
         # Grundlage des Modus-Dropdowns OHNE zusaetzlichen
         # DB-Roundtrip (gleicher Cache wie die Keys, Runde 15).
         source_modes_by_service: Dict[str, Set[str]] = {}
+        # 21.03.20-Bugfix 3: JSON-Keys je (Service, source_mode) - Grundlage
+        # modus-spezifischer Ergebnis-Parameter im Feld-Dropdown (modus-
+        # gefilterte Keys statt aller Keys ueber alle Modi hinweg).
+        keys_by_service_mode: Dict[str, Dict[str, Set[str]]] = {}
         for fid, hash_raw, raw in rows:
             data = self._normalize_feature_data(raw)
             if not isinstance(data, dict):
@@ -308,11 +312,19 @@ class FeatureStoreReader:
             if sm is not None and str(sm).strip():
                 source_modes_by_service.setdefault(
                     service, set()).add(str(sm).strip())
+                # 21.03.20-Bugfix 3: Keys DIESER Row sammeln (modus-
+                # spezifische Ergebnis-Parameter fuer das Feld-Dropdown) -
+                # NICHT bucket.keys() (bucket aggregiert ueber ALLE Modi).
+                row_keys = {str(k) for k in data
+                            if k != "schema_version" and str(k).strip()}
+                keys_by_service_mode.setdefault(service, {}).setdefault(
+                    str(sm).strip(), set()).update(row_keys)
         entry = {
             "types_by_service": types_by_service,
             "hashes_by_service": hashes_by_service,
             "null_hash_pids": null_hash_pids,
             "source_modes_by_service": source_modes_by_service,
+            "keys_by_service_mode": keys_by_service_mode,
         }
         self._meta_put(key, entry)
         return entry
@@ -748,6 +760,8 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -806,7 +820,19 @@ class FeatureStoreReader:
                 svc_hashes = hashes_by_service.get(svc_l, set())
                 if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
                     continue
-            keys = sorted(bucket.keys())
+            # 21.03.20-Bugfix 3: Optionaler Modus-Filter - nur Keys, die in
+            # Rows mit diesem source_mode vorkommen (modus-spezifische
+            # Ergebnis-Parameter). Noch nicht berechnete Modi liefern leer
+            # (der output_schema-Fallback im Repository greift dort).
+            use_mode = (str(service_mode or "").strip()
+                        if str(service_mode or "").strip().lower()
+                        not in ("all", "alle") else "")
+            if use_mode:
+                mode_keys = base.get("keys_by_service_mode", {}).get(
+                    service, {}).get(use_mode) or set()
+                keys = sorted(k for k in bucket.keys() if k in mode_keys)
+            else:
+                keys = sorted(bucket.keys())
             if numeric_only:
                 keys = [k for k in keys if bucket[k] == {"num"}]
             if keys:
