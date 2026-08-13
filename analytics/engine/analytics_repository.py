@@ -27,7 +27,7 @@ Weiteres unveraendert bestehen (genutzt vom Legacy-StatisticWindow); dieses
 Repository ist der Ersatz fuer die neue Analytics-UI (15.03).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -285,6 +285,18 @@ class AnalyticsRepository:
         if use_agg in ("avg", "sum", "min", "max"):
             if use_field not in avail_filtered:
                 use_field = avail_filtered[0] if avail_filtered else ""
+        # 21.03.20-Bugfix 3: Fehlende Registry-Modi als Achsenpunkte -
+        # NUR bei deaktivem Modus-Filter (alle Modi); bei konkretem
+        # service_mode filtert die WHERE-Bedingung auf genau diesen
+        # Modus und die Achse bleibt darauf begrenzt.
+        extra_service_modes = None
+        if str(service_mode or "").strip().lower() in ("", "all", "alle"):
+            try:
+                extra_service_modes = sorted(
+                    self._registry_service_mode_pairs(
+                        feature_ids, feature_id))
+            except Exception:
+                extra_service_modes = None
         try:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
@@ -294,6 +306,7 @@ class AnalyticsRepository:
                 bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
                 field_pairs=field_pairs,
                 service_mode=service_mode,
+                extra_service_modes=extra_service_modes,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -563,7 +576,69 @@ class AnalyticsRepository:
         """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung)."""
         return self.reader.get_available_timeframes(symbol)
 
+    @staticmethod
+    def _registry_service_mode_pairs(
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """'{feature_id}::{mode}'-Kombinationen der aktiven Services.
+
+        21.03.20-Bugfix 2/3: Liest parameter_schema["mode"]["options"]
+        der gewaehlten Services (PluginRegistry-Singleton, in-Memory).
+        Leere feature_ids = alle Services (Multi-Modus-faehige Plugins
+        tragen einen "mode"-Key mit nicht-leeren options). Format
+        `{plugin_id.lower()}::{mode}` (case-originaler Modus) - deckungs-
+        gleich mit der service_id-Achsen-Expression des Readers. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv abgefangen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return set()
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Set[str] = set()
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "parameter_schema", None) or {}
+                mode_cfg = schema.get("mode") or {}
+                options = [str(o).strip() for o in (mode_cfg.get("options")
+                                                    or []) if str(o).strip()]
+                if options:
+                    pid_l = str(pid).strip().lower()
+                    for m in options:
+                        out.add(f"{pid_l}::{m}")
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _registry_source_modes(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """Mogliche source_mode-Werte der aktiven Services (Registry).
+
+        21.03.20-Bugfix 2: UNION-Quelle fuer das Modus-Dropdown (alle
+        waehlbaren Modi statt nur der DB-geschriebenen). Abgeleitet aus
+        `_registry_service_mode_pairs` (eine Registry-Sammlung).
+        """
+        pairs = cls._registry_service_mode_pairs(feature_ids, feature_id)
+        modes: Set[str] = set()
+        for p in pairs:
+            if "::" in p:
+                modes.add(p.split("::", 1)[1])
+        return modes
+
     def get_available_features(
+
         self,
         symbol: str,
         timeframe: str,
@@ -608,8 +683,25 @@ class AnalyticsRepository:
                     instance_hashes=instance_hashes))
         except Exception:
             source_modes, has_sm = [], False
-        result["source_modes"] = source_modes
-        result["has_source_mode_services"] = has_sm
+        # 21.03.20-Bugfix 2: UNION der Registry-Modi. Die DB-geschriebenen
+        # source_mode-Werte decken nur die tatsaechlich ausgefuehrten Modi
+        # ab (meist der Default); parameter_schema["mode"]["options"] der
+        # aktiven Services enthaelt ALLE moeglichen Modi (z. B. Swing
+        # Momentum: MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet).
+        # Das Modus-Dropdown zeigt damit alle waehlbaren Modi; ein noch
+        # nicht berechneter Modus liefert bei Auswahl konsistent leere
+        # Zellen (Entscheidung 3, kein Crash). In-Memory-Registry-Singleton
+        # (Worker-Thread, kein DB-Roundtrip).
+        registry_modes = self._registry_source_modes(feature_ids)
+        if registry_modes:
+            merged = list(dict.fromkeys(
+                [str(m) for m in (source_modes or [])]
+                + sorted(registry_modes)))
+            result["source_modes"] = merged
+        else:
+            result["source_modes"] = source_modes
+        result["has_source_mode_services"] = bool(
+            has_sm or registry_modes)
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(

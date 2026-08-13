@@ -1622,6 +1622,13 @@ class AnalyticsViewModel(QObject):
         key = str(plugin_id or "").strip()
         if not key:
             return ""
+        # 21.03.20-Bugfix 3: Die service_id-Dimension traegt seit dem
+        # Modus-Split '{service_id}::{source_mode}' (leerer Suffix =
+        # Service ohne source_mode). Den Modus abspalten und als
+        # ' / {Modus}' anhaengen (nur bei nicht-leerem Wert).
+        mode_suffix = ""
+        if "::" in key:
+            key, mode_suffix = key.split("::", 1)
         model = self._selector_model
         if model is None:
             from analytics.engine.service_selector_model import ServiceSelectorModel
@@ -1630,17 +1637,19 @@ class AnalyticsViewModel(QObject):
         try:
             plugin = model.get_plugin(key)
             if plugin is None:
-                return key
-            meta = getattr(plugin, "metadata", {}) or {}
-            name = str(meta.get("display_name") or key)
-            if name.lower().startswith("srv_"):
-                name = name[4:]
-            category = str(model.plugin_category_path(key) or "")
-            if category:
-                return f"{category} / {name}"
-            return name
+                label = key
+            else:
+                meta = getattr(plugin, "metadata", {}) or {}
+                name = str(meta.get("display_name") or key)
+                if name.lower().startswith("srv_"):
+                    name = name[4:]
+                category = str(model.plugin_category_path(key) or "")
+                label = f"{category} / {name}" if category else name
+            if mode_suffix:
+                label = f"{label} / {mode_suffix}"
+            return label
         except Exception:
-            return key
+            return key + (f" / {mode_suffix}" if mode_suffix else "")
 
     def resolve_service_display_name(self, plugin_id: str,
                                      preset_name: Optional[str] = None,

@@ -93,7 +93,18 @@ DIM_MAPPINGS = {
     "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "timeframe": "LOWER(timeframe)",
-    "service_id": "LOWER(feature_id)",
+    # 21.03.20-Bugfix 3: Die Service-Achse splittet je
+    # (feature_id, source_mode)-Kombination - ein Multi-Modus-Service
+    # (z. B. Swing Momentum mit 3 Modi) belegt bei \"alle Modi\" drei
+    # Achsenpunkte. Services ohne source_mode erhalten den leeren
+    # Modus-Suffix (\"srv_x::\"); das Widget/VM-Resolver zeigt nur bei
+    # nicht-leerem Modus \"Service / Modus\" an. Der Modus-Filter
+    # (service_mode) schraenkt die Rows VOR der Aggregation ein -
+    # bei konkretem Modus bleibt genau ein Achsenpunkt je Service.
+    "service_id": (
+        "LOWER(feature_id) || '::' || COALESCE("
+        "json_extract_string(feature_data, '$.source_mode'), '')"
+    ),
     "symbol": "LOWER(symbol)",
 }
 
@@ -1123,6 +1134,11 @@ class FeatureStoreReader:
         # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
         # Multi-Modus-Services (None/"all"/leer = kein Filter).
         service_mode: Optional[str] = None,
+        # 21.03.20-Bugfix 3: optionale '{feature_id}::{mode}'-Kombinationen
+        # der aktiven Services (Registry) - die service_id-Achse zeigt
+        # damit auch noch nicht berechnete Modi als leere Achsenpunkte
+        # (nur bei deaktivem Modus-Filter; leere Liste = kein Effekt).
+        extra_service_modes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -1300,6 +1316,19 @@ class FeatureStoreReader:
         # Sortierwerte begrenzen (bei date = die neuesten Datumswerte).
         x_values = sorted({r[0] for r in rows})
         y_values = sorted({r[1] for r in rows})
+        # 21.03.20-Bugfix 3: fehlende (Service, Modus)-Kombinationen
+        # aus der Registry ergaenzen (nur service_id-Dimension, leere
+        # Zellen = fill). Der Modus-Filter schraenkt Rows VOR der
+        # Aggregation ein - bei konkretem Modus bleibt die Achse auf
+        # diesen Modus begrenzt (keine Registry-Ergaenzung noetig).
+        if extra_service_modes and (x_key == "service_id"
+                                    or y_key == "service_id"):
+            extra = {str(e) for e in extra_service_modes if str(e).strip()}
+            if extra:
+                if x_key == "service_id":
+                    x_values = sorted(set(x_values) | extra)
+                if y_key == "service_id":
+                    y_values = sorted(set(y_values) | extra)
         if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
             max_x = max(1, MAX_HEATMAP_CELLS // max(1, len(y_values)))
             x_keep = set(x_values[-max_x:])

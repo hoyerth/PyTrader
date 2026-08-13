@@ -673,9 +673,15 @@ class HeatmapWidget(QWidget):
         ctrl2.addWidget(QLabel("Modus:"))
         ctrl2.addWidget(self._combo_mode_filter)
         ctrl2.addSpacing(10)
+        # 21.03.20-Bugfix 1: Werteanzeige (_label_info) UEBER dem
+        # Feld-Dropdown platzieren - die Zeile bleibt ruhiger, weil
+        # das Label nicht mehr rechts am Ende wackelt; 'Feld'
+        # (Stretch 1) waechst bis zum Ende des Canvas.
         ctrl2.addWidget(QLabel("Feld:"))
-        ctrl2.addWidget(self._combo_field, 1)
+        ctrl2.addSpacing(6)
         ctrl2.addWidget(self._label_info)
+        ctrl2.addSpacing(6)
+        ctrl2.addWidget(self._combo_field, 1)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
