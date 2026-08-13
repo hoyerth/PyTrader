@@ -113,6 +113,14 @@ class HeatmapPage(QWidget):
         self._stack_modes.addWidget(self._standard_ui)
         self._stack_modes.addWidget(self._generic)
         lay.addWidget(self._stack_modes)
+        # 13.08.2026 (Bugfix, User-Meldung 'Heatmap wird nicht gezeigt'):
+        # Die Basis-Ansicht ist seit 21.01 IMMER das generische Widget
+        # (Stack Seite 1). set_mode()/_on_mode_changed() setzen Seite 1
+        # ebenfalls, aber ohne diesen Initial-Switch blieb beim frischen
+        # Start (kein Workspace-Restore mit heatmap_mode) die unsichtbare
+        # Legacy-Standard-UI (Index 0) aktiv -> generische Heatmap nie
+        # dargestellt und ihre Controls nicht bedienbar.
+        self._stack_modes.setCurrentIndex(1)
 
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
@@ -262,7 +270,11 @@ class HeatmapPage(QWidget):
         )
         matrix = np.asarray(data.get("matrix"), dtype=float)
         if matrix.size == 0:
-            self._stack.setCurrentIndex(1)
+            # 13.08.2026 (Bugfix): Die Standard-Ansicht (dow x hour) ist
+            # seit 21.01 NICHT mehr sichtbar (Stack zeigt immer das
+            # generische Widget). Ihr Datenstand darf die Seiten-
+            # Sichtbarkeit nicht mehr steuern - sonst verdeckt das
+            # No-Data-Overlay das generische Widget (nicht anklickbar).
             return
         self._render(matrix)
         self._stack.setCurrentIndex(0)
