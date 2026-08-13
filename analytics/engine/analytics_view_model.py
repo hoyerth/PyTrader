@@ -708,8 +708,14 @@ class AnalyticsViewModel(QObject):
 
         Chronologische Lichtsaeulen zeitgleicher Signale (Hauptansicht).
         Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        21.03.21 (Hotspot-Orchestrierung): Der Preset setzt den
+        Modus-Filter auf `"all"` zurueck - Confluence/Hotspots sind
+        die Haeufung ueber ALLE Modi hinweg (Kapitel §3.2-Standard).
+        Idempotent: `set_service_mode("all")` ist ein early-return,
+        wenn kein Modus-Filter aktiv ist.
         """
         self._set_heatmap_all_timeframes(False)
+        self.set_service_mode("all")
         self.set_heatmap_config("date", "service_id", "", "confluence_count")
 
     def apply_smart_preset_session(self) -> None:

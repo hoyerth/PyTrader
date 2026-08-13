@@ -211,3 +211,9 @@ In `apply_smart_preset_confluence()` VOR `set_heatmap_config(...)` ergänzen:
 ## 4. Implementierungs-Log (Doku-Teil, erledigt)
 
 - **13.08.2026 20:06:** Kapitel 21.03.21 gründlich gegen den Ist-Stand analysiert (Review-Tabelle); Entscheidungsprotokoll + Umsetzungs-Spezifikation (Schritt A/B) in `docs/AKTUELLE_UMSETZUNG.md` dokumentiert; Git-Commit `phase21_step1` gesetzt. **Kein Coding ausgeführt** – Umsetzung wartet auf den manuellen Startbefehl des Anwenders.
+- **13.08.2026 20:35 (Umsetzung, manueller Startbefehl):**
+  - **Schritt A:** `apply_smart_preset_confluence()` in `analytics/engine/analytics_view_model.py` setzt jetzt VOR der Heatmap-Konfiguration `set_service_mode("all")` – Confluence-Preset resetet den Modus-Filter auf „Alle Modi" (idempotent, early-return bei bereits `"all"`). Docstring ergänzt (21.03.21 Hotspot-Orchestrierung).
+  - **Schritt B:** AK2-Headless-Test in `test/test.py` (Block „37 k1/k2"): Temp-`analytics.duckdb` im `test/`-Ordner mit 2 Services × 2 Modi (`source_mode` top-level) auf derselben Bar → `service_mode="all"` liefert Zellwert `4.0`, `service_mode="ModeA"` liefert `2.0`.
+  - **Validierung (headless, `.venv`):** `py_compile` beider Dateien OK; `test/test.py` → `[PASS] 37 k1` + `[PASS] 37 k2`. Übrige FAILs im Harness sind vorbestehende Schema-Diskrepanzen (Test-Tabellen ohne `instance_hash`-Spalte, „Binder Error") in unveränderten Code-Pfaden (Tests 32/36/20.03.02/20.03.03/39/37 e1/g1/g2/j1) – nicht durch diese Änderung verursacht.
+  - Git-Commit `phase21_step2` (Umsetzung) gesetzt.
+
