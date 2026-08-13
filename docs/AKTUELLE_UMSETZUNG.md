@@ -1627,3 +1627,36 @@ def _on_mode_filter_changed(self) -> None:
 
 - **Kein Coding:** Es wurden keine Quelldateien geaendert (nur dieses Doku-Log). Die Umsetzung erfolgt nach explizitem Anwender-Startschuss.
 - **Commit:** Doku-Log (einziger Content dieses Commits)
+
+# Implementierungs-Log 21.03.20 - Umsetzung Punkte 1-8 (F1-F8) (13.08.2026)
+
+- **Stand:** Umgesetzt nach Anwender-Startschuss; Analyse & Entscheidungen siehe voriger Eintrag (F1-F8).
+
+- **Punkt 1 - MA_Slope_Change: a) Achse, b) Parameter-Dropdown (F1):**
+  - `analytics/engine/analytics_repository.py` `get_generic_heatmap`: `extra_service_modes` wird jetzt AUCH bei konkretem Modus-Filter ergaenzt - die Registry-Paare werden auf den gewaehlten Modus gefiltert (`p.rsplit("::",1)[1].lower() == mode_key`). Vorher blieb die service_id-Achse bei konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt (MA_Slope_Change erzeugte keinen Achsenpunkt).
+  - **P1b+P8:** `service_mode` wird jetzt an `_field_metadata` DURCHgereicht - vorher fehlte er im QUERY_HEATMAP_GENERIC-Payload und ueberschrieb damit die modus-gefilterte Feld-Liste aus QUERY_FEATURES (Parameter-Box zeigte die falschen/ungefilterten Keys). Identischer Root Cause wie Punkt 8.
+
+- **Punkt 2 - Legende (F2):** `_update_legend` (analytics/ui/heatmap_widget.py): Viridis-Labels auf `<= v25`, `>= v25`, `>= v50`, `>= v75`, `>= vmax` umgestellt (Operator VOR der Zahl, kein `x`). Confluence bleibt `= 0`...`= 4`, `>= 5` (unveraendert).
+
+- **Punkt 3 - Timeframes sortiert fein->grob (F3):**
+  - `analytics/engine/feature_store_reader.py`: neue Konstante `CANONICAL_TIMEFRAME_ORDER` (M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1) + Helfer `canonical_tf_sort()` (unbekannte TFs deterministisch am Ende, None/leer defensiv). `fetch_service_tf_status` UND `get_available_timeframes` liefern kanonisch sortiert statt `ORDER BY timeframe` (alphabetisch: D1,H1,H4,M1,...).
+  - `serviceui/common_widgets.py` (`TfStatusBadgeBar`): zusaetzliche DEFENSIVE kanonische Sortierung in `update_status`/`_rebuild` (`_sort_tfs_canonical`) - deckt die Pill-Strips aller drei Fenster (AnalyticsWindow, ServicePicker, ServiceWindow) ab.
+
+- **Punkt 4 - Feld-Dropdown genau ein angehaktes Feld (F4):** `_on_field_selection_changed` (heatmap_widget.py): das AKTIVE Feld wird vor der XOR-Reconciliation gemerkt; wird es abgehakt, zieht `_sync_field_current_after_checks` die Auswahl auf das naechste angehakte Feld nach und `_apply_config()` wird explizit nachgezogen (Refresh der Aggregations-/Anzeige-Auswahl).
+
+- **Punkt 5 - Unsinnig hohe Legendenwerte (F5):** Neue Helfer `_is_price_like_key()` + `_PRICE_LIKE_KEY_HINTS` (price, *price, reference_price, vwap_lower, atr_value, lower_band, lower_level, prox_level*) in heatmap_widget.py. `_update_controls`: das SUM-Item des Aggregations-Dropdowns wird fuer preisartige Felder DEAKTIVIERT; ist SUM gerade aktiv und das Feld preisartig, wird implizit auf AVG gewechselt. Signal-Felder (strength_value) bleiben erlaubt.
+
+- **Punkt 6 - MasterTree: Modus im Namen + Tooltip (F6):** Neuer Helper `MasterTree._mode_suffix(plugin_id, params)` (nur bei >1 'mode'-Option im `parameter_schema`; Modus aus params bzw. Schema-Default; rein lesend, defensiv leer):
+  - Set-Service-Zeile: `swing_momentum [MA_Peak_Hysteresis] (13.08.26)`
+  - Plugin-Zeile (ohne Clones): `swing_momentum [MA_Peak_Hysteresis] (13.08.26)`
+  - Clone-Zeile: `🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)` (ID/#hash bleibt entfernt)
+  - `_apply_badge` erhaelt `params`-Parameter und zeigt den Modus zusaetzlich im Tooltip (F6c).
+
+- **Punkt 7 - Ausfuehrung: Modus aus Parameterbox (F7, Wurzel von Bug 4):** Neue Methode `_merge_live_param_values(definition)` (serviceui/service_selector_dialog.py): liest die LIVE-Control-Werte der aktuellen Parameterbox (`_service_param_controls`/`_ctrl_value` von `_param_host`) und merged sie VOR dem Run in die Run-Definition (nur fuer diesen Run, KEINE Persistenz). Match: exakte instance_id (Set-Service/Standalone); bei Clone-Runs (instance_id = '<pid>#<hash>') per plugin_id, nur wenn genau EIN Service matcht (mehrdeutig = keine Uebernahme). Aufgerufen in `_on_run_service`, `_on_run_set` und `_on_run_plugin` - inkl. Modus (vorher lief der Picker-Run mit default_params -> erstem Mode-Eintrag; MA_Slope_Change landete nie im feature_store).
+
+- **Verifikation (headless, keine UI):**
+  - `py_compile` aller 6 geaenderten Quelldateien + Testdatei OK.
+  - `test/check_punkte_1_8.py` (9 Checks): canonical_tf_sort, _sort_tfs_canonical, _is_price_like_key, Repo extra_service_modes konkret/all/None + service_mode-Durchreichung an _field_metadata (Mock-Reader), _mode_suffix (3-Modi/Default/Ein-Modus/unbekannt), P7-Merge in allen 3 Run-Pfaden, P4-/P2-Source-Checks - ALLE PASS.
+  - Bestehende Tests gruen: `check_bugfix_2132.py` (8), `check_bugfix_2132b.py` (17), `check_bugfix_2132_label.py` (5), `check_bugfix_2132_layout.py` (8), `check_mode_filter_worker.py` (6), `check_mode_filter_vm.py` (11), `check_mode_filter_widget.py` (10), `check_mode_filter_db.py` (25).
+  - P3 gegen echte DB (read-only): `fetch_service_tf_status('srv_swing_momentum')` liefert M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1 (kanonisch); `get_available_timeframes('SILVER')` ebenfalls.
+- **Commit:** 9214f00
