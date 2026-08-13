@@ -363,6 +363,18 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.main_splitter.setSizes([460, 820])
 
             self.top_row.addWidget(self.main_splitter)
+            # 21.03.22 (Full Market-Data Sync Button): Rechtsbuendig im
+            # top_row-Header den Full-Sync-Button platzieren. Er aktualisiert
+            # ALLE in market_data.duckdb gespeicherten Symbol:TF-Paare und
+            # pausiert waehrenddessen den 45s-Auto-Sync (Concurrency-Guard).
+            self.btn_sync_all_market = QPushButton("🔄 Sync Alle Daten")
+            self.btn_sync_all_market.setToolTip(
+                "Aktualisiert ALLE in market_data.duckdb gespeicherten "
+                "Symbol:Timeframe-Paare aus MT5."
+            )
+            self.top_row.addStretch(1)
+            self.top_row.addWidget(self.btn_sync_all_market)
+            self._sync_worker = None
             self.central_layout.insertLayout(idx, self.top_row)
         # Fenstergroesse (15.02): 1280 x 800 als Default – Single Source of
         # Truth ist die ui/service_win.ui-Geometrie (der QUiLoader wendet sie
@@ -409,6 +421,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
         if self.btn_trash_sets:
             self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
+        # 21.03.22 (Full Market-Data Sync Button): Manueller Full-Sync aller
+        # gespeicherten Symbol:TF-Paare (Concurrency-Guard pausiert den
+        # 45s-sync_timer waehrend des Laufs).
+        if self.btn_sync_all_market:
+            self.btn_sync_all_market.clicked.connect(
+                self._on_sync_all_market_clicked)
         # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste (Speichern /
         # Speichern & Ausführen) – siehe _save_params_from_panel /
         # _save_and_run_from_panel.
@@ -1651,6 +1669,51 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                                 h = None
                         return pid, h
         return (str(service_id) if service_id else None), None
+
+    # -------------------------------------------------------------------------
+    # Phase 21.03.22: Full Market-Data Sync Button (alle Paare aktualisieren)
+    # -------------------------------------------------------------------------
+
+    @Slot()
+    def _on_sync_all_market_clicked(self) -> None:
+        """Startet den Full-Sync aller in market_data.duckdb vorhandenen Symbol:TF-Paare."""
+        _worker = getattr(self, "_sync_worker", None)
+        if _worker is not None and _qt_valid(_worker) and _worker.isRunning():
+            return
+
+        from repositories.market_data_repository import MarketDataRepository
+        all_pairs = MarketDataRepository().get_all_stored_symbol_tf_pairs()
+
+        if not all_pairs:
+            return
+
+        # 45s-Auto-Sync pausieren via Concurrency-Guard (EventBus, IoC)
+        from config.event_bus import event_bus
+        event_bus.service_run_started.emit()
+
+        self.btn_sync_all_market.setEnabled(False)
+        self.btn_sync_all_market.setText("⏳ Sync läuft...")
+
+        from workers.data_sync_worker import DataSyncWorker
+        self._sync_worker = DataSyncWorker(pairs=all_pairs, parent=self)
+        self._sync_worker.sync_completed.connect(self._on_sync_all_completed)
+        self._sync_worker.finished.connect(self._sync_worker.deleteLater)
+        self._sync_worker.start()
+
+    @Slot(set)
+    def _on_sync_all_completed(self, updated_pairs: set) -> None:
+        """Nach Abschluss des Full-Syncs: Auto-Sync fortsetzen & UI refreshen."""
+        from config.event_bus import event_bus
+        event_bus.service_run_finished.emit()
+
+        self.btn_sync_all_market.setEnabled(True)
+        self.btn_sync_all_market.setText("🔄 Sync Alle Daten")
+
+        self._refresh_badge_bar()
+        if hasattr(self, "service_selector"):
+            self.service_selector.refresh()
+        # Nach deleteLater (finished-Signal) keine stale C++-Referenz halten.
+        self._sync_worker = None
 
     def _refresh_badge_bar(self, plugin_id: Optional[str] = None,
                            instance_hash: Optional[str] = None) -> None:

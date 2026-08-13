@@ -16,7 +16,7 @@ db/schema_initializer (check_and_init_databases).
 
 import threading
 import time
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import duckdb
 import pandas as pd
@@ -122,27 +122,50 @@ def get_latest_timestamp(con: duckdb.DuckDBPyConnection, symbol: str, timeframe_
     return res[0] if res and res[0] is not None else None
 
 
-def sync_market_data() -> Set[Tuple[str, str]]:
-    """Synchronisiert die MT5-Historie (VOLLIMPORT oder UPDATE) je Symbol/Timeframe."""
+def sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None) -> Set[Tuple[str, str]]:
+    """Synchronisiert die MT5-Historie (VOLLIMPORT oder UPDATE) je Symbol/Timeframe.
+
+    Phase 21.03.22 (Full Market-Data Sync Button): Optionaler `target_pairs`-
+    Filter. Ist das Set uebergeben (nicht None), werden exakt diese
+    (symbol, timeframe)-Paare synchronisiert (statt des Standard-Rasters);
+    bei None/leer greift der Fallback auf das bisherige Standard-Raster
+    (SYMBOLS x get_timeframes()). Der Delta-Sync-Abgleich via
+    get_latest_timestamp() bleibt pro Paar voll erhalten.
+    """
     import MetaTrader5 as _mt5
     timeframes = get_timeframes()
 
     check_and_init_databases()
     check_mt5_connection()
 
-    print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(SYMBOLS)} über {len(timeframes)} Timeframes...")
+    # 21.03.22: Paar-Filter (UPPER-normalisiert, unbekannte Timeframes
+    # werden ignoriert); None/leer -> Standard-Raster (Abwaertskompatibilitaet).
+    filtered_pairs: Optional[Set[Tuple[str, str]]] = None
+    symbols_to_sync: List[str] = list(SYMBOLS)
+    if target_pairs:
+        filtered_pairs = {
+            (str(s).upper(), str(tf).upper())
+            for s, tf in target_pairs
+            if str(tf).upper() in timeframes
+        }
+        symbols_to_sync = sorted({s for s, _ in filtered_pairs})
+
+    print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(symbols_to_sync)} über {len(timeframes)} Timeframes...")
 
     start_time_total = time.perf_counter()
     total_bars_downloaded = 0
     updated_pairs: Set[Tuple[str, str]] = set()
 
-    for symbol in SYMBOLS:
+    for symbol in symbols_to_sync:
         print(f"\n--- Synchronisiere {symbol} ---")
         # Connection pro Symbol öffnen/schließen, damit andere Threads (LiveTickWorker)
         # zwischendurch ebenfalls auf die DB zugreifen können
         con = db_connect(DB_MARKET_DATA)
         try:
             for tf_str, tf_mt5 in timeframes.items():
+                # 21.03.22: Bei target_pairs-Filter exakt diese Paare abgleichen.
+                if filtered_pairs is not None and (symbol, tf_str) not in filtered_pairs:
+                    continue
                 tf_start = time.perf_counter()
 
                 last_time = get_latest_timestamp(con, symbol, tf_str)

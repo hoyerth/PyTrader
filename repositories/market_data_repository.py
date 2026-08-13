@@ -10,7 +10,7 @@ Custom-Level-Eingabefelder). Importiert nur db/db_pool (E4).
 
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from db.db_pool import DB_MARKET_DATA, DbPool, db_connect
 
@@ -165,3 +165,23 @@ class MarketDataRepository:
                     time.sleep(0.1)
 
         return candles, precision
+
+    def get_all_stored_symbol_tf_pairs(self) -> Set[Tuple[str, str]]:
+        """Liefert alle (symbol, timeframe)-Paare, für die bereits Daten in ohlcv_bars existieren.
+
+        Phase 21.03.22 (Full Market-Data Sync Button): Grundlage fuer den
+        manuellen Sync aller lokal gespeicherten Paare im ServiceWindow.
+        UPPER-normalisiert (DISTINCT); Muster: DbPool.get (Thread-local,
+        kein manuelles close(), konsistent mit get_symbol_precision).
+        """
+        try:
+            con = DbPool.get(self.db_path)
+            rows = con.execute("""
+                SELECT DISTINCT UPPER(symbol), UPPER(timeframe)
+                FROM ohlcv_bars
+                WHERE symbol IS NOT NULL AND timeframe IS NOT NULL
+            """).fetchall()
+            return {(str(r[0]), str(r[1])) for r in rows if r[0] and r[1]}
+        except Exception as e:
+            print(f"WARN [MarketDataRepository] Pair-Abfrage fehlgeschlagen: {e}")
+            return set()
