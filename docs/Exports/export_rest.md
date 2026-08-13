@@ -1049,9 +1049,12 @@ from analytics.engine.mtf_fc_confluence import WEIGHTS
 MTF_FC_SCHEMA_VERSION = "1.0.0"
 
 #: Bekannte Template-Keys (Whitelist für die Migration).
+# 21.03.15 (Bug 4): `custom_range` ist entfallen (das benutzerdefinierte
+# Von-/Bis-Panel des MtfFilterBarWidget wurde entfernt) - Alt-Templates mit
+# diesem Key verlieren ihn bei der Migration (Whitelist-Semantik).
 _TEMPLATE_KNOWN_KEYS = (
-    "mtf_fc_schema_version", "name", "data_tf", "chart_tf",
-    "range_preset", "custom_range", "sort_mode", "session_filters",
+    "mtf_fc_schema_version", "name", "data_tf", "chart_tf", "agg_tf",
+    "range_preset", "sort_mode", "session_filters",
     "confluence_weighting", "volatility_adaption", "view_templates_meta",
 )
 
@@ -1059,8 +1062,9 @@ _TEMPLATE_KNOWN_KEYS = (
 _TEMPLATE_DEFAULTS: Dict[str, Any] = {
     "data_tf": "multi",
     "chart_tf": "auto",
+    # 21.03.12 (Entscheidung 6a): Aggregations-TF ('auto' oder konkreter TF).
+    "agg_tf": "auto",
     "range_preset": "7d",
-    "custom_range": {"from_ts": None, "to_ts": None},
     "sort_mode": "date",
     "session_filters": [],
     "confluence_weighting": dict(WEIGHTS),
@@ -1111,7 +1115,7 @@ def migrate_template(raw: Any) -> Dict[str, Any]:
             # Pflicht-Keys existieren (defensive Ergänzung, non-destruktiv).
             for key, default in _TEMPLATE_DEFAULTS.items():
                 result.setdefault(key, default)
-            return result
+            return _normalize_obsolete(result)
 
         # 1) Fehlende Schema-Keys mit Defaults ergänzen.
         for key, default in _TEMPLATE_DEFAULTS.items():
@@ -1125,13 +1129,32 @@ def migrate_template(raw: Any) -> Dict[str, Any]:
 
         # 3) Schema-Version anheben.
         result["mtf_fc_schema_version"] = MTF_FC_SCHEMA_VERSION
-        return result
+        return _normalize_obsolete(result)
     except MigrationError:
         raise
     except TemplateError:
         raise
     except Exception as e:
         raise TemplateError(f"Template-Migration fehlgeschlagen: {e}") from e
+
+
+def _normalize_obsolete(result: Dict[str, Any]) -> Dict[str, Any]:
+    """21.03.15 (Bug 3/4): Obsolete Keys/Werte bereinigen (non-destruktiv).
+
+    * `custom_range` (entfallenes Von-/Bis-Panel des MtfFilterBarWidget)
+      wird entfernt - Alt-Templates verlieren den Key auch dann, wenn ihre
+      Schema-Version bereits aktuell ist (sonst bliebe er im
+      Nicht-Migrationspfad erhalten).
+    * Alt-Preset-Werte 'YTD'/'Benutzerdefiniert' werden auf den neuen
+      Preset-Satz (24h/7d/30d/90d/Year) abgebildet.
+    """
+    result.pop("custom_range", None)
+    preset = str(result.get("range_preset") or "").strip() or None
+    if preset == "YTD":
+        result["range_preset"] = "Year"
+    elif preset == "Benutzerdefiniert":
+        result["range_preset"] = "7d"
+    return result
 
 
 class MtfFcTemplateStore:

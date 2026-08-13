@@ -1849,6 +1849,25 @@ _STYLE_ERROR = ("background-color: #b04343; color: #ffffff; "
 _STYLE_HINT = ("background-color: #2c3e2c; color: #9fcf9f; "
                "border-radius: 3px; border: 1px solid #4a7a4a;")
 
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# die Pill-Badges. Die Reader-Rueckgabe (fetch_service_tf_status) ist seit
+# 13.08.2026 bereits kanonisch sortiert; diese Sortierung sichert das
+# Widget zusaetzlich DEFENSIV gegen unsortierte Alt-Daten/Test-Aufrufer ab.
+_TF_CANONICAL_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def _sort_tfs_canonical(tfs: list) -> list:
+    """Kanonische TF-Reihenfolge (unbekannte TFs am Ende, alphabetisch)."""
+    order = {tf: i for i, tf in enumerate(_TF_CANONICAL_ORDER)}
+    return sorted(
+        (str(t) for t in (tfs or [])
+        if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(str(tf).upper(), 10 ** 6), str(tf)),
+    )
+
 
 class TfStatusBadgeBar(QWidget):
     """Pill-Badges je Timeframe eines Services (21.01b, Schritt 2).
@@ -1898,10 +1917,15 @@ class TfStatusBadgeBar(QWidget):
         for extra in self._errors:
             if extra not in known_tfs:
                 known_tfs.append(extra)
-        self._rebuild(known_tfs)
+        # 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob).
+        self._rebuild(_sort_tfs_canonical(known_tfs))
 
     def _rebuild(self, tfs: list) -> None:
         """Erzeugt/entfernt Badge-Labels so, dass `tfs` angezeigt werden."""
+        # 13.08.2026 (Punkt 3, F3): Defensive kanonische Sortierung - das
+        # Widget rendert TFs unabhaengig von der Aufrufer-Reihenfolge
+        # korrekt (fein -> grob).
+        tfs = _sort_tfs_canonical(tfs)
         wanted = set(tfs)
         # Entfernen nicht mehr benoetigter Badges
         for tf in list(self._labels.keys()):
@@ -2557,7 +2581,10 @@ class MasterTree(QTreeWidget):
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "")
             last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
-            svc_label = f"{svc.get('instance_id')} ({last_exec})"
+            # 13.08.2026 (Punkt 6, F6): Modus-Suffix am Service-Namen
+            # (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)').
+            mode_sfx = self._mode_suffix(plugin_id, svc.get("params"))
+            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
             svc_archived = bool(svc.get("is_archived"))
@@ -2603,11 +2630,53 @@ class MasterTree(QTreeWidget):
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
-            self._apply_badge(svc_item, plugin_id, svc.get("badge") or "")
+            self._apply_badge(
+                svc_item, plugin_id, svc.get("badge") or "",
+                params=svc.get("params"))
             set_item.addChild(svc_item)
         if self._checkable:
             self._apply_set_state(set_item)
         return set_item
+
+    @staticmethod
+    def _mode_suffix(plugin_id: str,
+                     params: Optional[Dict[str, Any]] = None) -> str:
+        """'[{Modus}]'-Suffix fuer MasterTree-Labels (13.08.2026, Punkt 6, F6).
+
+        Nur fuer Multi-Modus-Services: parameter_schema['mode']['options']
+        enthaelt MEHR ALS EINEN Eintrag (z. B. srv_swing_momentum mit
+        MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet). Ein-
+        Modus-Services bleiben ohne Suffix (kein Rauschen im Baum). Der
+        Modus kommt aus den params der Instanz (Clone/Set-Service) bzw.
+        aus dem Schema-Default (flache Plugin-Zeile ohne eigene params).
+        Rein lesend (PluginRegistry-Singleton), Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+            plugins = getattr(reg, "plugins", None) or {}
+            pid_l = str(plugin_id or "").strip().lower()
+            plugin = None
+            for k, v in plugins.items():
+                if str(k).strip().lower() == pid_l:
+                    plugin = v
+                    break
+            if plugin is None:
+                return ""
+            schema = getattr(plugin, "parameter_schema", None) or {}
+            mode_cfg = schema.get("mode") or {}
+            options = [str(o).strip() for o in (mode_cfg.get("options") or [])
+                       if str(o).strip()]
+            if len(options) <= 1:
+                return ""
+            mode = ""
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode:
+                mode = str(mode_cfg.get("default") or "").strip()
+            return f" [{mode}]" if mode else ""
+        except Exception:
+            return ""
 
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
@@ -2628,7 +2697,11 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        plugin_label = display_pid if clones else f"{display_pid} ({last_exec})"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an flachen Plugin-Zeilen
+        # (Plugins MIT Clones zeigen den Modus an den Clone-Zeilen).
+        mode_sfx = "" if clones else self._mode_suffix(pid, None)
+        plugin_label = (display_pid if clones
+                        else f"{display_pid}{mode_sfx} ({last_exec})")
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -2673,16 +2746,22 @@ class MasterTree(QTreeWidget):
         last_exec = str(clone.get("last_execution") or "")
         last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         prefix = "🔹" if archived else "🟢"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
+        # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
+        # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
+        mode_sfx = self._mode_suffix(plugin_id, clone.get("params"))
         clone_item = QTreeWidgetItem(
-            [f"{prefix} {preset_name} ({last_exec})", ""])
+            [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
         clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
         clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
         clone_item.setData(0, ROLE_PRESET_NAME, preset_name)
         if archived:
             clone_item.setData(0, ROLE_ARCHIVED, True)
-        # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
+        # Tooltip: Plugin/Preset + Modus + Parameter + Doc-Log (F6c).
         tooltip = f"Plugin: {plugin_id}\nPreset: {preset_name}"
+        if mode_sfx:
+            tooltip += f"\nModus:{mode_sfx}"
         params = clone.get("params") or {}
         if isinstance(params, dict) and params:
             try:
@@ -2710,7 +2789,8 @@ class MasterTree(QTreeWidget):
         return clone_item
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
-                     badge: str) -> None:
+                     badge: str,
+                     params: Optional[Dict[str, Any]] = None) -> None:
         """Setzt die Darstellung eines Service-/Plugin-Items (Spalte 0/1).
 
         * Spalte 1: KEIN Badge-Text mehr (Bugfix 05.08.2026) – den Platz
@@ -2735,6 +2815,12 @@ class MasterTree(QTreeWidget):
                        else f"im {name}")
         else:
             tooltip = ""
+        # 13.08.2026 (Punkt 6, F6c): Modus auch im Tooltip (falls die
+        # Instanz-Params verfuegbar sind - Set-Service-/Clone-Zeile).
+        mode_sfx = self._mode_suffix(plugin_id, params)
+        if mode_sfx:
+            tooltip = (f"{tooltip}\nModus:{mode_sfx}"
+                       if tooltip else f"Modus:{mode_sfx}")
         item.setToolTip(0, tooltip)
         item.setToolTip(1, tooltip)
 
@@ -7588,6 +7674,52 @@ class ServiceSelectorDialog(QDialog):
         except Exception:
             pass
 
+    def _merge_live_param_values(self, definition: Dict[str, Any]) -> None:
+        """13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox.
+
+        Der Picker-Run nutzt sonst die GESPEICHERTE Set-/Plugin-Definition
+        (set_repo.get_set / variant_run_entries + _plugin_config). Wurden
+        in der Parameterbox Werte geaendert, ohne zu speichern (inkl.
+        Modus), gingen sie bei der Ausfuehrung verloren - Wurzel von Bug 4
+        (MA_Slope_Change landete nie im Store, weil der Run mit
+        default_params -> erstem Mode-Eintrag lief). Hier werden die LIVE-
+        Control-Werte der aktuellen Parameterbox in die Run-Definition
+        uebernommen (nur fuer DIESEN Run, keine Persistenz).
+
+        Match: exakte instance_id (Set-Service/Standalone ohne Presets);
+        bei Clone-Runs (instance_id = '<pid>#<hash>') zusaetzlich per
+        plugin_id, sofern in der Definition genau EIN Service matcht
+        (mehrere Varianten = mehrdeutig, dann keine Uebernahme).
+        """
+        host = getattr(self, "_param_host", None)
+        if host is None:
+            return
+        controls = getattr(host, "_service_param_controls", None) or {}
+        if not controls:
+            return
+        services = definition.get("services") or {}
+        for (iid, key), ctrl in controls.items():
+            cfg = services.get(iid)
+            if not isinstance(cfg, dict):
+                matches = [c for c in services.values()
+                           if isinstance(c, dict)
+                           and str(c.get("plugin_id") or "") == str(iid)]
+                if len(matches) == 1:
+                    cfg = matches[0]
+                else:
+                    continue
+            try:
+                value = host._ctrl_value(ctrl)
+            except (RuntimeError, AttributeError):
+                continue
+            if key == "lookback":
+                try:
+                    cfg["lookback"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                cfg.setdefault("params", {})[key] = value
+
     def _on_run_service(self, set_id: str, service_id: str) -> None:
         """'▶️ Diesen Service ausführen' (Picker-MasterTree)."""
         if not set_id or not service_id:
@@ -7619,6 +7751,11 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox-
+        # Werte (inkl. Modus) vor der Ausfuehrung - sonst liefe der Run mit
+        # der GESPEICHERTEN Definition (Aenderungen ohne Speichern gehen
+        # verloren).
+        self._merge_live_param_values(definition)
         self._start_run_worker(service_id, definition, instance_id=service_id)
 
     def _on_run_set(self, set_id: str) -> None:
@@ -7651,6 +7788,9 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (sichtbare Set-Service-Spalten), bevor das ganze Set laeuft.
+        self._merge_live_param_values(definition)
         self._start_run_worker(set_id, definition, instance_id=None)
 
     def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
@@ -7701,6 +7841,10 @@ class ServiceSelectorDialog(QDialog):
             "execution_order": [e[0] for e in entries],
             "services": {e[0]: e[1] for e in entries},
         }
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (inkl. Modus - Bug 4: der Run nutzte sonst default_params und
+        # lief immer mit dem ersten Mode-Eintrag).
+        self._merge_live_param_values(definition)
         self._start_run_worker(
             plugin_id, definition,
             instance_id=entries[0][0] if single else None)

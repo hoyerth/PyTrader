@@ -57,7 +57,7 @@ Weiteres unveraendert bestehen (genutzt vom Legacy-StatisticWindow); dieses
 Repository ist der Ersatz fuer die neue Analytics-UI (15.03).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -89,6 +89,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
 
@@ -97,7 +104,9 @@ class AnalyticsRepository:
         """
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes, limit=limit)
+            instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -112,6 +121,13 @@ class AnalyticsRepository:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -139,7 +155,9 @@ class AnalyticsRepository:
         use_metric = metric if metric in metrics else "count"
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
-            feature_ids=feature_ids, instance_hashes=instance_hashes
+            feature_ids=feature_ids, instance_hashes=instance_hashes,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode
         )
         result["metrics"] = metrics
         return result
@@ -158,6 +176,8 @@ class AnalyticsRepository:
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> tuple:
         """Verfuegbare Feld-Metriken + Quellen-Zuordnung (Feld-Dropdown).
 
@@ -197,9 +217,28 @@ class AnalyticsRepository:
             # Varianten-Hashes.
             by_service = self.reader.feature_keys_by_service(
                 symbol, timeframe, numeric_only=True,
-                feature_id=feature_id, feature_ids=feature_ids)
+                feature_id=feature_id, feature_ids=feature_ids,
+                service_mode=service_mode)
         except Exception:
             by_service = {}
+        # 21.03.20-Bugfix 3: Modus-Fallback - ist ein Modus gewaehlt, aber
+        # noch nicht in der DB berechnet (leere modus-gefilterte Keys),
+        # werden die nicht-technischen output_schema-Keys der selektierten
+        # Services als Ergebnis-Parameter vorgeschlagen (Param-Box bleibt
+        # nutzbar; der konkrete Modus kann danach berechnet/ausgefuehrt
+        # werden). Muster _registry_service_mode_pairs (Registry, rein
+        # lesend, Fehler defensiv).
+        use_mode = (str(service_mode or "").strip()
+                    if str(service_mode or "").strip().lower()
+                    not in ("all", "alle") else "")
+        if use_mode and not by_service:
+            try:
+                fallback_keys = self._registry_output_keys(
+                    feature_ids, feature_id)
+            except Exception:
+                fallback_keys = {}
+            if fallback_keys:
+                by_service = fallback_keys
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
@@ -242,6 +281,20 @@ class AnalyticsRepository:
         # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
         # (Preset `[📊 Service-Timeframe]`) – wird an den Reader gereicht.
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing) + optionaler Zeitfilter (Wanduhr-Epochs).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer/
+        # None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -268,9 +321,13 @@ class AnalyticsRepository:
         # gecachten Reader-Basis-Scan (EIN DB-Scan; der QUERY_FEATURES-
         # Leichtpfad liefert identische Metadaten OHNE die teure
         # Heatmap-Pivot-Aggregation).
+        # 13.08.2026 (Punkte 1b+8, F1/F8): `service_mode` wird jetzt DURCH-
+        # gereicht - vorher ueberschrieb das QUERY_HEATMAP_GENERIC-Payload
+        # die modus-gefilterte Feld-Liste aus QUERY_FEATURES (die
+        # Parameter-Box zeigte die falschen/ungefilterten Keys).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes, service_mode=service_mode)
         # Numerische Keys aus den Metadaten (ohne count/confluence_count) –
         # Grundlage des E6-Fallbacks fuer Wert-Aggregationen.
         avail_filtered = [m for m in metrics
@@ -283,12 +340,39 @@ class AnalyticsRepository:
         if use_agg in ("avg", "sum", "min", "max"):
             if use_field not in avail_filtered:
                 use_field = avail_filtered[0] if avail_filtered else ""
+        # 21.03.20-Bugfix 3: Fehlende Registry-Modi als Achsenpunkte.
+        # 13.08.2026 (Punkt 1a, F1): Die Ergaenzung greift JETZT AUCH bei
+        # konkretem Modus-Filter - die Registry-Paare werden dann auf den
+        # gewaehlten Modus gefiltert. Vorher blieb die service_id-Achse bei
+        # konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt
+        # (ein noch nicht berechneter Modus erzeugte KEINEN Achsenpunkt,
+        # obwohl der Modus im Dropdown waehlbar war).
+        extra_service_modes = None
+        mode_raw = str(service_mode or "").strip()
+        mode_key = mode_raw.lower()
+        try:
+            if mode_key in ("", "all", "alle"):
+                extra_service_modes = sorted(
+                    self._registry_service_mode_pairs(
+                        feature_ids, feature_id))
+            elif mode_raw:
+                extra_service_modes = sorted(
+                    p for p in self._registry_service_mode_pairs(
+                        feature_ids, feature_id)
+                    if "::" in p
+                    and p.rsplit("::", 1)[1].strip().lower() == mode_key)
+        except Exception:
+            extra_service_modes = None
         try:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
                 instance_hashes=instance_hashes, limit=limit,
                 all_timeframes=all_timeframes,
+                bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
+                field_pairs=field_pairs,
+                service_mode=service_mode,
+                extra_service_modes=extra_service_modes,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -374,6 +458,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
@@ -404,6 +495,8 @@ class AnalyticsRepository:
             symbol, timeframe, [x_col, y_col],
             feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -438,6 +531,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
@@ -468,7 +568,8 @@ class AnalyticsRepository:
         rows = self.reader.fetch_columns(
             symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, instance_hashes=instance_hashes,
-            limit=limit,
+            limit=limit, from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -541,7 +642,107 @@ class AnalyticsRepository:
         """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung)."""
         return self.reader.get_available_timeframes(symbol)
 
+    @staticmethod
+    def _registry_service_mode_pairs(
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """'{feature_id}::{mode}'-Kombinationen der aktiven Services.
+
+        21.03.20-Bugfix 2/3: Liest parameter_schema["mode"]["options"]
+        der gewaehlten Services (PluginRegistry-Singleton, in-Memory).
+        Leere feature_ids = alle Services (Multi-Modus-faehige Plugins
+        tragen einen "mode"-Key mit nicht-leeren options). Format
+        `{plugin_id.lower()}::{mode}` (case-originaler Modus) - deckungs-
+        gleich mit der service_id-Achsen-Expression des Readers. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv abgefangen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return set()
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Set[str] = set()
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "parameter_schema", None) or {}
+                mode_cfg = schema.get("mode") or {}
+                options = [str(o).strip() for o in (mode_cfg.get("options")
+                                                    or []) if str(o).strip()]
+                if options:
+                    pid_l = str(pid).strip().lower()
+                    for m in options:
+                        out.add(f"{pid_l}::{m}")
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _registry_output_keys(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Nicht-technische output_schema-Keys je Service (Registry).
+
+        21.03.20-Bugfix 3: Fallback fuer die Parameter-Box (Feld-Dropdown),
+        wenn der gewaehlte Modus noch nicht in der DB berechnet wurde
+        (leere modus-gefilterte field_sources). `output_schema`-Felder mit
+        `technical: True` (System-Metrik) werden ausgeschlossen. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return {}
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Dict[str, List[str]] = {}
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "output_schema", None) or {}
+                keys = [k for k, v in schema.items()
+                        if k and not (v or {}).get("technical")]
+                if keys:
+                    out[str(pid)] = sorted(keys)
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _registry_source_modes(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """Mogliche source_mode-Werte der aktiven Services (Registry).
+
+        21.03.20-Bugfix 2: UNION-Quelle fuer das Modus-Dropdown (alle
+        waehlbaren Modi statt nur der DB-geschriebenen). Abgeleitet aus
+        `_registry_service_mode_pairs` (eine Registry-Sammlung).
+        """
+        pairs = cls._registry_service_mode_pairs(feature_ids, feature_id)
+        modes: Set[str] = set()
+        for p in pairs:
+            if "::" in p:
+                modes.add(p.split("::", 1)[1])
+        return modes
+
     def get_available_features(
+
         self,
         symbol: str,
         timeframe: str,
@@ -550,6 +751,8 @@ class AnalyticsRepository:
         # Metadaten (metrics/field_sources) im QUERY_FEATURES-Leichtpfad.
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
 
@@ -572,9 +775,40 @@ class AnalyticsRepository:
         # denselben Reader-Basis-Scan wie die Heatmap (cache-served).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes,
+            service_mode=service_mode)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
+        # 21.03.20 (Analytics Modus-Filter): source_modes +
+        # Deaktivierungs-Flag im LEICHTEN QUERY_FEATURES-Payload
+        # (Modus-Dropdown im HeatmapWidget; gecachter Reader-Basis-
+        # Scan, kein zusaetzlicher Roundtrip).
+        try:
+            source_modes, has_sm = (
+                self.reader.fetch_available_source_modes(
+                    symbol, timeframe, feature_ids=feature_ids,
+                    instance_hashes=instance_hashes))
+        except Exception:
+            source_modes, has_sm = [], False
+        # 21.03.20-Bugfix 2: UNION der Registry-Modi. Die DB-geschriebenen
+        # source_mode-Werte decken nur die tatsaechlich ausgefuehrten Modi
+        # ab (meist der Default); parameter_schema["mode"]["options"] der
+        # aktiven Services enthaelt ALLE moeglichen Modi (z. B. Swing
+        # Momentum: MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet).
+        # Das Modus-Dropdown zeigt damit alle waehlbaren Modi; ein noch
+        # nicht berechneter Modus liefert bei Auswahl konsistent leere
+        # Zellen (Entscheidung 3, kein Crash). In-Memory-Registry-Singleton
+        # (Worker-Thread, kein DB-Roundtrip).
+        registry_modes = self._registry_source_modes(feature_ids)
+        if registry_modes:
+            merged = list(dict.fromkeys(
+                [str(m) for m in (source_modes or [])]
+                + sorted(registry_modes)))
+            result["source_modes"] = merged
+        else:
+            result["source_modes"] = source_modes
+        result["has_source_mode_services"] = bool(
+            has_sm or registry_modes)
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(
@@ -683,6 +917,12 @@ DEBOUNCE_MS = 250
 DEFAULT_BINS = 20
 DEFAULT_LIMIT = 5000
 
+# 21.03.12 (MTF-FC auf Analytics): Alle Haupt-Queries, die beim data_tf-
+# Wechsel neu angestossen werden (OHLCV/DAILY_OHLC sind on-demand und
+# folgen keinem Filterwechsel - identisch zur refresh_all()-Liste).
+_ALL_QUERIES = (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES)
+
 
 class AnalyticsViewModel(QObject):
     """MVVM-ViewModel der Analytics-Engine (kein SQL, kein UI)."""
@@ -783,6 +1023,33 @@ class AnalyticsViewModel(QObject):
             "table_row_height": 0,
             "table_sort_column": 0,
             "table_sort_order": 1,
+            # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter des
+            # MtfFilterBarWidget. `data_tf` = Analysequelle ('multi' = alle
+            # TFs in einer Query via all_timeframes; sonst fixierter TF, der
+            # den `timeframe`-Filter uebernimmt). `agg_tf` = Aggregations-TF
+            # (Entscheidung 6a: 'auto' oder konkreter TF fuer das Zeitraster
+            # der generischen Heatmap). `range_from`/`range_to` = optionaler
+            # Zeitfilter (bar_time BETWEEN), Basis = letzter Datenpunkt.
+            "data_tf": "multi",
+            "agg_tf": "auto",
+            "range_preset": None,
+            "range_from": None,
+            "range_to": None,
+            # 21.03.12: Von set_data_tf() verwaltetes Flag - True = alle
+            # Timeframes in EINER Query (data_tf='multi'), False = fixierter
+            # TF. Separates Flag von heatmap_all_timeframes (21.01-Preset).
+            "all_timeframes": False,
+            # 21.03.14 (Wunsch 2): Tabellen-Sortierung des MtfFilterBarWidget
+            # ('date' | 'signal' | 'tf'). Reiner UI-Zustand (kein SQL-Filter);
+            # wird im Profil-Payload (Sektion sources) persistiert und beim
+            # Profil-/Workspace-Restore ueber die Filterleiste restauriert
+            # (nach dem Rueckbau der View-Template-Buttons).
+            "sort_mode": "date",
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+            # Multi-Modus-Services. Default "all" = kein Filter (alle Modi).
+            # Wirkt GLOBAL auf alle Analytics-Datenquellen (Entscheidung 1);
+            # wird in der sources-Sektion des Profil-Payloads persistiert.
+            "service_mode": "all",
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -892,6 +1159,144 @@ class AnalyticsViewModel(QObject):
                          QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
                          QUERY_FEATURES))
 
+    # ------------------------------------------------------------------
+    # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter
+    # ------------------------------------------------------------------
+    def set_data_tf(self, data_tf: str) -> None:
+        """Setzt die Analysequelle des MtfFilterBarWidget ('multi' | TF).
+
+        'multi'  -> alle Timeframes in EINER Query (`all_timeframes=True`,
+                    der `timeframe`-Filter entfaellt im Reader).
+        'M15' o.ae. -> Fixiert auf diesen TF: `all_timeframes=False` und der
+                    `timeframe`-Filter uebernimmt den fixierten TF (die UI
+                    synchronisiert combo_tf daraus).
+        """
+        data_tf = str(data_tf or "").strip() or "multi"
+        if data_tf == "multi":
+            if (self._params.get("data_tf") == "multi"
+                    and not self._params.get("all_timeframes")):
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            elif self._params.get("data_tf") != "multi":
+                self._params["data_tf"] = "multi"
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            return
+        # Fixiert auf einen konkreten TF.
+        tf = data_tf.upper()
+        changed = (self._params.get("data_tf") != tf
+                   or self._params.get("timeframe") != tf
+                   or self._params.get("all_timeframes"))
+        if not changed:
+            return
+        self._params["data_tf"] = tf
+        self._params["all_timeframes"] = False
+        self._params["timeframe"] = tf
+        self._mark_dirty()
+        self._refresh(_ALL_QUERIES)
+
+    def set_agg_tf(self, agg_tf: str) -> None:
+        """Setzt den Aggregations-TF (Entscheidung 6a: 'auto' | TF).
+
+        'auto' -> Granularitaet wird dynamisch aus dem Zeitraum abgeleitet
+                  (kein Zeit-Bucketing; Verhalten wie bisher).
+        'H1' o.ae. -> Die generische Heatmap fasst die date-Achse starr auf
+                  diesem TF-Raster zusammen (bucket_tf im Reader).
+        """
+        agg_tf = str(agg_tf or "").strip().lower() or "auto"
+        self._set_param("agg_tf", agg_tf, (QUERY_HEATMAP_GENERIC,))
+
+    def set_sort_mode(self, mode: str) -> None:
+        """21.03.14 (Wunsch 2): Speichert die Tabellen-Sortierung.
+
+        `sort_mode` ist 'date' | 'signal' | 'tf' und wird fuer die
+        Profil-Persistenz gemerkt (Sektion sources). Reiner UI-Zustand
+        (die TablePage wendet die Sortierung ueber den EventBus an) -
+        KEIN Query-Refresh, nur Dirty-Markierung (Option B - Explicit
+        Save). Idempotent ohne Aenderung.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = "date"
+        if mode == self._params.get("sort_mode"):
+            return
+        self._params["sort_mode"] = mode
+        self._mark_dirty()
+
+    def set_service_mode(self, mode: str) -> None:
+        """21.03.20: Setzt den Modus-Filter (z. B. 'MA_Peak_Hysteresis').
+
+        `"all"` (Default) = kein Filter (alle Modi). Wirkt GLOBAL auf
+        alle Analytics-Datenquellen (Entscheidung 1): Tabelle, beide
+        Heatmaps, Scatter, Verteilung. `QUERY_FEATURES` wird mitrefreshed,
+        damit die dynamische Modus-Liste / das Deaktivierungs-Flag
+        (`has_source_mode_services`) synchron zur Auswahl bleibt. Idempotent
+        ohne Aenderung (kein Refresh/Dirty).
+        """
+        mode = str(mode or "all").strip()
+        if mode == self._params.get("service_mode"):
+            return
+        self._params["service_mode"] = mode
+        self._mark_dirty()
+        self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+
+    def set_range(self, from_ts, to_ts, preset: Optional[str] = None) -> None:
+        """Setzt den Zeitraum-Filter (optional, bar_time BETWEEN).
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int) oder None (kein Filter).
+        `preset` ist der Range-Preset-Name des MtfFilterBarWidget (z. B.
+        '7d'/'90d'/'Year', 21.03.15) und wird fuer die Profil-Persistenz
+        gemerkt. Alt-Werte 'YTD' (bis 21.03.15) bzw. 'Benutzerdefiniert'
+        (entfallenes Custom-Panel) werden auf den neuen Preset-Satz
+        abgebildet. Wird vom Range-Picker des MtfFilterBarWidget gesetzt
+        (Basis = letzter Datenpunkt statt time.time()).
+        """
+        f = int(from_ts) if from_ts is not None else None
+        t = int(to_ts) if to_ts is not None else None
+        preset = str(preset or "").strip() or None
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Preset-Satz (24h/7d/30d/90d/Year) abbilden.
+        if preset == "YTD":
+            preset = "Year"
+        elif preset == "Benutzerdefiniert":
+            preset = "7d"
+        if (f == self._params.get("range_from")
+                and t == self._params.get("range_to")
+                and preset == self._params.get("range_preset")):
+            return
+        self._params["range_from"] = f
+        self._params["range_to"] = t
+        self._params["range_preset"] = preset
+        self._mark_dirty()
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def clear_range(self) -> None:
+        """Entfernt den Zeitraum-Filter (kein Zeitfilter mehr)."""
+        self.set_range(None, None)
+
+    def latest_data_epoch(self) -> Optional[int]:
+        """Neuester Wanduhr-Epoch der Feature-Daten (Range-Referenzpunkt).
+
+        Delegiert lesend an das Repository (`fetch_latest_bar_time` fuer das
+        aktuelle Symbol/Timeframe) – der `now_provider` des MtfFilterBarWidget
+        rechnet die Presets relativ zum letzten Datenpunkt statt zu
+        time.time(). Defensiv: ohne Symbol/Timeframe oder bei Fehler -> None
+        (das Widget faellt dann auf time.time() zurueck).
+        """
+        symbol = str(self._params.get("symbol") or "")
+        timeframe = str(self._params.get("timeframe") or "")
+        if not symbol or not timeframe:
+            return None
+        try:
+            return self._repo.get_latest_bar_time(symbol, timeframe)
+        except Exception:
+            return None
+
     def set_feature_id(self, feature_id: Optional[str]) -> None:
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
         self.set_feature_ids([feature_id] if feature_id else [])
@@ -950,6 +1355,97 @@ class AnalyticsViewModel(QObject):
         self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
                        QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
                        QUERY_DISTRIBUTION))
+
+    def set_field_selection(self, field_pairs, update_ids: bool = True) -> None:
+        """Setzt die (Service|Parameter)-Auswahl des 'Feld'-Dropdowns.
+
+        12.08.2026 (Option A, Bug 1/2): Die Feld-Auswahl ist eine explizite
+        Liste von '{service_id}|{key}'-Paaren (effective pairs) - der
+        Reader filtert damit auf PARAMETER-Ebene (field_pairs-WHERE:
+        `feature_data->>key IS NOT NULL` je Service). Leere Liste = kein
+        Paar-Filter (reines feature_ids-Verhalten wie bisher).
+
+        `update_ids=True` (USER-Interaktion, ServicePicker-Sync): Die
+        Services werden aus den Paaren abgeleitet und in `feature_ids`
+        uebernommen (Dropdown und Picker bleiben konsistent; Abwaehlen des
+        letzten Parameters eines Services entfernt ihn aus dem Picker).
+
+        `update_ids=False` (PROGRAMMATISCHER Sync am Ende des
+        Dropdown-Rebuilds): `feature_ids` bleibt UNANGETASTET - der
+        ServicePicker ist die Service-Quelle; Services OHNE numerische
+        Feld-Keys duerfen dadurch nicht stillschweigend aus der Auswahl
+        fallen (nur ihre Paare koennen fehlen).
+
+        Im Gegensatz zu set_feature_ids() wird der Refresh auch bei
+        UNVERAENDERTER Service-Menge ausgeloest, wenn sich die Parameter-
+        Auswahl geaendert hat. Idempotent ohne Aenderung (kein
+        Refresh/Dirty).
+        """
+        pairs = self._normalize_field_pairs(field_pairs)
+        ids = self._pairs_to_feature_ids(pairs)
+        current_pairs = self._params.get("field_selection") or []
+        current_ids = self._params.get("feature_ids") or []
+        pairs_changed = pairs != current_pairs
+        ids_changed = update_ids and ids != current_ids
+        if not pairs_changed and not ids_changed:
+            return
+        self._params["field_selection"] = pairs
+        if ids_changed:
+            self._params["feature_ids"] = ids
+        self._mark_dirty()
+        if ids_changed:
+            # Service-Satz geaendert -> ServicePicker + Feld-Metadaten
+            # (QUERY_FEATURES) synchron nachziehen (identisch zu
+            # set_feature_ids).
+            self.feature_ids_changed.emit()
+            self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+        else:
+            # NUR die Parameter-Auswahl hat sich geaendert -> nur die
+            # generische Heatmap neu aggregieren (Bug 1: An/Abwaehlen
+            # eines Parameters muss die Grafik aendern).
+            self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    @staticmethod
+    def _normalize_field_pairs(value) -> List[str]:
+        """Normalisiert '{service_id}|{key}'-Paare (dedupliziert, getrimmt).
+
+        12.08.2026 (Option A): Eintraege ohne `|` oder mit leerer Service-/
+        Key-Seite werden verworfen. Die Keys bleiben case-sensitiv (JSON-
+        Keys aus den Service-Payloads), die Service-ID wird getrimmt.
+        """
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if not s or "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if sid and key and f"{sid}|{key}" not in out:
+                out.append(f"{sid}|{key}")
+        return out
+
+    @staticmethod
+    def _pairs_to_feature_ids(pairs) -> List[str]:
+        """Leitet die aktiven Service-IDs aus '{service_id}|{key}'-Paaren ab.
+
+        12.08.2026 (Option A): Dedupliziert in Paar-Reihenfolge (die
+        Feld-Dropdown-Item-Reihenfolge bestimmt die ServicePicker-Reihenfolge
+        - konsistent zu _checked_field_service_ids()).
+        """
+        out: List[str] = []
+        for p in pairs or []:
+            s = str(p or "")
+            if "|" not in s:
+                continue
+            sid = s.split("|", 1)[0].strip()
+            if sid and sid not in out:
+                out.append(sid)
+        return out
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
@@ -1368,6 +1864,13 @@ class AnalyticsViewModel(QObject):
             # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
             # Stale-Payloads (Queries vor dem letzten Restore).
             "restore_generation": self._restore_generation,
+            # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter
+            # (Wanduhr-Epochs relativ zum letzten Datenpunkt; None = alle).
+            "from_ts": p.get("range_from"),
+            "to_ts": p.get("range_to"),
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+            # (GLOBAL - alle Query-Kinds, Entscheidung 1).
+            "service_mode": p.get("service_mode", "all"),
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -1383,10 +1886,24 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # 12.08.2026 (Option A, Bug 1/2): Explizite (Service|Parameter)-
+            # Auswahl des 'Feld'-Dropdowns -> der Reader filtert auf
+            # PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer =
+            # kein Paar-Filter (verhalten wie bisher, reiner feature_ids-
+            # Filter). Wird in set_field_selection() gepflegt.
+            base["field_selection"] = p.get("field_selection") or []
             # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
             # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
+            # 21.03.12: OR-verknuepft mit `all_timeframes` (data_tf='multi' -
+            # Analysequelle des MtfFilterBarWidget uebernimmt die Freigabe).
             base["all_timeframes"] = bool(
-                p.get("heatmap_all_timeframes", False))
+                p.get("heatmap_all_timeframes", False)
+                or p.get("all_timeframes", False))
+            # 21.03.12 (Entscheidung 6a): agg_tf -> bucket_tf fuer das
+            # date-Raster der generischen Heatmap ('auto'/leer = kein
+            # Bucketing, dynamische Granularitaet wie bisher).
+            _agg_tf = str(p.get("agg_tf") or "auto").strip().lower()
+            base["bucket_tf"] = None if _agg_tf in ("", "auto") else _agg_tf
             # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
             # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
             # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
@@ -1583,6 +2100,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (Alt-Payloads ohne den
+        # Key -> leer = kein Paar-Filter, Verhalten wie bisher).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # 20.01 (E5) + Runde 9 (Bug 1): Fehlende Services NUR melden -
         # die IDs bleiben im Filter (kein stilles Kuerzen des restaurierten
         # Filters; die DB liefert fuer unbekannte IDs keine Zeilen).
@@ -1659,6 +2181,13 @@ class AnalyticsViewModel(QObject):
                 self._params[key] = flat[key]
         if "instance_hashes" not in flat or not flat.get("instance_hashes"):
             self._params["instance_hashes"] = []
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Range-Preset-Satz abbilden (das Custom-Panel ist entfallen).
+        _preset = str(self._params.get("range_preset") or "").strip() or None
+        if _preset == "YTD":
+            self._params["range_preset"] = "Year"
+        elif _preset == "Benutzerdefiniert":
+            self._params["range_preset"] = "7d"
 
     def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
         """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
@@ -1691,6 +2220,23 @@ class AnalyticsViewModel(QObject):
                 # Profil-Payload persistieren (Replace-Semantik beim
                 # Restore: fehlt der Key -> garantiert leer, B3-2).
                 "instance_hashes": list(p.get("instance_hashes") or []),
+                # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand
+                # (data_tf/agg_tf/range) im Profil persistieren - die
+                # Analysequelle, die Aggregations-TF und der Zeitraum des
+                # MtfFilterBarWidget werden beim Profilwechsel restauriert.
+                # 21.03.14 (Wunsch 2): `sort_mode` kommt additiv hinzu
+                # (nach dem Rueckbau der View-Template-Buttons).
+                "data_tf": p.get("data_tf"),
+                "agg_tf": p.get("agg_tf"),
+                "range_preset": p.get("range_preset"),
+                "range_from": p.get("range_from"),
+                "range_to": p.get("range_to"),
+                "all_timeframes": p.get("all_timeframes"),
+                "sort_mode": p.get("sort_mode"),
+                # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+                # wird additiv in der sources-Sektion persistiert
+                # (Restore ueber _restore_params_from_payload).
+                "service_mode": p.get("service_mode"),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),
@@ -1771,6 +2317,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (identisch zu
+        # _apply_profile).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # Runde 9 (Bug 1): Fehlende Services NUR melden, NICHT aus dem
         # Filter entfernen - der Resolver wuerde sonst den restaurierten
         # Filter stillschweigend kuerzen (die DB liefert fuer unbekannte
@@ -1934,6 +2485,13 @@ class AnalyticsViewModel(QObject):
         key = str(plugin_id or "").strip()
         if not key:
             return ""
+        # 21.03.20-Bugfix 3: Die service_id-Dimension traegt seit dem
+        # Modus-Split '{service_id}::{source_mode}' (leerer Suffix =
+        # Service ohne source_mode). Den Modus abspalten und als
+        # ' / {Modus}' anhaengen (nur bei nicht-leerem Wert).
+        mode_suffix = ""
+        if "::" in key:
+            key, mode_suffix = key.split("::", 1)
         model = self._selector_model
         if model is None:
             from analytics.engine.service_selector_model import ServiceSelectorModel
@@ -1942,17 +2500,19 @@ class AnalyticsViewModel(QObject):
         try:
             plugin = model.get_plugin(key)
             if plugin is None:
-                return key
-            meta = getattr(plugin, "metadata", {}) or {}
-            name = str(meta.get("display_name") or key)
-            if name.lower().startswith("srv_"):
-                name = name[4:]
-            category = str(model.plugin_category_path(key) or "")
-            if category:
-                return f"{category} / {name}"
-            return name
+                label = key
+            else:
+                meta = getattr(plugin, "metadata", {}) or {}
+                name = str(meta.get("display_name") or key)
+                if name.lower().startswith("srv_"):
+                    name = name[4:]
+                category = str(model.plugin_category_path(key) or "")
+                label = f"{category} / {name}" if category else name
+            if mode_suffix:
+                label = f"{label} / {mode_suffix}"
+            return label
         except Exception:
-            return key
+            return key + (f" / {mode_suffix}" if mode_suffix else "")
 
     def resolve_service_display_name(self, plugin_id: str,
                                      preset_name: Optional[str] = None,
@@ -2522,6 +3082,14 @@ class AnalyticsAsyncWorker(QThread):
             feature_ids = [p["feature_id"]]
         # Runde 10 (Bug 1): Varianten-Einschraenkung an die Repo-Methoden.
         instance_hashes = p.get("instance_hashes") or []
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter + Bucket-TF.
+        from_ts = p.get("from_ts")
+        to_ts = p.get("to_ts")
+        bucket_tf = p.get("bucket_tf") or None
+        # 21.03.20 (Analytics Modus-Filter): globaler
+        # source_mode-Filter fuer Multi-Modus-Services
+        # (None/"all" = kein Filter).
+        service_mode = p.get("service_mode")
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
@@ -2530,6 +3098,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP:
             return repo.get_heatmap(
@@ -2538,6 +3108,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -2559,6 +3131,15 @@ class AnalyticsAsyncWorker(QThread):
                 # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
                 # (Preset `[📊 Service-Timeframe]`) – Bool aus den Params.
                 all_timeframes=bool(p.get("all_timeframes", False)),
+                # 21.03.12 (Entscheidung 6a): Aggregations-TF fuer das
+                # date-Raster + optionaler Zeitfilter (Wanduhr-Epochs).
+                bucket_tf=bucket_tf,
+                from_ts=from_ts, to_ts=to_ts,
+                # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-
+                # Auswahl des 'Feld'-Dropdowns -> Reader filtert auf
+                # Parameter-Ebene (feature_data-JSON-Keys je Service).
+                field_pairs=p.get("field_selection") or [],
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -2584,6 +3165,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
@@ -2594,6 +3177,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
@@ -2607,6 +3192,9 @@ class AnalyticsAsyncWorker(QThread):
                 presets_data=p.get("presets_data") or None,
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                # 21.03.20-Bugfix 3: Modus-Filter fuer die Feld-Metadaten
+                # (modus-spezifische Ergebnis-Parameter im Feld-Dropdown).
+                service_mode=service_mode,
             )
 
         raise ValueError(
@@ -2717,7 +3305,18 @@ DIM_MAPPINGS = {
     "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "timeframe": "LOWER(timeframe)",
-    "service_id": "LOWER(feature_id)",
+    # 21.03.20-Bugfix 3: Die Service-Achse splittet je
+    # (feature_id, source_mode)-Kombination - ein Multi-Modus-Service
+    # (z. B. Swing Momentum mit 3 Modi) belegt bei \"alle Modi\" drei
+    # Achsenpunkte. Services ohne source_mode erhalten den leeren
+    # Modus-Suffix (\"srv_x::\"); das Widget/VM-Resolver zeigt nur bei
+    # nicht-leerem Modus \"Service / Modus\" an. Der Modus-Filter
+    # (service_mode) schraenkt die Rows VOR der Aggregation ein -
+    # bei konkretem Modus bleibt genau ein Achsenpunkt je Service.
+    "service_id": (
+        "LOWER(feature_id) || '::' || COALESCE("
+        "json_extract_string(feature_data, '$.source_mode'), '')"
+    ),
     "symbol": "LOWER(symbol)",
 }
 
@@ -2745,6 +3344,42 @@ OHLCV_SNAPSHOT_LIMIT = 5000
 # Matrix). Das Candle-Overlay aggregiert Tages-Ohlc SQL-seitig ueber bis zu
 # DAILY_OHLC_MAX_DAYS Tage (deckt den gesamten Heatmap-Zeitraum ab).
 DAILY_OHLC_MAX_DAYS = 4000
+
+# 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF ->
+# Bucket-Sekunden fuer das date-Raster der generischen Heatmap (`agg_tf`
+# fixiert auf einen konkreten TF, z. B. 'M15'/'H1'). 'auto' bedeutet KEIN
+# Bucketing (Granularitaet dynamisch, bisheriges Verhalten).
+TF_SECONDS = {
+    "M1": 60, "M2": 120, "M5": 300, "M10": 600, "M15": 900,
+    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
+    "W1": 604800, "MN1": 2592000,
+}
+
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# Pill-Strips (TfStatusBadgeBar), TF-Dropdowns und Verfuegbarkeitslisten.
+# Reihenfolge entspricht der broker-ueblichen Skala M1..MN1 inkl. M2/M10
+# (vorher lieferte `ORDER BY timeframe` die ALPHABETISCHE Reihenfolge:
+# D1, H1, H4, M1, M10, M15, M30, M5, MN1, W1 - falsch im UI).
+CANONICAL_TIMEFRAME_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def canonical_tf_sort(tfs) -> List[str]:
+    """Sortiert Timeframe-Strings kanonisch fein -> grob (13.08.2026, F3).
+
+    Bekannte TFs folgen CANONICAL_TIMEFRAME_ORDER; unbekannte TFs
+    (z. B. neue Broker-TFs) landen deterministisch am Ende. Defensiv
+    gegen None/leer (ruft beide Stellen: fetch_service_tf_status und
+    get_available_timeframes).
+    """
+    order = {tf: i for i, tf in enumerate(CANONICAL_TIMEFRAME_ORDER)}
+    return sorted(
+        (str(t).strip().upper() for t in (tfs or [])
+         if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(tf, 10 ** 6), tf),
+    )
 
 
 class FeatureStoreReader:
@@ -2873,6 +3508,15 @@ class FeatureStoreReader:
         types_by_service: Dict[str, Dict[str, set]] = {}
         hashes_by_service: Dict[str, set] = {}
         null_hash_pids: Set[str] = set()
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Werte je
+        # Service (Multi-Modus-Services srv_swing_*/srv_trend_*) -
+        # Grundlage des Modus-Dropdowns OHNE zusaetzlichen
+        # DB-Roundtrip (gleicher Cache wie die Keys, Runde 15).
+        source_modes_by_service: Dict[str, Set[str]] = {}
+        # 21.03.20-Bugfix 3: JSON-Keys je (Service, source_mode) - Grundlage
+        # modus-spezifischer Ergebnis-Parameter im Feld-Dropdown (modus-
+        # gefilterte Keys statt aller Keys ueber alle Modi hinweg).
+        keys_by_service_mode: Dict[str, Dict[str, Set[str]]] = {}
         for fid, hash_raw, raw in rows:
             data = self._normalize_feature_data(raw)
             if not isinstance(data, dict):
@@ -2899,10 +3543,26 @@ class FeatureStoreReader:
                 hashes_by_service.setdefault(svc_l, set()).add(h_s)
             else:
                 null_hash_pids.add(svc_l)
+            # source_mode (nur nicht-leere String-Werte) - das
+            # Modus-Dropdown zeigt ausschliesslich tatsaechlich
+            # geschriebene Modi (dynamisch, keine Registry-Logik).
+            sm = data.get("source_mode")
+            if sm is not None and str(sm).strip():
+                source_modes_by_service.setdefault(
+                    service, set()).add(str(sm).strip())
+                # 21.03.20-Bugfix 3: Keys DIESER Row sammeln (modus-
+                # spezifische Ergebnis-Parameter fuer das Feld-Dropdown) -
+                # NICHT bucket.keys() (bucket aggregiert ueber ALLE Modi).
+                row_keys = {str(k) for k in data
+                            if k != "schema_version" and str(k).strip()}
+                keys_by_service_mode.setdefault(service, {}).setdefault(
+                    str(sm).strip(), set()).update(row_keys)
         entry = {
             "types_by_service": types_by_service,
             "hashes_by_service": hashes_by_service,
             "null_hash_pids": null_hash_pids,
+            "source_modes_by_service": source_modes_by_service,
+            "keys_by_service_mode": keys_by_service_mode,
         }
         self._meta_put(key, entry)
         return entry
@@ -2988,6 +3648,109 @@ class FeatureStoreReader:
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 
+    @staticmethod
+    def _apply_field_pair_filter(
+        field_pairs: Optional[List[str]],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um den (Service|Parameter)-Paar-Filter.
+
+        12.08.2026 (Option A, Bug 1/2): Jedes Paar '{service_id}|{key}'
+        des 'Feld'-Dropdowns wird zu einer OR-Bedingung
+        `LOWER(TRIM(feature_id)) = ? AND json_extract_string(feature_data,
+        '$.key') IS NOT NULL` - der Reader filtert damit auf PARAMETER-Ebene (nur Rows, deren
+        feature_data den gewaehlten JSON-Key des jeweiligen Services
+        wirklich traegt). Identifier-unsichere Keys werden defensiv
+        uebersprungen (kein SQL-Injection-Risiko, Muster
+        `_is_json_key_identifier`). Leere/None-Liste = kein Filter.
+        """
+        if not field_pairs:
+            return
+        clauses: List[str] = []
+        for pair in field_pairs:
+            s = str(pair or "")
+            if "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if not sid or not key or not FeatureStoreReader._is_json_key_identifier(key):
+                continue
+            # 12.08.2026 (Option A): `json_extract_string(..., '$.key')` statt
+            # `feature_data->>'key'` - der DuckDB-Arrow-Operator kollidiert in
+            # Kombination mit LOWER/TRIM-Equalities mit einem Optimizer-Bug
+            # (v1.5.5: versucht die JSON-Spalte auf numerisch/BOOL zu casten
+            # und wirft fuer nicht-matchende Zeilen). json_extract_string
+            # liefert NULL fuer fehlende Keys (identische Semantik) und ist
+            # sowohl fuer VARCHAR- als auch JSON-Spalten stabil.
+            clauses.append(
+                f"(LOWER(TRIM(feature_id)) = ? AND "
+                f"json_extract_string(feature_data, '$.{key}') IS NOT NULL)")
+            params.append(sid.lower().strip())
+        if clauses:
+            conditions.append("(" + " OR ".join(clauses) + ")")
+
+    # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+    # Multi-Modus-Services (srv_swing_structure/srv_swing_momentum/...).
+    # Nur die 6 Swing-/Trend-Services schreiben `source_mode` top-level
+    # in jedes feature_data-Record; `"all"`/None/leer = kein Filter.
+    # Muster-Konsistenz (21.03.16): json_extract_string statt
+    # feature_data->>'source_mode' (DuckDB-v1.5.5-Arrow-Optimizer-Bug
+    # in Kombination mit LOWER/TRIM-Equalities). LOWER auf beiden Seiten
+    # = case-tolerantes Matching (z. B. 'ma_peak_hysteresis').
+    @staticmethod
+    def _apply_mode_filter(
+        service_mode: Optional[str],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        if not service_mode or str(service_mode).lower() in ("all", "alle", ""):
+            return
+        conditions.append(
+            "LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)")
+        params.append(str(service_mode).strip())
+
+    # 21.03.12 (MTF-FC auf Analytics): Optionaler bar_time-Zeitfilter.
+    # Wird von allen Daten-Queries (fetch_rows/fetch_columns/fetch_heatmap/
+    # fetch_generic_heatmap) ueber `from_ts`/`to_ts` aufgerufen.
+    @staticmethod
+    def _apply_time_range(
+        from_ts: Optional[Any],
+        to_ts: Optional[Any],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um einen optionalen bar_time-Zeitfilter.
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int, relativ zum letzten
+        Datenpunkt – `now_provider` des MtfFilterBarWidget) oder None.
+        `EXTRACT('epoch' FROM bar_time)` liefert exakt die gespeicherte
+        Wanduhr-Epoch (Invariante 7) – der Vergleich ist damit DST-robust
+        (Wanduhr gegen Wanduhr). Ungueltige Werte werden defensiv
+        ignoriert (kein Filter).
+        """
+        if from_ts is None and to_ts is None:
+            return
+        try:
+            f = int(from_ts)
+        except (TypeError, ValueError):
+            f = None
+        try:
+            t = int(to_ts)
+        except (TypeError, ValueError):
+            t = None
+        if f is not None and t is not None:
+            conditions.append(
+                "EXTRACT('epoch' FROM bar_time)::BIGINT BETWEEN ? AND ?")
+            params.extend([f, t])
+        elif f is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT >= ?")
+            params.append(f)
+        elif t is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT <= ?")
+            params.append(t)
+
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
     # ------------------------------------------------------------------
@@ -3000,6 +3763,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
@@ -3035,6 +3805,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -3103,6 +3875,14 @@ class FeatureStoreReader:
         try:
             if dim == "date":
                 if hasattr(value, "strftime"):
+                    # 21.03.12 (bucket_tf): tz-aware Datetimes (Session-TZ)
+                    # auf naive Wanduhr-UTC normalisieren - sonst zeigt das
+                    # Label den Berlin-Nachbar-Datumstag (+2h/+1h).
+                    try:
+                        value = value.astimezone(
+                            _dt_timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        pass
                     return value.strftime("%d.%m.")
                 return str(value)
             if dim == "hour":
@@ -3134,7 +3914,15 @@ class FeatureStoreReader:
             out: List[float] = []
             for v in values:
                 if isinstance(v, _dt_datetime):
-                    out.append(float(int(v.timestamp())))
+                    # 21.03.12 (bucket_tf): Naive Datetimes von to_timestamp
+                    # sind Wanduhr-encoded - als UTC-Darstellung interpretieren
+                    # (Invariante 7), sonst waere die Achse um den Berlin-
+                    # Offset (+2h/+1h) verschoben.
+                    if v.tzinfo is None:
+                        out.append(float(int(
+                            v.replace(tzinfo=_dt_timezone.utc).timestamp())))
+                    else:
+                        out.append(float(int(v.timestamp())))
                 elif hasattr(v, "year") and hasattr(v, "month") \
                         and hasattr(v, "day"):
                     # date-Objekt (CAST AS DATE): Mitternacht Wanduhr-UTC
@@ -3210,6 +3998,8 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -3268,12 +4058,83 @@ class FeatureStoreReader:
                 svc_hashes = hashes_by_service.get(svc_l, set())
                 if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
                     continue
-            keys = sorted(bucket.keys())
+            # 21.03.20-Bugfix 3: Optionaler Modus-Filter - nur Keys, die in
+            # Rows mit diesem source_mode vorkommen (modus-spezifische
+            # Ergebnis-Parameter). Noch nicht berechnete Modi liefern leer
+            # (der output_schema-Fallback im Repository greift dort).
+            use_mode = (str(service_mode or "").strip()
+                        if str(service_mode or "").strip().lower()
+                        not in ("all", "alle") else "")
+            if use_mode:
+                mode_keys = base.get("keys_by_service_mode", {}).get(
+                    service, {}).get(use_mode) or set()
+                keys = sorted(k for k in bucket.keys() if k in mode_keys)
+            else:
+                keys = sorted(bucket.keys())
             if numeric_only:
                 keys = [k for k in keys if bucket[k] == {"num"}]
             if keys:
                 out[service] = keys
         return out
+
+    def fetch_available_source_modes(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
+    ) -> Tuple[List[str], bool]:
+        """Distinct source_mode-Werte je Symbol/TF (21.03.20, Modus-Dropdown).
+
+        Analysiert den gecachten Metadaten-Basis-Scan `_feature_meta_base`
+        (Runde 15, Performance-Fix 3: EIN DB-Scan fuer alle Metadaten-
+        Methoden) - der leichte QUERY_FEATURES-Pfad bekommt die Modus-Liste
+        OHNE zusaetzlichen Roundtrip. Der feature_ids-Filter folgt dem
+        Muster `feature_keys_by_service` (case-insensitiv + whitespace-
+        tolerant): abgewaehlte Services liefern ihre Modi NICHT mehr.
+
+        Returns:
+            (source_modes, has_source_mode_services)
+              source_modes:             sortierte, case-originale Modus-Werte
+                                        (z. B. ['momentum', 'structure'])
+              has_source_mode_services: True, wenn mindestens ein AKTIVER
+                                        Service einen nicht-leeren
+                                        source_mode-Wert schreibt (Combo-
+                                        Deaktivierung im HeatmapWidget).
+        """
+        if not symbol or not timeframe:
+            return [], False
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return [], False
+        modes_by_service = base.get("source_modes_by_service", {})
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        hashes = set()
+        if instance_hashes:
+            hashes = {str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()}
+        hashes_by_service = base["hashes_by_service"]
+        null_hash_pids = base["null_hash_pids"]
+
+        values: Set[str] = set()
+        has = False
+        for service, modes in modes_by_service.items():
+            svc_l = str(service).strip().lower()
+            if wanted and svc_l not in wanted:
+                continue
+            if hashes:
+                svc_hashes = hashes_by_service.get(svc_l, set())
+                if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
+                    continue
+            if modes:
+                values.update(modes)
+                has = True
+        return sorted(values), has
 
     def fetch_columns(
         self,
@@ -3285,6 +4146,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
 
@@ -3323,6 +4191,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -3368,6 +4238,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
 
@@ -3428,6 +4305,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -3504,6 +4383,26 @@ class FeatureStoreReader:
         # ist VERWORFEN: der alte Guard `if not symbol or not timeframe:`
         # brach damit mit einer leeren Matrix ab).
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing). Optionaler Zeitfilter (Wanduhr-Epochs relativ zum
+        # letzten Datenpunkt; None = kein Filter).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data->>key IS NOT NULL je Service).
+        # Leer/None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
+        # 21.03.20-Bugfix 3: optionale '{feature_id}::{mode}'-Kombinationen
+        # der aktiven Services (Registry) - die service_id-Achse zeigt
+        # damit auch noch nicht berechnete Modi als leere Achsenpunkte
+        # (nur bei deaktivem Modus-Filter; leere Liste = kein Effekt).
+        extra_service_modes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -3571,6 +4470,22 @@ class FeatureStoreReader:
         y_key = str(y_dim or "").lower()
         x_expr = DIM_MAPPINGS.get(x_key)
         y_expr = DIM_MAPPINGS.get(y_key)
+        # 21.03.12 (Entscheidung 6a): `bucket_tf` bucketed das date-Raster
+        # auf das Aggregations-TF-Raster (agg_tf). to_timestamp liefert
+        # naive TIMESTAMP-Werte (Wanduhr) - _axis_coords interpretiert sie
+        # als Wanduhr (UTC-Darstellung, Invariante 7).
+        if bucket_tf:
+            _secs = TF_SECONDS.get(str(bucket_tf).strip().upper())
+            if _secs:
+                _bucket_expr = (
+                    f"(to_timestamp((FLOOR(EXTRACT('epoch' FROM bar_time AT "
+                    f"TIME ZONE 'UTC') / {_secs})::BIGINT) * {_secs}) "
+                    f"AT TIME ZONE 'UTC')"
+                )
+                if x_key == "date":
+                    x_expr = _bucket_expr
+                if y_key == "date":
+                    y_expr = _bucket_expr
         if x_expr is None or y_expr is None:
             raise ValueError(
                 f"[FeatureStoreReader] Unbekannte Dimension '{x_dim}/{y_dim}' – "
@@ -3610,6 +4525,14 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # des 'Feld'-Dropdowns - OR-Bedingung je Paar
+        # (`feature_id = ? AND json_extract_string(feature_data, '$.key')
+        # IS NOT NULL`). Leere Liste = kein Paar-Filter (nur
+        # feature_ids-Filter).
+        self._apply_field_pair_filter(field_pairs, conditions, params)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
@@ -3657,6 +4580,19 @@ class FeatureStoreReader:
         # Sortierwerte begrenzen (bei date = die neuesten Datumswerte).
         x_values = sorted({r[0] for r in rows})
         y_values = sorted({r[1] for r in rows})
+        # 21.03.20-Bugfix 3: fehlende (Service, Modus)-Kombinationen
+        # aus der Registry ergaenzen (nur service_id-Dimension, leere
+        # Zellen = fill). Der Modus-Filter schraenkt Rows VOR der
+        # Aggregation ein - bei konkretem Modus bleibt die Achse auf
+        # diesen Modus begrenzt (keine Registry-Ergaenzung noetig).
+        if extra_service_modes and (x_key == "service_id"
+                                    or y_key == "service_id"):
+            extra = {str(e) for e in extra_service_modes if str(e).strip()}
+            if extra:
+                if x_key == "service_id":
+                    x_values = sorted(set(x_values) | extra)
+                if y_key == "service_id":
+                    y_values = sorted(set(y_values) | extra)
         if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
             max_x = max(1, MAX_HEATMAP_CELLS // max(1, len(y_values)))
             x_keep = set(x_values[-max_x:])
@@ -3694,8 +4630,15 @@ class FeatureStoreReader:
             "matrix": matrix.tolist(),
             "x_labels": [self._format_dim_value(x_key, v) for v in x_values],
             "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
-            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
-            "x_values": [str(v) for v in x_values],
+            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt).
+            # 21.03.12 (bucket_tf): tz-aware Datetimes (falls DuckDB den
+            # Session-TZ anhaengt) defensiv auf naive Wanduhr-UTC normalisieren.
+            "x_values": [
+                (str(v.astimezone(_dt_timezone.utc).replace(tzinfo=None))
+                 if isinstance(v, _dt_datetime) and v.tzinfo is not None
+                 else str(v))
+                for v in x_values
+            ],
             # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
             # (date -> Mitternachts-Epochs, hour/dow -> Ganzzahlen, dow 1..5
             # Mo-Fr, kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
@@ -4025,7 +4968,11 @@ class FeatureStoreReader:
                 except (AttributeError, ValueError):
                     last_run = ""
             out[str(tf_raw).upper()] = {"count": int(cnt), "last_run": last_run}
-        return out
+        # 13.08.2026 (Punkt 3, F3): Sortierte Rueckgabe (kanonisch fein ->
+        # grob) - die Pill-Strips aller drei Fenster (AnalyticsWindow,
+        # ServicePicker, ServiceWindow) rendern die TFs damit korrekt
+        # sortiert statt alphabetisch.
+        return {tf: out[tf] for tf in canonical_tf_sort(out)}
 
     def fetch_last_execution_dates_by_hash(
         self,
@@ -4181,9 +5128,11 @@ class FeatureStoreReader:
             rows = con.execute("""
                 SELECT DISTINCT timeframe FROM feature_store
                 WHERE LOWER(symbol) = LOWER(?)
-                ORDER BY timeframe
             """, [symbol]).fetchall()
-            return [str(r[0]) for r in rows if r[0] is not None]
+            # 13.08.2026 (Punkt 3, F3): Kanonische Sortierung statt
+            # `ORDER BY timeframe` (alphabetisch).
+            return canonical_tf_sort(
+                [str(r[0]) for r in rows if r[0] is not None])
         except Exception as e:
             print(f"WARN [FeatureStoreReader] get_available_timeframes "
                   f"fehlgeschlagen: {e}")
@@ -4766,6 +5715,7 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_view_model import AnalyticsViewModel
 from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.engine.feature_store_reader import FeatureStoreReader
+from chart.widgets.mtf_filter_bar import MtfFilterBarWidget
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -4786,6 +5736,13 @@ from serviceui.symbols_win import SymbolsWindow
 # Timeframes ohne Feature-Store-Daten werden in der Combo ausgegraut
 # (_refresh_timeframe_combo) und sind nicht auswaehlbar.
 TIMEFRAMES = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+
+# 21.03.12 (MTF-FC auf Analytics): TF-Listen des MtfFilterBarWidget –
+# 11 Analytics-Timeframes (M1..MN1) statt der 6 Chart-Defaults. `data_tf`
+# (Analysequelle: Multi oder fixierter TF) und `agg_tf` (Aggregations-TF,
+# Entscheidung 6a: Auto oder fixierter TF) sind unabhaengige Dropdowns.
+MTF_DATA_TF_OPTIONS = ["🌐 Multi"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
+MTF_AGG_TF_OPTIONS = ["⚡ Auto"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
 
 # Fenstertitel (Option B: '*' = ungespeicherte Parametertrends).
 WINDOW_TITLE_BASE = "PyTrader - Analytics"
@@ -5070,6 +6027,22 @@ class AnalyticsWindow(PersistentWindow):
         filt.addStretch(1)
         root.addLayout(filt)
 
+        # --- 21.03.12 (MTF-FC auf Analytics): Filterleiste des MtfFilterBarWidget ---
+        # Data-TF (Analysequelle: Multi/fixiert), Agg-TF (Aggregations-TF,
+        # Entscheidung 6a), Range-Picker, Sortierung + View-Templates.
+        # now_provider = letzter Datenpunkt (MAX(bar_time)) statt time.time(),
+        # damit Range-Presets relativ zum letzten Signal rechnen. Der
+        # Chart-Modus wird auf '🔒 Fix' gesetzt, damit das Agg-TF-Dropdown
+        # sofort aktiv ist (im Chart gated '⚡ Auto' das Agg-Dropdown).
+        self.mtf_bar = MtfFilterBarWidget(
+            data_tf_options=MTF_DATA_TF_OPTIONS,
+            agg_tf_options=MTF_AGG_TF_OPTIONS,
+            now_provider=self._vm.latest_data_epoch,
+            parent=self,
+        )
+        self.mtf_bar.set_chart_mode("fix")
+        root.addWidget(self.mtf_bar)
+
         # --- Body: Sidebar + Seiten (QStackedWidget) ---
         body = QHBoxLayout()
         # 10.08.2026 (Bugfix, UI-Splitter): Sidebar (links) und Seiten-Stack
@@ -5292,6 +6265,9 @@ class AnalyticsWindow(PersistentWindow):
             print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
         self._sync_profile_filters()
         self._sync_service_filter_button()
+        # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand nach einem
+        # Profil-/Workspace-Restore synchronisieren (data_tf/agg_tf/Range).
+        self._sync_mtf_bar_from_params()
 
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
@@ -5357,9 +6333,22 @@ class AnalyticsWindow(PersistentWindow):
         # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
         # automatisch neu laden. `refresh_all` ist im VM debounced.
         event_bus.service_set_changed.connect(self._on_service_set_changed)
-        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # 21.03.11/12 (MTF-FC): Sortier-Aenderung der Filterleiste (Analytics)
         # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
         event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+        # 21.03.12 (MTF-FC auf Analytics): MtfFilterBarWidget-Signale -> VM.
+        self.mtf_bar.data_tf_changed.connect(self._on_mtf_data_tf_changed)
+        self.mtf_bar.agg_tf_changed.connect(self._vm.set_agg_tf)
+        self.mtf_bar.range_changed.connect(self._on_mtf_range_changed)
+        # 21.03.14 (Wunsch 2): Sortier-Aenderung an den ViewModel
+        # (Profil-Persistenz, Sektion sources) UND ueber den bestehenden
+        # EventBus an die TablePage (set_external_sort_mode, IoC).
+        self.mtf_bar.sort_mode_changed.connect(self._vm.set_sort_mode)
+        self.mtf_bar.sort_mode_changed.connect(
+            event_bus.mtf_fc_sort_changed.emit)
+        # Filterleisten-Zustand aus den VM-Params initial synchronisieren
+        # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
+        self._sync_mtf_bar_from_params()
 
     @Slot()
     def _on_service_set_changed(self) -> None:
@@ -5379,11 +6368,12 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot(str)
     def _on_mtf_fc_sort_changed(self, mode: str) -> None:
-        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+        """21.03.11/12 (MTF-FC): Sortier-Aenderung auf die TablePage anwenden.
 
-        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
-        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
-        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        Die MTF-FC-Filterleiste (AnalyticsWindow) emittiert
+        `event_bus.mtf_fc_sort_changed` ('date' | 'signal' | 'tf'). Die
+        TablePage setzt daraufhin ihre Anzeige-Sortierung entsprechend
+        (IoC, kein Fenster-Know-how).
         """
         if getattr(self, "table_page", None) is None:
             return
@@ -5391,6 +6381,50 @@ class AnalyticsWindow(PersistentWindow):
             self.table_page.set_external_sort_mode(str(mode))
         except Exception as e:
             print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
+
+    @Slot(str)
+    def _on_mtf_data_tf_changed(self, data_tf: str) -> None:
+        """21.03.12: Analysequelle des MtfFilterBarWidget uebernehmen.
+
+        `set_data_tf` setzt bei fixiertem TF auch den `timeframe`-Filter
+        (Analysequelle = Analyse-TF) - die Timeframe-Combo wird dann
+        synchronisiert (Muster set_data_tf-Docstring).
+        """
+        self._vm.set_data_tf(str(data_tf))
+        if str(data_tf).strip().lower() != "multi":
+            self._sync_profile_filters()
+
+    @Slot(str, int, int)
+    def _on_mtf_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
+        """21.03.12: Zeitraum-Preset des MtfFilterBarWidget uebernehmen."""
+        self._vm.set_range(int(from_ts), int(to_ts), str(preset))
+
+    def _sync_mtf_bar_from_params(self) -> None:
+        """Synchronisiert die MTF-FC-Filterleiste aus den VM-Params.
+
+        Wird nach Profil-/Workspace-Restore (params_restored) und initial
+        nach _wire_controls gerufen. `apply_external_state` setzt die Combos
+        mit blockSignals und emittiert die Aenderungs-Signale danach explizit
+        (der VM dedupliziert gleiche Werte, kein Doppel-Refresh).
+        """
+        bar = getattr(self, "mtf_bar", None)
+        if bar is None:
+            return
+        p = self._vm.params
+        try:
+            # 21.03.14 (Wunsch 2): sort_mode stellt die Tabellen-Sortierung
+            # wieder her. 21.03.15 (Bug 3): range_preset wird auf den neuen
+            # Preset-Satz abgebildet (Alt-Werte 'YTD'/'Benutzerdefiniert'
+            # migriert die Filterleiste selbst); range_from/range_to (Custom-
+            # Panel) sind seit 21.03.15 entfallen.
+            bar.apply_external_state(
+                data_tf=str(p.get("data_tf") or "multi"),
+                agg_tf=str(p.get("agg_tf") or "auto"),
+                range_preset=p.get("range_preset"),
+                sort_mode=p.get("sort_mode"),
+            )
+        except (RuntimeError, AttributeError):
+            pass
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:
@@ -6789,6 +7823,14 @@ class HeatmapPage(QWidget):
         self._stack_modes.addWidget(self._standard_ui)
         self._stack_modes.addWidget(self._generic)
         lay.addWidget(self._stack_modes)
+        # 13.08.2026 (Bugfix, User-Meldung 'Heatmap wird nicht gezeigt'):
+        # Die Basis-Ansicht ist seit 21.01 IMMER das generische Widget
+        # (Stack Seite 1). set_mode()/_on_mode_changed() setzen Seite 1
+        # ebenfalls, aber ohne diesen Initial-Switch blieb beim frischen
+        # Start (kein Workspace-Restore mit heatmap_mode) die unsichtbare
+        # Legacy-Standard-UI (Index 0) aktiv -> generische Heatmap nie
+        # dargestellt und ihre Controls nicht bedienbar.
+        self._stack_modes.setCurrentIndex(1)
 
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
@@ -6938,7 +7980,11 @@ class HeatmapPage(QWidget):
         )
         matrix = np.asarray(data.get("matrix"), dtype=float)
         if matrix.size == 0:
-            self._stack.setCurrentIndex(1)
+            # 13.08.2026 (Bugfix): Die Standard-Ansicht (dow x hour) ist
+            # seit 21.01 NICHT mehr sichtbar (Stack zeigt immer das
+            # generische Widget). Ihr Datenstand darf die Seiten-
+            # Sichtbarkeit nicht mehr steuern - sonst verdeckt das
+            # No-Data-Overlay das generische Widget (nicht anklickbar).
             return
         self._render(matrix)
         self._stack.setCurrentIndex(0)
@@ -7082,7 +8128,7 @@ pyqtgraph uebergibt an `tickValues` die ACHSEN-LAENGE in Pixeln (3. Param)
 
 import math
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pyqtgraph as pg
@@ -7090,6 +8136,7 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -7125,6 +8172,27 @@ _VIRIDIS = "viridis"
 
 # E6: Wert-Aggregationen benoetigen einen numerischen feature_data-JSON-Key.
 _VALUE_AGGS = ("avg", "sum", "min", "max")
+
+# 13.08.2026 (Punkt 5, F5): Preisartige feature_data-Keys - SUM ueber
+# Preise erzeugt unsinnig hohe Legendenwerte (z. B. SILVER ~43k/Tag bei
+# 5-Min-Summen) und wird fuer diese Felder deaktiviert. Signal-Felder
+# (strength_value) bleiben erlaubt. Abgleich mit den Output-Schemata der
+# srv_*-Plugins (price, reference_price, poc_price, vah_price, val_price,
+# lvn_price, grid_price, vwap_price, vwap_lower, atr_value, lower_band,
+# lower_level, prox_level1..6).
+_PRICE_LIKE_KEY_HINTS = (
+    "price",      # Preisfelder (price, *price, reference_price)
+    "vwap_lower",  # VWAP-Band-Unterkante
+    "atr_value",  # ATR-Magnitude (Punkte)
+    "band",       # lower_band (Trend-Breakout)
+    "level",      # lower_level / prox_level* (Grid-Level)
+)
+
+
+def _is_price_like_key(key: str) -> bool:
+    """True fuer preisartige feature_data-Keys (13.08.2026, F5)."""
+    k = str(key or "").lower()
+    return any(h in k for h in _PRICE_LIKE_KEY_HINTS) if k else False
 
 # Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
 _DAY_SECONDS = 86400
@@ -7238,6 +8306,35 @@ def _format_heatmap_value(val: Any) -> str:
     return f"{fval:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_legend_value(val: Any, span: float) -> str:
+    """Formatiert einen Legenden-Schwellwert mit adaptiver Genauigkeit.
+
+    12.08.2026 (Bug 5): Bei kleinen Werte-Spannen kollabierten die
+    Quartil-Schwellen der Legende unter der .2f-Rundung zu identischen
+    Labels ('0.01 - 0.01' war unsinnig). Die Nachkommastellen-Zahl wird
+    aus der Spanne abgeleitet, sodass die 25-%-Schritte (span/4) der
+    Viridis-Legende GARANTIERT unterscheidbar bleiben. Ganzzahlige
+    Schwellen ohne Nachkommastellen werden als Integer ausgegeben
+    ('25'), Bruchwerte ohne Nullen ('0.0125', '0.02').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if span is None or span <= 0:
+        decimals = 2
+    else:
+        step = span / 4.0
+        if step >= 1.0:
+            decimals = 0
+        else:
+            decimals = int(math.ceil(-math.log10(step))) + 1
+            decimals = max(0, min(decimals, 6))
+    return f"{fval:.{decimals}f}".rstrip("0").rstrip(".")
+
+
 class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
@@ -7346,6 +8443,13 @@ class _HeatmapAxis(pg.AxisItem):
         (LWC `Q_`): Jahres-/Monatsmarken werden immer gesetzt, feinere
         Marken fuellen die Luecken.
         """
+        # 21.03.20-Bugfix 5: Date-Epochs sind Wanduhr-Sekunden seit 1970
+        # (positiv). Negative/riesige Werte (z. B. zusammengefallener
+        # Auto-Range nach 'Keine Daten' -> [-0.5, 0.5]) wuerden in
+        # _date_marks zu datetime.fromtimestamp(-86400) fuehren und auf
+        # Windows/Python 3.14 OSError 22 werfen. Clampen verhindert das.
+        lo = max(0.0, float(lo))
+        hi = max(0.0, float(hi))
         span = hi - lo
         if span <= 0:
             return []
@@ -7376,7 +8480,14 @@ class _HeatmapAxis(pg.AxisItem):
         d1 = int(math.floor(hi / _DAY_SECONDS)) * _DAY_SECONDS
         d = d0
         while d <= d1:
-            dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            # 21.03.20-Bugfix 5: fromtimestamp kann auf Windows OSError 22
+            # fuer ungueltige (negative/riesige) Epochs werfen - ungueltige
+            # Marken ueberspringen statt zu crashen.
+            try:
+                dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            except (OSError, ValueError, OverflowError):
+                d += _DAY_SECONDS
+                continue
             if dt.month == 1 and dt.day == 1:
                 w = 70
             elif dt.day == 1:
@@ -7551,6 +8662,22 @@ class HeatmapWidget(QWidget):
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown fuer
+        # Multi-Modus-Services (srv_swing_*/srv_trend_* schreiben
+        # `source_mode` top-level in jedes feature_data-Record).
+        # Wird aus dem QUERY_FEATURES-Payload befuellt
+        # (`source_modes` + `has_source_mode_services`);
+        # "[Alle Modi]" (data "all") = kein Filter. Deaktiviert,
+        # wenn KEIN aktiver Service source_mode schreibt.
+        self._combo_mode_filter = QComboBox()
+        self._combo_mode_filter.addItem("[Alle Modi]", "all")
+        self._combo_mode_filter.setMinimumWidth(150)
+        self._combo_mode_filter.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self._combo_mode_filter.setToolTip(
+            "Modus-Filter: grenzt die Daten auf einen source_mode "
+            "der Multi-Modus-Services ein (global fuer Tabelle, "
+            "Heatmaps, Scatter, Verteilung).")
         # 20.03.02 (F1c/F7): 'Feld' ist ein CheckableComboBox – die
         # Multi-Auswahl steuert den Datenquellen-Filter `feature_ids`, die
         # Aggregation nutzt genau EIN aktives Hauptfeld (currentData). Bei
@@ -7605,23 +8732,40 @@ class HeatmapWidget(QWidget):
             s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
                          "links = Zoom-Out.")
 
-        ctrl2 = QHBoxLayout()
-        ctrl2.addWidget(self._chk_candle)
-        ctrl2.addWidget(self._label_overlay_tf)
-        ctrl2.addWidget(QLabel("Zoom X:"))
-        ctrl2.addWidget(self._slider_zoom_x)
-        ctrl2.addWidget(QLabel("Zoom Y:"))
-        ctrl2.addWidget(self._slider_zoom_y)
+        # 21.03.20-Bugfix 1+2: Zwei-zeiliges QGridLayout. Zeile 0 traegt die
+        # Werteanzeige (_label_info) EINE ZEILE UEBER der Steuerleiste,
+        # linksbuendig auf Hoehe des Feld-Dropdowns (Spalte des 'Feld:'-
+        # Labels). Bug 2: Modus-Dropdown steht JETZT VOR der Aggregation.
+        # 'Feld' (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
+        ctrl2 = QGridLayout()
+        ctrl2.setHorizontalSpacing(6)
+        ctrl2.setVerticalSpacing(2)
+        _c = 0
+        ctrl2.addWidget(self._chk_candle, 1, _c); _c += 1
+        ctrl2.addWidget(self._label_overlay_tf, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom X:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_x, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom Y:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_y, 1, _c); _c += 1
         # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
         # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
         # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
-        ctrl2.addSpacing(15)
-        ctrl2.addWidget(QLabel("Aggregation:"))
-        ctrl2.addWidget(self._combo_agg)
-        ctrl2.addSpacing(10)
-        ctrl2.addWidget(QLabel("Feld:"))
-        ctrl2.addWidget(self._combo_field, 1)
-        ctrl2.addWidget(self._label_info)
+        ctrl2.addWidget(QWidget(), 1, _c); _c += 1
+        ctrl2.setColumnMinimumWidth(_c - 1, 15)
+        # 21.03.20-Bugfix 2: Modus-Dropdown VOR der Aggregation (Tausch).
+        ctrl2.addWidget(QLabel("Modus:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_mode_filter, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Aggregation:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_agg, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Feld:"), 1, _c); _c += 1
+        _field_col = _c
+        ctrl2.addWidget(self._combo_field, 1, _c); _c += 1
+        ctrl2.setColumnStretch(_field_col, 1)
+        # 21.03.20-Bugfix 1: Werteanzeige eine Zeile ueber der Steuerleiste
+        # (linksbuendig auf Hoehe des Feld-Dropdowns) - die Zeile bleibt
+        # ruhiger, weil das Label nicht mehr rechts am Ende wackelt.
+        ctrl2.addWidget(self._label_info, 0, _field_col,
+                        1, 1, Qt.AlignLeft)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -7723,16 +8867,20 @@ class HeatmapWidget(QWidget):
         self._combo_x.currentIndexChanged.connect(self._on_config_changed)
         self._combo_y.currentIndexChanged.connect(self._on_config_changed)
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
+        # 21.03.20 (Analytics Modus-Filter): Aenderung im Modus-
+        # Dropdown -> globaler ViewModel-Refresh (alle Datenquellen).
+        self._combo_mode_filter.currentIndexChanged.connect(
+            self._on_mode_filter_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
         # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
-        # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung ist ENTFERNT -
-        # das 'Feld'-Dropdown schreibt KEIN feature_ids mehr (kein
-        # Ueberschreiben der ServicePicker-Auswahl bzw. des Restores). Die
-        # Haken spiegeln den aktiven Filter (_sync_combos_from_payload); die
-        # Feld-Auswahl (Current-Item) steuert heatmap_field weiterhin ueber
-        # currentIndexChanged -> _on_config_changed.
-        # self._combo_field.selection_changed.connect(
-        #     self._on_field_selection_changed)
+        # 21.03.15 (Bug 1): Die Verbindung ist WIEDER AKTIV - Check/Uncheck
+        # im 'Feld'-Dropdown schreibt feature_ids ueber den bestehenden
+        # ServicePicker-Pfad (`_on_field_selection_changed` ->
+        # `_reconcile_sammel_checks` -> `_checked_field_service_ids` ->
+        # `set_feature_ids`), damit ServicePicker-Auswahl und Feld-Dropdown
+        # konsistent bleiben.
+        self._combo_field.selection_changed.connect(
+            self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -7808,6 +8956,12 @@ class HeatmapWidget(QWidget):
             self._set_combo_data(
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
+            # 21.03.20 (Analytics Modus-Filter): Modus-Auswahl aus
+            # den VM-Params wiederherstellen (Profil-/Workspace-
+            # Restore; unbekannte Werte werden additiv ergaenzt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(p.get("service_mode") or "all"))
             # Runde 8 (Bugfix 3): Das 'Feld'-Dropdown wird aus den gecachten
             # Feld-Metadaten (self._field_keys/self._field_sources) + den
             # aktuellen VM-Params SYNCHRON neu abgeleitet (Items, Haken,
@@ -7879,6 +9033,24 @@ class HeatmapWidget(QWidget):
         self._slider_zoom_x.setEnabled(True)
         self._slider_zoom_y.setEnabled(True)
         is_value_agg = agg in _VALUE_AGGS
+        # 13.08.2026 (Punkt 5, F5): SUM fuer preisartige Felder sperren
+        # (unsinnig hohe Legendenwerte); Signal-Felder (strength_value)
+        # bleiben erlaubt. Ist SUM gerade aktiv und das Feld preisartig,
+        # wird implizit auf AVG gewechselt (VM-Config + Refresh idempotent).
+        active_field = self._field_key(self._combo_field.currentData())
+        # 13.08.2026 (Punkt 5, F5): Modul-Funktion (kein self.) - die
+        # Helfer ist als reine Funktion definiert (SRP, kein Widget-Zustand).
+        price_like = _is_price_like_key(active_field)
+        sum_idx = self._combo_agg.findData("sum")
+        if sum_idx >= 0:
+            _sum_item = self._combo_agg.model().item(sum_idx)
+            if _sum_item is not None:
+                _sum_item.setEnabled(not price_like)
+        if price_like and agg == "sum":
+            self._set_combo_data(self._combo_agg, "avg")
+            agg = "avg"
+            is_value_agg = True
+            self._apply_config()
         self._combo_field.setEnabled(is_value_agg)
         if is_value_agg:
             self._combo_field.setToolTip(
@@ -7953,6 +9125,19 @@ class HeatmapWidget(QWidget):
         self._apply_config()
         self.request_data()
 
+    def _on_mode_filter_changed(self, *args) -> None:
+        """21.03.20: Modus-Filter-Aenderung -> ViewModel (global).
+
+        `set_service_mode` stoesst intern den Refresh von
+        QUERY_FEATURES + allen Datenquellen an (Tabelle, beide
+        Heatmaps, Scatter, Verteilung - Entscheidung 1). Der
+        _syncing-Guard verhindert Endlos-Schleifen.
+        """
+        if self._syncing or self._view_model is None:
+            return
+        mode = str(self._combo_mode_filter.currentData() or "all")
+        self._view_model.set_service_mode(mode)
+
     def _apply_config(self) -> None:
         self._view_model.set_heatmap_config(
             x_dim=str(self._combo_x.currentData() or "date"),
@@ -8005,14 +9190,13 @@ class HeatmapWidget(QWidget):
     # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
     # ------------------------------------------------------------------
     def _on_field_selection_changed(self, _checked: List[str]) -> None:
-        """CheckState-Wechsel im 'Feld'-Dropdown (nicht mehr verbunden).
+        """CheckState-Wechsel im 'Feld'-Dropdown -> feature_ids-Filter.
 
-        10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung
-        selection_changed -> dieser Handler wurde in __init__ entfernt - das
-        'Feld'-Dropdown schreibt KEIN feature_ids mehr (Single Source of
-        Truth = ServicePicker; kein Ueberschreiben des Restores). Der Handler
-        bleibt als Bestandscode erhalten.
-        -> feature_ids-Filter.
+        21.03.15 (Bug 1): Die Verbindung selection_changed -> dieser
+        Handler ist WIEDER aktiv (siehe __init__) - Check/Uncheck im
+        'Feld'-Dropdown schreibt feature_ids ueber den ServicePicker-
+        Pfad, damit ServicePicker-Auswahl und Feld-Dropdown konsistent
+        bleiben (Single Source of Truth = ServicePicker + Dropdown).
 
         Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
         `set_feature_ids` stoesst den Debounce-Refresh der generischen
@@ -8025,9 +9209,33 @@ class HeatmapWidget(QWidget):
         """
         if self._syncing or self._view_model is None:
             return
+        # 13.08.2026 (Punkt 4, F4): Vor der Reconciliation das AKTIVE Feld
+        # merken - wird es abgehakt, wechselt die Aggregations-/Anzeige-
+        # auswahl implizit auf das naechste angehakte Feld (genau EIN Feld
+        # wird aggregiert/angezeigt; die angehakten Paare bestimmen die
+        # Verfuegbarkeit).
+        prev_ud = str(self._combo_field.currentData() or "")
         self._reconcile_sammel_checks()
-        ids = self._checked_field_service_ids()
-        self._view_model.set_feature_ids(ids)
+        new_ud = str(self._combo_field.currentData() or "")
+        # 12.08.2026 (Option A, Bug 1/2): Die angehakten Items bestimmen die
+        # (Service|Parameter)-Paare (`set_field_selection`) - An/Abwaehlen
+        # eines Parameters aendert die Grafik auch bei unveraenderter
+        # Service-Menge. Leere Auswahl = kein Paar-Filter (alle Features,
+        # ViewModel-Semantik 15.03-E). Alt-/Test-ViewModel ohne
+        # Parameter-Ebene fallen auf den Service-Pfad zurueck.
+        pairs = self._checked_field_pairs()
+        if hasattr(self._view_model, "set_field_selection"):
+            self._view_model.set_field_selection(pairs)
+        else:
+            ids = self._checked_field_service_ids()
+            self._view_model.set_feature_ids(ids)
+        # P4 (F4): Das aktive Feld wurde abgehakt -> die Auswahl ist auf das
+        # naechste angehakte Feld nachgezogen (_sync_field_current_after_-
+        # checks in _reconcile_sammel_checks, blockSignals) -> die
+        # Konfiguration/der Refresh wird hier explizit nachgezogen, damit
+        # das neue Feld auch aggregiert/angezeigt wird.
+        if new_ud and new_ud != prev_ud:
+            self._apply_config()
 
     def _reconcile_sammel_checks(self) -> None:
         """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
@@ -8119,6 +9327,55 @@ class HeatmapWidget(QWidget):
                 if sid and sid not in ids:
                     ids.append(sid)
         return ids
+
+    def _checked_field_pairs(self) -> List[str]:
+        """(Service|Parameter)-Paare der angehakten Feld-Items (12.08.2026).
+
+        Option A (Bug 1/2): Grundlage des Parameter-Filters
+        (`set_field_selection`). `ALL|<key>` expandiert ueber
+        `self._field_sources[key]` auf ALLE Quellen-Services des Keys,
+        `{service_id}|<key>` liefert genau das Paar. Roh-Keys ohne `|`
+        (Legacy) bleiben aussen vor (tragen keine Service-Zuordnung).
+        Dedupliziert, in Item-Reihenfolge.
+        """
+        pairs: List[str] = []
+        for ud in self._combo_field.checked_data():
+            s = str(ud or "")
+            if s.startswith("ALL|"):
+                key = s.split("|", 1)[1]
+                for sid in (self._field_sources.get(key) or []):
+                    if sid and f"{sid}|{key}" not in pairs:
+                        pairs.append(f"{sid}|{key}")
+            elif "|" in s:
+                sid, key = s.split("|", 1)
+                if sid and f"{sid}|{key}" not in pairs:
+                    pairs.append(f"{sid}|{key}")
+        return pairs
+
+    def _sync_field_selection_to_vm(self) -> None:
+        """Spiegelt die effektive Paar-Auswahl in den ViewModel (12.08.2026).
+
+        Wird am Ende jedes `_rebuild_field_dropdown()` gerufen: Die
+        effektiven (Service|Parameter)-Paare (aus der Dropdown-Auswahl)
+        werden via `set_field_selection` persistiert, damit a) die
+        DEFAULT-Vorbelegung (erster Parameter je aktivem Service) auch die
+        Query steuert (Bug 2) und b) verwaiste/entfernte Paare automatisch
+        bereinigt werden. Nur bei aktivem Service-Filter (feature_ids nicht
+        leer) - ohne Filter (alle Features) bleibt field_selection None und
+        die Heatmap zeigt weiterhin alle Features ohne Paar-Filter.
+        Idempotent via set_field_selection (kein Refresh bei Gleichstand).
+        """
+        if self._view_model is None:
+            return
+        p = self._view_model.params
+        if not (p.get("feature_ids") or []):
+            return
+        if not hasattr(self._view_model, "set_field_selection"):
+            return
+        pairs = self._checked_field_pairs()
+        # update_ids=False: feature_ids (ServicePicker) bleibt die
+        # Service-Quelle - der Sync verkleinert die Service-Auswahl nie.
+        self._view_model.set_field_selection(pairs, update_ids=False)
 
     # ------------------------------------------------------------------
     # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
@@ -8285,6 +9542,11 @@ class HeatmapWidget(QWidget):
                 field_sources if isinstance(field_sources, dict) else {})
         else:
             self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown aus dem
+        # LEICHTEN QUERY_FEATURES-Payload befuellen (`source_modes`
+        # + `has_source_mode_services`; Entscheidung 2: kein Extra-
+        # Roundtrip, Worker-Thread + Reader-Cache).
+        self._sync_mode_filter_from_payload(data)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
         """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
@@ -8298,6 +9560,51 @@ class HeatmapWidget(QWidget):
             self._no_data_variants_error = True
             self._rebuild_field_dropdown(self._field_keys,
                                          self._field_sources)
+
+    def _sync_mode_filter_from_payload(self, data: Dict[str, Any]) -> None:
+        """Befuellt das Modus-Dropdown aus dem QUERY_FEATURES-Payload.
+
+        21.03.20 (Entscheidung 2/4): `source_modes` (distinct, case-original)
+        fuellt die Items (itemData = Modus-Wert). `has_source_mode_services
+        == False` deaktiviert die Combo und setzt den Filter auf "all"
+        zurueck (kein aktiver Service schreibt source_mode). Stale-Payloads
+        werden verworfen (Generation-Guard, Muster _sync_combos_from_payload).
+        """
+        if self._view_model is None:
+            return
+        vm = self._view_model
+        payload_gen = data.get("restore_generation")
+        if (payload_gen is not None
+                and str(payload_gen) != str(
+                    getattr(vm, "restore_generation", 0))):
+            return  # Stale-Payload (Query lief VOR dem letzten Restore)
+        modes = [str(m) for m in (data.get("source_modes") or [])]
+        has_sm = bool(data.get("has_source_mode_services"))
+        self._syncing = True
+        try:
+            self._combo_mode_filter.blockSignals(True)
+            self._combo_mode_filter.clear()
+            self._combo_mode_filter.addItem("[Alle Modi]", "all")
+            for m in modes:
+                if str(m).strip():
+                    self._combo_mode_filter.addItem(
+                        str(m).strip(), str(m).strip())
+            # Deaktivierung: Combo aus + Filter auf "all" zuruecksetzen
+            # (idempotent - set_service_mode("all") refresh-t nur bei
+            # tatsaechlicher Aenderung).
+            if not has_sm:
+                self._combo_mode_filter.setEnabled(False)
+                if str(vm.params.get("service_mode") or "all") != "all":
+                    vm.set_service_mode("all")
+            else:
+                self._combo_mode_filter.setEnabled(True)
+            # Auswahl aus den VM-Params wiederherstellen (Restore gewinnt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(vm.params.get("service_mode") or "all"))
+        finally:
+            self._combo_mode_filter.blockSignals(False)
+            self._syncing = False
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)
@@ -8321,12 +9628,32 @@ class HeatmapWidget(QWidget):
         self._sync_combos_from_payload(data)
         agg = str(data.get("agg") or "count")
 
+        # 21.03.20-Bugfix 4: Achsen-Labels VOR dem Leer-Check konfigurieren -
+        # auch bei 'Keine Daten' (gewaehlter Modus ohne DB-Rows) muss die
+        # Service-Beschriftung (inkl. ' / {Modus}') auf der Achse
+        # aktualisiert werden (vorher blieb der alte Zustand stehen).
+        x_labels = data.get("x_labels") or []
+        y_labels = data.get("y_labels") or []
+        if x_dim == "service_id" and self._view_model is not None:
+            x_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in x_labels]
+        if y_dim == "service_id" and self._view_model is not None:
+            y_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in y_labels]
+        self._axis_x.configure(x_dim, x_labels)
+        self._axis_y.configure(y_dim, y_labels)
+
         if matrix.size == 0:
             self._n_cols = self._n_rows = 0
             self._x_axis = []
             self._y_axis = []
             self._image.clear()
-            self._label_info.setText("Keine Daten")
+            # 21.03.20-Bugfix 4: 'Keine Daten'-Hinweis mit Modus-Kontext
+            # (erklaert, dass der gewaehlte Modus keine DB-Rows hat).
+            _mode_txt = str(self._combo_mode_filter.currentData() or "all")
+            self._label_info.setText(
+                "Keine Daten"
+                + (f" fuer Modus '{_mode_txt}'" if _mode_txt != "all" else ""))
             self._legend.hide()  # 21.01 Bugfix 2: keine Legende ohne Daten
             self._grid_lines.setData([], [])  # 21.01 R3: keine Teiler
             self._clear_overlay()
@@ -8399,20 +9726,6 @@ class HeatmapWidget(QWidget):
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a): Senkrechte Teiler je
         # Dateneinheit (TF-Bar-Intervall) an der X-Achse (date).
         self._update_grid_lines()
-
-        # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
-        # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
-        x_labels = data.get("x_labels") or []
-        y_labels = data.get("y_labels") or []
-        if x_dim == "service_id" and self._view_model is not None:
-            x_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in x_labels]
-        if y_dim == "service_id" and self._view_model is not None:
-            y_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in y_labels]
-        # Dynamische Achsen konfigurieren (Bugfix 5+6).
-        self._axis_x.configure(x_dim, x_labels)
-        self._axis_y.configure(y_dim, y_labels)
 
         # 20.02.01 (E4): Achsen-Label der Tageszeit mit UTC-Offset –
         # DST-robust aus dem neuesten Datumswert der Daten abgeleitet
@@ -8602,7 +9915,63 @@ class HeatmapWidget(QWidget):
                       or self._field_key(self._combo_field.currentData()))
         active_ids = {str(f).strip().lower()
                       for f in (p.get("feature_ids") or [])}
+        # 12.08.2026 (Option A, Bug 1/2): EXPLIZITE (Service|Parameter)-
+        # Auswahl (`field_selection`) gewinnt - sie wird bei Check/Uncheck
+        # persistiert und beim Aggregations-/Restore-Wechsel EXAKT wieder
+        # hergestellt (Bug 2: keine 'alle Parameter'-Vorbelegung mehr; Bug 1:
+        # An/Abwaehlen eines Parameters aendert die Grafik). Ohne explizite
+        # Auswahl greift die DEFAULT-Vorbelegung: bei aktivem Service-Filter
+        # wird je aktivem Service genau der ERSTE Parameter angehakt (fuer
+        # AVG/SUM/MIN/MAX ist genau EIN aktives Hauptfeld sinnvoll), bei
+        # leerem Filter (alle Features) nur der erste Eintrag insgesamt
+        # (Verhalten wie bisher).
+        sel_pairs = [str(x) for x in (p.get("field_selection") or [])]
+        sel_map: Dict[str, Set[str]] = {}
+        for _sp in sel_pairs:
+            if "|" in _sp:
+                _sid, _k = _sp.split("|", 1)
+                sel_map.setdefault(_k, set()).add(_sid.strip().lower())
+        explicit = bool(sel_pairs)
         no_filter = not active_ids
+        # Default-Vorbelegung: erster Parameter je aktivem Service
+        # (sortierte Key-Reihenfolge aus self._field_keys).
+        first_key_by_service: Dict[str, str] = {}
+        if not explicit and not no_filter:
+            for k in sorted(self._field_keys):
+                for sid in self._field_sources.get(k) or []:
+                    sid_l = sid.strip().lower()
+                    if (sid_l in active_ids
+                            and sid_l not in first_key_by_service):
+                        first_key_by_service[sid_l] = k
+        # no_filter-Semantik: genau der ERSTE Eintrag insgesamt wird
+        # vorbelegt (first_done); alle weiteren folgen `match`.
+        first_done = [no_filter and not explicit]
+
+        def _chk(match: bool) -> bool:
+            if first_done[0]:
+                first_done[0] = False
+                return True
+            return match
+
+        def _chk_pair(sid: str, key: str) -> bool:
+            """Check-Vorgabe fuer einen '{sid}|{key}'-Einzel-Eintrag."""
+            sid_l = str(sid).strip().lower()
+            if explicit:
+                # Nur AKTIVE Services: ein Paar eines im ServicePicker
+                # abgewaehlten Services darf nicht angehakt bleiben.
+                return (sid_l in active_ids
+                        and sid_l in sel_map.get(key, ()))
+            return first_key_by_service.get(sid_l) == key
+
+        def _chk_all(key: str, src: List[str]) -> bool:
+            """Check-Vorgabe fuer den 'ALL|<key>'-Sammel-Eintrag."""
+            if explicit:
+                return all(str(s).strip().lower() in active_ids
+                           and str(s).strip().lower() in sel_map.get(key, ())
+                           for s in src)
+            return all(first_key_by_service.get(str(s).strip().lower())
+                       == key for s in src)
+
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
@@ -8615,30 +9984,32 @@ class HeatmapWidget(QWidget):
                     src = self._field_sources.get(k) or []
                     self._combo_field.add_checkable_item(
                         f"Alle Services / {k}", f"ALL|{k}",
-                        checked=no_filter or all(
-                            s.lower() in active_ids for s in src))
+                        checked=_chk(_chk_all(k, src)))
             if self._field_keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
             for k in sorted(self._field_keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
-                    # Eindeutiger Service: nur angehakt, wenn der Service im
-                    # aktiven Filter liegt (oder kein Filter).
+                    # Eindeutiger Service: nur angehakt, wenn das
+                    # (Service|Parameter)-Paar aktiv ist (Default: erster
+                    # Parameter; explizit: field_selection).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
-                        checked=no_filter or sids[0].lower() in active_ids)
+                        checked=_chk(_chk_pair(sids[0], k)))
                 elif not sids:
                     # Legacy ohne field_sources (roher Key, defensiv).
-                    self._combo_field.add_checkable_item(k, k, checked=True)
+                    self._combo_field.add_checkable_item(k, k,
+                                                         checked=_chk(False))
                 else:
-                    # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
-                    # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
-                    all_active = all(s.lower() in active_ids for s in sids)
+                    # Shared Key: je Quelle ein Einzel-Eintrag; der Sammel-
+                    # Eintrag deckt die Quellen ab (Q5/XOR), daher nur
+                    # anhaken, solange NICHT alle Quellen des Keys aktiv.
+                    all_checked = _chk_all(k, sids)
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
-                            checked=no_filter
-                            or (sid.lower() in active_ids and not all_active))
+                            checked=_chk(_chk_pair(sid, k)
+                                         and not all_checked))
             if prev_field in self._field_keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
@@ -8676,6 +10047,10 @@ class HeatmapWidget(QWidget):
                     self._combo_field.setCurrentIndex(fidx)
             else:
                 self._apply_config()
+        # 12.08.2026 (Option A, Bug 1/2): Effektive Paar-Auswahl in den VM
+        # spiegeln (Default-Vorbelegung materialisieren / verwaiste Paare
+        # bereinigen). Idempotent; kein Refresh bei Gleichstand.
+        self._sync_field_selection_to_vm()
 
     def _render_no_data_items(self) -> None:
         """Rendert die No-Data-Hinweise aus dem Payload-Cache (B4-2/B4-5).
@@ -9241,7 +10616,7 @@ class HeatmapWidget(QWidget):
                 time_txt = (f"{days[d_day.weekday()]} {d_day.day:02d}."
                             f"{d_day.month:02d}.{d_day.year % 100:02d} "
                             f"{d_time.hour:02d}:{d_time.minute:02d}  →  ")
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, OSError):
                 time_txt = ""
         if not in_bounds:
             self._label_info.setText(
@@ -9288,22 +10663,31 @@ class HeatmapWidget(QWidget):
                 label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            # 12.08.2026 (Bug 5): Viridis als OPERATOR-Intervalle. Die
+            # Schwellen v25/v50/v75/vmax werden mit adaptiver Genauigkeit
+            # formatiert (_format_legend_value, Spannen-abhaengige Nach-
+            # kommastellen), damit sie bei kleinen Spannen (z. B. vmin=0.01,
+            # vmax=0.02) NICHT zusammenfallen ('0.01 - 0.01' war unsinnig).
+            # Die Labels sind eindeutige Operator-Angaben (`<`, `<=`,
+            # `>=`) statt Bindestrich-Bereichen.
             span = vmax - vmin
             v25 = vmin + 0.25 * span
             v50 = vmin + 0.50 * span
             v75 = vmin + 0.75 * span
-            fmt = _format_heatmap_value
+            fmt = lambda v: _format_legend_value(v, span)
+            # 13.08.2026 (Punkt 2, F2): Viridis-Operatoren VOR der Zahl,
+            # kein 'x' mehr - eindeutige Schwellen-Angaben
+            # (<= v25, >= v25, >= v50, >= v75, >= vmax).
             self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
                                     "<= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
-                                    "{} - {}".format(fmt(v25), fmt(v50)))
+                                    ">= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
-                                    "{} - {}".format(fmt(v50), fmt(v75)))
+                                    ">= {}".format(fmt(v50)))
             self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
-                                    "{} - {}".format(fmt(v75), fmt(vmax)))
-            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
                                     ">= {}".format(fmt(v75)))
+            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
+                                    ">= {}".format(fmt(vmax)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:

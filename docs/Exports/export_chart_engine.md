@@ -1,7 +1,7 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Chart-Fenster & Lightweight Charts
 
 > Teil-Export (sachbezogen). Vollständiger Export: export_Full.md
-> Dateien in dieser Datei: 26
+> Dateien in dieser Datei: 23
 
 ## 1. ORDNERSTRUKTUR
 ```
@@ -27,9 +27,6 @@ PyTrader/
             04_live_updates.js
             05_measurement.js
             06_two_tier.js
-            07_mtf_fc.js
-            08_mtf_layers.js
-            09_mtf_axis.js
         overlays/
             __init__.py
             style_models.py
@@ -104,15 +101,6 @@ JS_FILES = [
     # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
     # werden (hängt sich über optionale Hooks in 04 ein).
     "06_two_tier.js",
-    # Phase 21.03 (MTF-FC v4): Zoom-Kaskade, Puls-Breadcrumb, Boundary-UI
-    # (07) und interaktive TF-Badges & Geister-Marker (08). Beide hängen
-    # sich über optionale Hooks in 04 ein (Muster 06_two_tier.js).
-    "07_mtf_fc.js",
-    "08_mtf_layers.js",
-    # 21.03.11 (Bug 4): TF-spezifische Achsen-Ticks – Overlay-Layer rendert
-    # Zeit-Tick-Labels aligniert zum gewählten Timeframe (M15 -> 15-min-
-    # Marken, H1 -> 1h-Marken); 04 liefert die Intraday-Labels zurück.
-    "09_mtf_axis.js",
 ]
 
 
@@ -286,12 +274,6 @@ class ChartBridge(QObject):
     measurementChanged = Signal(str)
     olderDataRequested = Signal(int, int, int, int)
     jumpToLiveRequested = Signal()
-    # Phase 21.03 (MTF-FC v4): Viewport-Epochs für die Kaskaden-Engine,
-    # interaktive TF-Badges und Geister-Marker (21.03.08/21.03.09).
-    viewportChanged = Signal(int, int)
-    badgeClicked = Signal(str, bool)
-    ghostMarkerClicked = Signal(float, str)
-    guardOverrideReset = Signal()
 
     @Slot(float, float, float)
     def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
@@ -308,21 +290,6 @@ class ChartBridge(QObject):
 
     @Slot()
     def onJumpToLive(self): self.jumpToLiveRequested.emit()
-
-    @Slot(int, int)
-    def onViewportChanged(self, from_epoch, to_epoch):
-        self.viewportChanged.emit(from_epoch, to_epoch)
-
-    @Slot(str, bool)
-    def onBadgeClick(self, tf, ctrl):
-        self.badgeClicked.emit(tf, ctrl)
-
-    @Slot(float, str)
-    def onGhostMarkerClick(self, price, target_tf):
-        self.ghostMarkerClicked.emit(price, target_tf)
-
-    @Slot()
-    def onGuardOverrideReset(self): self.guardOverrideReset.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -506,25 +473,6 @@ class PyTraderChartWindow(QMainWindow):
         self._js_window_first_real: Optional[int] = None
         self._js_window_last_real: Optional[int] = None
 
-        # Phase 21.03 (MTF-FC v4): Data Provider + Boundary + isolierter
-        # Namespace (Schicht 2, 21.03.01/02). Die Engine-Module sind reine
-        # Logik; die UI greift NIE direkt auf shared_state zu, sondern über
-        # den Provider (MVVM, Grundsatz 4). Der Namespace ist fenster-lokal.
-        self.mtf_fc_provider: MtfFcProvider = MtfFcProvider()
-        self.mtf_fc_boundary: MtfFcBoundary = MtfFcBoundary(provider=self.mtf_fc_provider)
-        self._mtf_fc_context = None  # PluginContext wird lazy je Aufruf erzeugt
-        self._mtf_fc_ns: Dict[str, Any] = default_mtf_fc_state()
-        self._mtf_fc_last_viewport: Optional[Tuple[int, int]] = None
-        # 21.03.11 (Bug 2): Pending-Viewport-Epochs nach einem Kaskaden-TF-
-        # Wechsel. Die persistierten `visible_from/visible_to` sind Bar-Offsets
-        # des ALTEN TF-Fensters (H1) und dürfen NICHT auf das neue Fenster
-        # (z. B. M5) angewendet werden (sonst zeigt der Chart einen winzigen
-        # Ausschnitt und die Kaskade springt direkt weiter). Stattdessen wird
-        # der Zeitbereich des auslösenden Viewports (Wanduhr-Epochs) beim
-        # Refresh beibehalten und in logische Indizes des neuen Fensters
-        # übersetzt (`_resolve_epoch_logical_range`).
-        self._mtf_fc_pending_epochs: Optional[Tuple[int, int]] = None
-
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
         matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
@@ -665,26 +613,6 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
-        # Phase 21.03 (MTF-FC v4): Filterleiste (21.03.07) in die Toolbar
-        # einsetzen (nach row2). MVVM: Das Widget enthält KEIN SQL und
-        # kommuniziert ausschliesslich über Signale (Grundsatz 4/5).
-        self.mtf_filter_bar: MtfFilterBarWidget = MtfFilterBarWidget(
-            provider=self.mtf_fc_provider)
-        toolbar_layout = self.ui_widget.findChild(QVBoxLayout, "verticalLayout_toolbar")
-        if toolbar_layout is not None:
-            toolbar_layout.addWidget(self.mtf_filter_bar)
-        self.mtf_filter_bar.data_tf_changed.connect(self._on_mtf_fc_data_tf_changed)
-        self.mtf_filter_bar.chart_tf_changed.connect(self._on_mtf_fc_chart_tf_changed)
-        self.mtf_filter_bar.range_changed.connect(self._on_mtf_fc_range_changed)
-        self.mtf_filter_bar.guard_override_requested.connect(self._on_mtf_fc_guard_override_requested)
-        # 21.03.11 (Bug 6): Fehlende Verdrahtung nachgerüstet – Sortierung,
-        # Session-Filter und Template-Anwendung waren als UI vorhanden, aber
-        # nicht an die Logik angebunden (Dropdowns/Buttons wirkungslos).
-        self.mtf_filter_bar.sort_mode_changed.connect(self._on_mtf_fc_sort_mode_changed)
-        self.mtf_filter_bar.sessions_changed.connect(self._on_mtf_fc_sessions_changed)
-        self.mtf_filter_bar.template_applied.connect(self._on_mtf_fc_template_applied)
-        self.mtf_filter_bar.refresh_templates()
-
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
         self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -704,11 +632,6 @@ class PyTraderChartWindow(QMainWindow):
         # Live-Ende („Live"-Button).
         self.bridge.olderDataRequested.connect(self._on_older_data_requested)
         self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
-        # Phase 21.03 (MTF-FC v4): Kaskaden-/Layer-Signale (21.03.08/09).
-        self.bridge.viewportChanged.connect(self._on_mtf_fc_viewport_changed)
-        self.bridge.badgeClicked.connect(self._on_mtf_fc_badge_clicked)
-        self.bridge.ghostMarkerClicked.connect(self._on_mtf_fc_ghost_marker_clicked)
-        self.bridge.guardOverrideReset.connect(self._on_mtf_fc_guard_reset)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -1231,9 +1154,6 @@ class PyTraderChartWindow(QMainWindow):
             # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
             # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
             "hasMoreHistory": self.chart_buffer.has_more_history,
-            # Phase 21.03 (MTF-FC v4): Kaskaden-/Boundary-State für die
-            # JS-Hooks (Breadcrumb, Boundary-UI, Layer-Badges).
-            "mtfFcState": self._mtf_fc_js_state(),
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -1245,19 +1165,8 @@ class PyTraderChartWindow(QMainWindow):
 
         # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
         # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
-        # 21.03.11 (Bug 2): Nach einem Kaskaden-TF-Wechsel (z. B. H1 -> M5)
-        # werden die auslösenden Viewport-EPOCHS beibehalten, statt die
-        # Bar-Offsets des alten TF-Fensters auf das neue Fenster anzuwenden
-        # (die Offsets sind fensterspezifisch -> winziger/verrutschter
-        # Ausschnitt, Kaskade würde sofort weiter springen).
-        if self._mtf_fc_pending_epochs is not None:
-            vp_from, vp_to = self._mtf_fc_pending_epochs
-            self._mtf_fc_pending_epochs = None
-            range_from, range_to = self._resolve_epoch_logical_range(
-                continuous_candles, vp_from, vp_to)
-        else:
-            range_from, range_to = self._resolve_visible_logical_range(
-                len(continuous_candles))
+        range_from, range_to = self._resolve_visible_logical_range(
+            len(continuous_candles))
         if range_from is not None and range_to is not None:
             update_package["rangeFrom"] = range_from
             update_package["rangeTo"] = range_to
@@ -1412,80 +1321,6 @@ class PyTraderChartWindow(QMainWindow):
         f = max(0, min(vf, total - 1))
         t = max(f + 1, min(vt, total))
         return f, t
-
-    def _resolve_epoch_logical_range(
-        self, candles: List[Dict[str, Any]],
-        from_epoch: Optional[int], to_epoch: Optional[int]):
-        """21.03.11 (Bug 2): Übersetzt einen Zeitbereich (Wanduhr-Epochs) in
-        logische Indizes des aktuellen Tier-1-Fensters.
-
-        Nach einem Kaskaden-TF-Wechsel wird der auslösende Viewport-Zeitbereich
-        beibehalten (statt der fensterspezifischen Bar-Offsets). Die konti-
-        nuierlichen Candle-Zeiten werden über `_time_cont_to_real` auf echte
-        Epochs gemappt und per Binärsuche in Indizes übersetzt.
-
-        Args:
-            candles: Tier-1-Kerzen (kontinuierliche Zeiten).
-            from_epoch/to_epoch: Zeitbereich als Wanduhr-Epochs.
-
-        Returns:
-            (range_from, range_to) als ints oder (None, None).
-        """
-        if not candles:
-            return None, None
-        if from_epoch is None or to_epoch is None:
-            return None, None
-        try:
-            from_epoch, to_epoch = int(from_epoch), int(to_epoch)
-        except (TypeError, ValueError):
-            return None, None
-        # Zeitbereich -> kontinuierliche Zeiten (Binärsuche auf cont-Keys).
-        # _time_cont_to_real mappt cont -> real (bijektiv, monoton steigend,
-        # Invariante 7). Die reale Epoch ist in cont monoton wachsend, daher
-        # ist die Binärsuche auf den sortierten cont-Keys korrekt.
-        if not self._time_cont_to_real:
-            return None, None
-        cont_keys = sorted(self._time_cont_to_real.keys())
-        if not cont_keys:
-            return None, None
-        f_cont = self._epoch_to_cont(cont_keys, from_epoch)
-        t_cont = self._epoch_to_cont(cont_keys, to_epoch)
-        if f_cont is None or t_cont is None:
-            return None, None
-        # Kontinuierliche Zeiten -> Indizes im Tier-1-Fenster.
-        f_idx, t_idx = 0, len(candles) - 1
-        for i, c in enumerate(candles):
-            if int(c["time"]) >= f_cont:
-                f_idx = i
-                break
-        for i in range(len(candles) - 1, -1, -1):
-            if int(candles[i]["time"]) <= t_cont:
-                t_idx = i
-                break
-        if t_idx < f_idx:
-            t_idx = f_idx
-        return f_idx, t_idx
-
-    def _epoch_to_cont(self, cont_keys: List[int], epoch: int) -> Optional[int]:
-        """Binärsuche: kontinuierliche Zeit für einen Wanduhr-Epoch.
-
-        Liefert den cont-Key, dessen reale Epoch am nächsten unterhalb der
-        gesuchten liegt (obere Schranke), damit der Viewport den Zeitbereich
-        inklusive der linken Kante abdeckt. Liegt die gesuchte Epoch vor dem
-        ersten Datenpunkt, wird der erste Key geliefert."""
-        if not cont_keys:
-            return None
-        lo, hi = 0, len(cont_keys) - 1
-        best = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            mid_real = self._time_cont_to_real[cont_keys[mid]]
-            if mid_real <= epoch:
-                best = cont_keys[mid]
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best if best is not None else cont_keys[0]
 
     def _on_jump_to_live(self) -> None:
         """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
@@ -1897,267 +1732,6 @@ class PyTraderChartWindow(QMainWindow):
         if not self._is_loading_data:
             self.measurement_state = json.loads(m) if m else None
             self.save_state()
-
-    # ======================================================================
-    # Phase 21.03 – MTF-FC v4 (Kaskade, Boundary, Guards, Filterleiste)
-    # ======================================================================
-
-    def _mtf_fc_js_state(self) -> Dict[str, Any]:
-        """Baut den JS-freundlichen MTF-FC-State für das Update-Payload.
-
-        Keys sind camelCase (JS-Hooks in 07/08) und werden aus dem fenster-
-        lokalen Namespace abgeleitet. `m1_available_from` wird über den
-        Boundary-Resolver live ermittelt (21.03.02)."""
-        hb = dict(self._mtf_fc_ns.get("history_boundaries") or {})
-        try:
-            boundary = self.mtf_fc_boundary.evaluate_coverage(
-                self.current_symbol,
-                self._mtf_fc_last_viewport[0] if self._mtf_fc_last_viewport else None,
-            )
-            hb["m1_available_from"] = boundary.get("m1_available_from")
-            hb["coverage_status"] = boundary.get("coverage_status")
-            hb["source_tf"] = boundary.get("source_tf")
-        except Exception as e:
-            print(f"⚠️ [MTF-FC] Boundary-Evaluierung fehlgeschlagen: {e}")
-        cascade = self._mtf_fc_ns.get("cascade_state") or {}
-        override = self._mtf_fc_ns.get("temporary_guard_override") or {}
-        return {
-            "activeChartTf": self.current_tf,
-            "activeDataTf": self._mtf_fc_ns.get("active_data_tf") or "M15",
-            "historyBoundaries": hb,
-            "transitionStartedAt": cascade.get("transition_started_at", 0.0),
-            "rangeDays": cascade.get("range_days", 0.0),
-            "temporaryGuardOverride": {
-                "active": bool(override.get("active")),
-                "previousDataTf": override.get("previous_data_tf"),
-                "targetTf": override.get("target_tf"),
-                "reason": override.get("reason"),
-            },
-        }
-
-    def _on_mtf_fc_viewport_changed(self, from_ts: int, to_ts: int) -> None:
-        """Kaskaden-Trigger: JS meldet die Viewport-Kanten (Wanduhr-Epochs).
-
-        Ruft die Hysterese-Engine (21.03.03) auf. Bei Zoom-Out/-In über die
-        Schwellwerte und bestandener Transition-Guard-Periode wird der
-        Chart-TF gewechselt (`tf_combo`-Sync + Refresh)."""
-        if self._is_loading_data:
-            return
-        try:
-            from_ts, to_ts = int(from_ts), int(to_ts)
-            self._mtf_fc_last_viewport = (from_ts, to_ts)
-            ns = self._mtf_fc_ns
-            cascade = ns.setdefault("cascade_state", {})
-
-            # Boundary (21.03.02) in den Namespace übernehmen (Level 1).
-            boundary = self.mtf_fc_boundary.evaluate_coverage(
-                self.current_symbol, from_ts)
-            ns["history_boundaries"] = {
-                "m1_available_from": boundary.get("m1_available_from"),
-                "coverage_status": boundary.get("coverage_status"),
-                "source_tf": boundary.get("source_tf"),
-            }
-            if boundary.get("coverage_status") == "fallback":
-                # Ebene 1 – Hard Data Availability Guard: Fallback-TF erzwingen.
-                source_tf = boundary.get("source_tf") or "H1"
-                if source_tf != self.current_tf:
-                    print(f"⚠️ [MTF-FC] Fallback-Guard: {self.current_tf} -> {source_tf}")
-                    self._mtf_fc_switch_tf(source_tf)
-                return
-
-            # 21.03.11 (Bug 2/6): Chart-TF-Modus 'fix' unterbindet die Auto-
-            # Kaskade (kein automatischer TF-Wechsel bei Zoom). Der Modus war
-            # bisher nur gespeichert (Namespace), aber nie ausgewertet.
-            if ns.get("chart_tf_mode") == "fix":
-                return
-
-            # Auto-Kaskade (21.03.03): Kandidat aus Viewport-Breite.
-            cascade["current_tf"] = self.current_tf
-            result = evaluate_cascade(from_ts, to_ts, self.current_tf, cascade)
-            cascade["candidate_tf"] = result["candidate_tf"]
-            cascade["direction"] = result["direction"]
-            cascade["range_days"] = result["range_days"]
-
-            candidate = result["candidate_tf"]
-            if candidate is None:
-                return
-            # Transition Guard: Umschalten erst nach CROSSFADE-Zeit.
-            if not transition_guard_ok(cascade):
-                return
-            if candidate != self.current_tf:
-                telemetry = apply_transition(
-                    cascade, candidate, result["direction"],
-                    result["range_days"])
-                print(f"[MTF-FC] Kaskade: {telemetry}")
-                self._mtf_fc_switch_tf(candidate)
-        except Exception as e:
-            print(f"⚠️ [MTF-FC] Kaskaden-Trigger fehlgeschlagen: {e}")
-
-    def _mtf_fc_switch_tf(self, new_tf: str) -> None:
-        """Wechselt den Chart-TF konsistent (tf_combo-Sync + Refresh).
-
-        Setzt `current_tf` und synchronisiert die ComboBox, damit die
-        bestehende `on_tf_changed`-Logik (Zustand laden, Refresh) sauber
-        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt.
-
-        21.03.11 (Bug 2): Der aktuelle Viewport-ZEITBEREICH (Wanduhr-Epochs)
-        wird als pending übernommen, damit der neue TF nach dem Refresh
-        denselben Zeitausschnitt zeigt (statt der fensterspezifischen
-        Bar-Offsets des alten TF -> sonst winziger/verrutschter Ausschnitt)."""
-        new_tf = str(new_tf or "").upper()
-        if not new_tf or new_tf == self.current_tf:
-            return
-        # Viewport-Epochs für den folgenden Refresh merken (sofern bekannt).
-        if self._mtf_fc_last_viewport is not None:
-            self._mtf_fc_pending_epochs = self._mtf_fc_last_viewport
-        if self.tf_combo is not None:
-            idx = self.tf_combo.findText(new_tf)
-            if idx < 0:
-                self.tf_combo.addItem(new_tf)
-                idx = self.tf_combo.findText(new_tf)
-            if idx >= 0:
-                self.tf_combo.blockSignals(True)
-                self.tf_combo.setCurrentIndex(idx)
-                self.tf_combo.blockSignals(False)
-        self.current_tf = new_tf
-        self._update_window_title()
-        self.refresh_chart_data()
-
-    def _on_mtf_fc_data_tf_changed(self, data_tf: str) -> None:
-        """Filterleiste: Source-Data-TF geändert (multi | fixiert)."""
-        self._mtf_fc_ns["active_data_tf"] = data_tf
-        # Ebene 3 (Fixed Data-TF Guard): Fixierter Data-TF begrenzt den
-        # Chart-TF nach oben (nie höher als das Data-TF).
-        if data_tf and str(data_tf).lower() != "multi":
-            if self.current_tf is not None:
-                from analytics.engine.mtf_fc_guards import _tf_rank
-                if _tf_rank(self.current_tf) > _tf_rank(data_tf):
-                    print(f"⚠️ [MTF-FC] Fixed-Guard: Chart-TF {self.current_tf} "
-                          f"-> {data_tf} (Data-TF fixiert)")
-                    self._mtf_fc_switch_tf(data_tf)
-
-    def _on_mtf_fc_chart_tf_changed(self, mode: str) -> None:
-        """Filterleiste: Chart-Overlay-Modus ('auto' | 'fix')."""
-        self._mtf_fc_ns["chart_tf_mode"] = mode
-
-    def _on_mtf_fc_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
-        """Filterleiste: Range-Preset -> Viewport im Namespace + JS-Sync."""
-        self._mtf_fc_ns["viewport_range"] = {"from_ts": from_ts, "to_ts": to_ts}
-        self._mtf_fc_last_viewport = (int(from_ts), int(to_ts))
-        # JS-Viewport auf das Preset-Fenster setzen (sofern Chart geladen).
-        try:
-            self.web_view.page().runJavaScript(
-                "if(window._mtfFcApplyRange) _mtfFcApplyRange("
-                f"{int(from_ts)}, {int(to_ts)});")
-        except (RuntimeError, AttributeError):
-            pass
-
-    def _on_mtf_fc_badge_clicked(self, tf: str, ctrl: bool) -> None:
-        """Interaktives TF-Badge (21.03.09): Klick filtert auf diesen TF.
-
-        Strg+Klick = Multi-Select (in dieser Version: zusätzliches Setzen
-        des aktiven TF im Namespace, ohne harten Wechsel)."""
-        tf = str(tf or "").upper()
-        if not tf:
-            return
-        if ctrl:
-            # Multi-Select: TF dem Namespace-Vektor hinzufügen (kein Wechsel).
-            multi = self._mtf_fc_ns.setdefault("multi_select_tfs", [])
-            if tf not in multi:
-                multi.append(tf)
-            return
-        self._mtf_fc_switch_tf(tf)
-
-    def _on_mtf_fc_ghost_marker_clicked(self, price: float, target_tf: str) -> None:
-        """Geister-Marker-Klick (21.03.09): Ebene-2-Guard-Override.
-
-        Startet den Temporary Override (previous_data_tf = aktives Data-TF)
-        und wechselt auf den Ziel-TF (z. B. D1). Der Reset stellt exakt den
-        vorherigen Data-TF wieder her (21.03.05)."""
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            price = 0.0
-        target_tf = str(target_tf or "D1").upper()
-        ns = self._mtf_fc_ns
-        override = ns.setdefault("temporary_guard_override", {})
-        current_data_tf = str(ns.get("active_data_tf") or "M15")
-        start_override(override, current_data_tf, target_tf, "ghost_marker_click")
-        print(f"[MTF-FC] Guard-Override: Data-TF {current_data_tf} "
-              f"-> temporär {target_tf}")
-        # Override-UI (Reset-Badge) an JS schicken.
-        self._push_mtf_fc_override_ui()
-        self._mtf_fc_switch_tf(target_tf)
-
-    def _on_mtf_fc_guard_override_requested(self, target_tf: str, reason: str) -> None:
-        """Filterleiste: Override angefordert (z. B. Geister-Marker)."""
-        self._on_mtf_fc_ghost_marker_clicked(0.0, target_tf)
-
-    def _on_mtf_fc_guard_reset(self) -> None:
-        """Reset-Badge-Klick: Override zurücksetzen, previous_data_tf wiederherstellen."""
-        ns = self._mtf_fc_ns
-        override = ns.setdefault("temporary_guard_override", {})
-        if not override.get("active"):
-            return
-        restored = reset_override(override)
-        print(f"[MTF-FC] Guard-Reset: Data-TF wiederhergestellt -> {restored}")
-        ns["active_data_tf"] = restored
-        # Filterleisten-State synchronisieren (falls vorhanden).
-        fb = getattr(self, "mtf_filter_bar", None)
-        if fb is not None:
-            fb.apply_namespace_state(self)
-        self._push_mtf_fc_override_ui()
-        if restored and str(restored).lower() != "multi":
-            self._mtf_fc_switch_tf(restored)
-
-    def _on_mtf_fc_sort_mode_changed(self, mode: str) -> None:
-        """Filterleiste: Tabellen-Sortierung ('date' | 'signal' | 'tf').
-
-        21.03.11 (Bug 6): Nachgeruestete Verdrahtung. Der Modus wird im
-        MTF-FC-Namespace persistiert und zusaetzlich ueber den EventBus
-        emittiert (`mtf_fc_sort_changed`) - das AnalyticsWindow wendet ihn
-        auf die TablePage-Sortierung an (Entkopplung, kein Fenster-Know-how).
-        """
-        self._mtf_fc_ns["sort_mode"] = mode
-        try:
-            event_bus.mtf_fc_sort_changed.emit(mode)
-        except Exception as e:  # pragma: no cover
-            print(f"WARN [MTF-FC] Sort-EventBus-Emission fehlgeschlagen: {e}")
-        print(f"[MTF-FC] Sortierung: {mode}")
-
-    def _on_mtf_fc_sessions_changed(self, sessions: list) -> None:
-        """Filterleiste: Session-Farbbalken (London/NY/Tokio) im M1/M5-Zoom."""
-        self._mtf_fc_ns["sessions"] = list(sessions)
-        print(f"[MTF-FC] Sessions: {list(sessions)}")
-
-    def _on_mtf_fc_template_applied(self, template: dict) -> None:
-        """Filterleiste: View-Template geladen.
-
-        Die Werte (Data-TF, Range, Sortierung, Sessions) wurden vom Widget
-        bereits über die Einzelsignale emittiert – hier nur der Log-/Sync-
-        Abschluss, damit die Filterleiste den konsolidierten State zeigt.
-        """
-        print(f"[MTF-FC] Template angewendet: "
-              f"{template.get('name') or 'Unbenannt'}")
-        fb = getattr(self, "mtf_filter_bar", None)
-        if fb is not None:
-            fb.apply_namespace_state(self)
-
-    def _push_mtf_fc_override_ui(self) -> None:
-        """Sendet den Override-Zustand an die JS-Layer (Reset-Badge)."""
-        ns = self._mtf_fc_ns
-        override = ns.get("temporary_guard_override") or {}
-        try:
-            self.web_view.page().runJavaScript(
-                "if(window.renderMtfLayers) renderMtfLayers("
-                + json.dumps({
-                    "badges": [],
-                    "ghostMarkers": [],
-                    "overrideActive": bool(override.get("active")),
-                    "overrideTargetTf": override.get("target_tf"),
-                }) + ");")
-        except (RuntimeError, AttributeError):
-            pass
 
     def save_state(self):
         if not self.state_manager or self._is_loading_data: return
@@ -7676,11 +7250,6 @@ function applyFullChartUpdate(data) {
                         if (isDailyOrHigher || tickMarkType <= 2) {
                             return p.day + '.' + p.month + '.' + p.year.slice(-2);
                         }
-                        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) aktiv -> die
-                        // TF-alignierten Zeit-Ticks rendert das Overlay selbst
-                        // (M15 -> 15-min-Marken statt 12h-Blöcke). LWC-Intraday-
-                        // Labels hier abgeben; Tagesgrenzen behalten das Datum.
-                        if (window._mtfAxisActive) return '';
                         return p.hour + ':' + p.minute;
                     }
                 },
@@ -7732,12 +7301,6 @@ function applyFullChartUpdate(data) {
         // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
         // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
         try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
-        // P21.03 (MTF-FC, 08/12): State-Reset für Kaskade/Boundary/Layer.
-        // Muster 06_two_tier.js – optionaler Hook, kein Umbau des Kern-Pfads.
-        try { if (window._onMtfFcFullUpdate) window._onMtfFcFullUpdate(data); } catch(e) {}
-        try { if (window._onMtfLayersFullUpdate) window._onMtfLayersFullUpdate(data); } catch(e) {}
-        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) – TF-alignierte Tick-Labels.
-        try { if (window._onMtfAxisFullUpdate) window._onMtfAxisFullUpdate(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -7759,10 +7322,6 @@ function applyFullChartUpdate(data) {
                     // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
                     // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
                     try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
-                    // P21.03 (MTF-FC): Kaskaden-Trigger (Zoom -> Python).
-                    try { if (window._onMtfFcVisibleRangeChanged) window._onMtfFcVisibleRangeChanged(); } catch(e) {}
-                    // P21.03.11 (Bug 4): MTF-Axis-Overlay bei Zoom/Scroll neu rendern.
-                    try { if (window._onMtfAxisVisibleRangeChanged) window._onMtfAxisVisibleRangeChanged(); } catch(e) {}
                 }
             });
 
@@ -8490,641 +8049,6 @@ function _isHistoryView() {
 
 --------------------------------------------------
 
-### DATEI: chart/js/07_mtf_fc.js
-```js
-// chart/js/07_mtf_fc.js
-// Phase 21.03.08 – MTF-FC Chart-Integration (JS-Tier)
-//
-// Zuständigkeiten:
-//   * Zoom-Hook: bei visibleRangeChanged werden die Viewport-Kanten
-//     (reale Wanduhr-Epochs) debounced an Python geschickt
-//     (pyBridge.onViewportChanged) -> Python bewertet die Kaskade (21.03.03)
-//     und liefert {current_tf, candidate_tf} via Payload zurück.
-//   * Puls-Breadcrumb: transparenter Badge `[ ⚡ Kerzen: M5 ]` oben rechts,
-//     der bei TF-Umschaltung kurz hellblau aufleuchtet (§4 Säule 2.2).
-//   * Boundary-UI: `ℹ️ M1 verfügbar ab DD.MM.JJJJ` sowie Fallback-Hinweis
-//     "Keine M1-Rohdaten für diesen Zeitraum" (§4 Säule 1.3, 21.03.02).
-//
-// Dieses Modul wird NACH 04_live_updates.js geladen und hängt sich über die
-// optionalen Hooks ein:
-//   window._onMtfFcFullUpdate(data)        – State-Reset nach Full-Update
-//   window._onMtfFcVisibleRangeChanged()   – Kaskaden-Trigger (Zoom)
-// (04_live_updates.js ruft beide optional auf – Muster 06_two_tier.js.)
-
-// =============================================================================
-// Zustand
-// =============================================================================
-let _mtfFc = {
-    activeChartTf: null,       // aktueller Chart-TF (aus Python-Payload)
-    lastChartTf: null,         // vorheriger Chart-TF (Breadcrumb-Detection)
-    transitionStartedAt: 0,    // Transition Guard (Zeitstempel der letzten Schaltung)
-    rangeDays: 0,
-    historyBoundaries: null,   // { m1AvailableFrom, coverageStatus, sourceTf }
-    breadcrumbTimer: null,
-    viewportTimer: null,       // Debounce-Timer für Kaskaden-Trigger
-};
-
-const MTF_FC_VIEWPORT_DEBOUNCE_MS = 150;  // JS-Debounce für Zoom-Hook
-const MTF_FC_BREADCRUMB_MS = 1500;        // Puls-Dauer des Breadcrumbs
-
-// =============================================================================
-// Helper: Viewport-Epochs aus der logischen Range
-// =============================================================================
-function _mtfFcComputeViewportEpochs() {
-    if (!chart || !rawCandleData || rawCandleData.length === 0) return null;
-    try {
-        var lr = chart.timeScale().getVisibleLogicalRange();
-        if (!lr || lr.from === null || lr.to === null) return null;
-        var fromIdx = Math.max(0, Math.floor(lr.from));
-        var toIdx = Math.min(rawCandleData.length - 1, Math.floor(lr.to));
-        if (toIdx < fromIdx) return null;
-        var fromEpoch = toReal(rawCandleData[fromIdx].time);
-        var toEpoch = toReal(rawCandleData[toIdx].time);
-        if (fromEpoch === undefined || toEpoch === undefined) return null;
-        return { from: fromEpoch, to: toEpoch };
-    } catch (e) {
-        return null;
-    }
-}
-
-// =============================================================================
-// Puls-Breadcrumb (§4 Säule 2.2)
-// =============================================================================
-function _mtfFcEnsureBreadcrumb() {
-    var el = document.getElementById('mtf-fc-breadcrumb');
-    if (el) return el;
-    el = document.createElement('div');
-    el.id = 'mtf-fc-breadcrumb';
-    el.style.cssText =
-        'position:absolute; top:4px; right:70px; background:rgba(41,98,255,0.15);' +
-        ' border:1px solid #2962FF; color:#d1d4dc; font-size:11px; font-weight:bold;' +
-        ' padding:2px 8px; border-radius:3px; z-index:1001; pointer-events:none;' +
-        ' opacity:0; transition:opacity 0.25s;';
-    document.getElementById('chart-container').appendChild(el);
-    return el;
-}
-
-function _mtfFcShowBreadcrumb(text) {
-    var el = _mtfFcEnsureBreadcrumb();
-    el.innerText = text;
-    el.style.opacity = '1';
-    if (_mtfFc.breadcrumbTimer) clearTimeout(_mtfFc.breadcrumbTimer);
-    _mtfFc.breadcrumbTimer = setTimeout(function() {
-        el.style.opacity = '0';
-    }, MTF_FC_BREADCRUMB_MS);
-}
-
-// =============================================================================
-// Boundary-UI (§4 Säule 1.3): ℹ️ M1 verfügbar ab + Fallback-Hinweis
-// =============================================================================
-function _mtfFcUpdateBoundaryInfo() {
-    var hb = _mtfFc.historyBoundaries || {};
-    var fallback = (hb.coverageStatus === 'fallback');
-    var srcTf = hb.sourceTf || 'H1';
-
-    // Fallback-Schraffur-Hinweis (keine Lücke, kein Absturz)
-    var el = document.getElementById('mtf-fc-boundary-info');
-    if (fallback) {
-        if (!el) {
-            el = document.createElement('div');
-            el.id = 'mtf-fc-boundary-info';
-            el.style.cssText =
-                'position:absolute; left:8px; bottom:8px;' +
-                ' background:rgba(242,54,69,0.15); border:1px solid #F23645;' +
-                ' color:#d1d4dc; font-size:11px; padding:3px 8px;' +
-                ' border-radius:3px; z-index:1000; pointer-events:none;';
-            document.getElementById('chart-container').appendChild(el);
-        }
-        el.style.display = 'block';
-        el.innerText = '⚠️ Keine M1-Rohdaten für diesen Zeitraum (' + srcTf + '-Fallback)';
-    } else if (el) {
-        el.style.display = 'none';
-    }
-
-    // ℹ️ M1 verfügbar ab DD.MM.JJJJ
-    var info2 = document.getElementById('mtf-fc-m1-available');
-    var from = hb.m1AvailableFrom;
-    if (typeof from === 'number' && !isNaN(from)) {
-        if (!info2) {
-            info2 = document.createElement('div');
-            info2.id = 'mtf-fc-m1-available';
-            info2.style.cssText =
-                'position:absolute; left:8px; top:4px;' +
-                ' background:rgba(41,98,255,0.12); border:1px solid #2962FF;' +
-                ' color:#d1d4dc; font-size:11px; padding:2px 8px;' +
-                ' border-radius:3px; z-index:1000; pointer-events:none;';
-            document.getElementById('chart-container').appendChild(info2);
-        }
-        var p = getBerlinParts(from);
-        info2.style.display = 'block';
-        info2.innerText = 'ℹ️ M1 verfügbar ab ' + p.day + '.' + p.month + '.' + p.year;
-    } else if (info2) {
-        info2.style.display = 'none';
-    }
-}
-
-// =============================================================================
-// Kaskaden-Trigger (Zoom-Hook)
-// =============================================================================
-function _mtfFcTriggerCascade() {
-    if (!pyBridge || !pyBridge.onViewportChanged) return;
-    if (isUpdatingChart) return;
-    var vp = _mtfFcComputeViewportEpochs();
-    if (!vp) return;
-    if (_mtfFc.viewportTimer) clearTimeout(_mtfFc.viewportTimer);
-    var from = Math.floor(vp.from);
-    var to = Math.floor(vp.to);
-    _mtfFc.viewportTimer = setTimeout(function() {
-        _mtfFc.viewportTimer = null;
-        try {
-            pyBridge.onViewportChanged(from, to);
-        } catch (e) {}
-    }, MTF_FC_VIEWPORT_DEBOUNCE_MS);
-}
-
-// =============================================================================
-// Hooks (04_live_updates.js ruft optional auf)
-// =============================================================================
-function _onMtfFcFullUpdate(data) {
-    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
-    _mtfFc.historyBoundaries = st.historyBoundaries || null;
-    if (st.activeChartTf) {
-        _mtfFc.activeChartTf = st.activeChartTf;
-        if (_mtfFc.lastChartTf && _mtfFc.lastChartTf !== st.activeChartTf) {
-            _mtfFcShowBreadcrumb('⚡ Kerzen: ' + st.activeChartTf);
-        }
-        _mtfFc.lastChartTf = st.activeChartTf;
-    }
-    if (st.transitionStartedAt) {
-        _mtfFc.transitionStartedAt = st.transitionStartedAt;
-    }
-    _mtfFcUpdateBoundaryInfo();
-}
-
-function _onMtfFcVisibleRangeChanged() {
-    _mtfFcTriggerCascade();
-}
-
-// =============================================================================
-// Externe API (Python -> JS via runJavaScript)
-// =============================================================================
-function applyMtfFcCascade(payload) {
-    // Python liefert {current_tf, candidate_tf, direction, range_days}
-    // nach einer Kaskaden-Entscheidung (Breadcrumb + State-Sync).
-    if (!payload || typeof payload !== 'object') return;
-    if (payload.current_tf && payload.current_tf !== _mtfFc.activeChartTf) {
-        _mtfFc.activeChartTf = payload.current_tf;
-        _mtfFcShowBreadcrumb('⚡ Kerzen: ' + payload.current_tf);
-    }
-    if (payload.rangeDays !== undefined) {
-        _mtfFc.rangeDays = payload.rangeDays;
-    }
-    if (payload.transitionStartedAt) {
-        _mtfFc.transitionStartedAt = payload.transitionStartedAt;
-    }
-}
-
-// Viewport auf ein Range-Preset setzen (Python -> JS, 21.03.07).
-function _mtfFcApplyRange(fromEpoch, toEpoch) {
-    if (!chart || !rawCandleData || rawCandleData.length === 0) return;
-    try {
-        var fromIdx = -1, toIdx = -1;
-        for (var i = 0; i < rawCandleData.length; i++) {
-            var real = toReal(rawCandleData[i].time);
-            if (real === undefined) continue;
-            if (fromIdx < 0 && real >= fromEpoch) fromIdx = i;
-            if (real <= toEpoch) toIdx = i;
-        }
-        if (fromIdx < 0) fromIdx = 0;
-        if (toIdx < fromIdx) toIdx = rawCandleData.length - 1;
-        chart.timeScale().setVisibleLogicalRange({ from: fromIdx, to: toIdx });
-    } catch (e) {}
-}
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/js/08_mtf_layers.js
-```js
-// chart/js/08_mtf_layers.js
-// Phase 21.03.09 – Interaktives Layering: TF-Badges & Geister-Marker
-//
-// Zuständigkeiten (§4 Säule 3):
-//   * Interaktive TF-Badges (z. B. `[ H4-Swing ]`): Klick filtert die
-//     aktuelle Ansicht synchron auf diesen Timeframe; Strg+Klick = Multi-
-//     Select. Badge-Klicks werden an Python gereicht
-//     (pyBridge.onBadgeClick(tf, ctrlKey)).
-//   * Geister-Marker (Off-Screen Level): übergeordnete Level außerhalb des
-//     Zoom-Blicks werden am Rand des Viewports als verblasster Pfeil
-//     gerendert (`▲ D1-Widerstand (27.85)`). Klick löst den Guard-Override
-//     aus (pyBridge.onGhostMarkerClick(price, targetTf)) und animiert den
-//     Viewport sanft zum Ziel-Level.
-//   * Reset-Badge `[ 🌐 Data-TF gelockert ]`: Klick auf *Reset* stellt
-//     previous_data_tf wieder her (pyBridge.onGuardOverrideReset()).
-//
-// Verhalten defensiv: Fehlende Elemente/pyBridge werden abgefangen
-// (kein Chart-Abbruch).
-
-// =============================================================================
-// Konstanten & Zustand
-// =============================================================================
-let _mtfLayers = {
-    badges: [],            // [{tf, label, active}]
-    ghostMarkers: [],      // [{price, tf, label, side}]
-    overrideActive: false,
-    overrideTargetTf: null,
-    animFrame: null,
-    animStart: null,
-};
-
-const MTF_GHOST_ANIMATION_MS = 400;  // sanfte Viewport-Animation
-
-// =============================================================================
-// Container sicherstellen
-// =============================================================================
-function _mtfLayersEnsureContainer() {
-    var c = document.getElementById('chart-container');
-    if (!c) return null;
-    var layer = document.getElementById('mtf-layers-layer');
-    if (!layer) {
-        layer = document.createElement('div');
-        layer.id = 'mtf-layers-layer';
-        layer.style.cssText =
-            'position:absolute; left:0; top:0; right:0; bottom:0;' +
-            ' pointer-events:none; z-index:1002; overflow:hidden;';
-        c.appendChild(layer);
-    }
-    return layer;
-}
-
-// =============================================================================
-// TF-Badges
-// =============================================================================
-function _mtfLayersRenderBadges() {
-    var layer = _mtfLayersEnsureContainer();
-    if (!layer) return;
-    var old = layer.querySelectorAll('.mtf-tf-badge');
-    for (var i = 0; i < old.length; i++) old[i].remove();
-
-    if (!_mtfLayers.badges || _mtfLayers.badges.length === 0) return;
-    var wrap = document.createElement('div');
-    wrap.className = 'mtf-tf-badge-wrap';
-    wrap.style.cssText =
-        'position:absolute; left:8px; top:28px; display:flex; gap:4px;' +
-        ' pointer-events:auto; z-index:1003; flex-wrap:wrap; max-width:70%;';
-
-    for (var b = 0; b < _mtfLayers.badges.length; b++) {
-        (function(badge) {
-            var btn = document.createElement('button');
-            btn.className = 'mtf-tf-badge';
-            btn.innerText = badge.label || ('[' + badge.tf + ']');
-            btn.title = (badge.active ? 'Aktiv – Klick: Filter' : 'Klick: Filter auf ' + badge.tf)
-                + ' | Strg+Klick: Multi-Select';
-            var activeStyle = badge.active
-                ? 'background:rgba(41,98,255,0.35); border:1px solid #2962FF;'
-                : 'background:rgba(30,34,45,0.8); border:1px solid #3d4450;';
-            btn.style.cssText = activeStyle +
-                ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
-                ' padding:2px 8px; border-radius:3px; cursor:pointer;';
-            btn.addEventListener('click', function(ev) {
-                try {
-                    if (pyBridge && pyBridge.onBadgeClick) {
-                        pyBridge.onBadgeClick(badge.tf, !!(ev.ctrlKey || ev.metaKey));
-                    }
-                } catch (e) {}
-            });
-            wrap.appendChild(btn);
-        })(_mtfLayers.badges[b]);
-    }
-    layer.appendChild(wrap);
-
-    // Reset-Badge bei aktivem Temporary Override
-    if (_mtfLayers.overrideActive) {
-        var resetBtn = document.createElement('button');
-        resetBtn.className = 'mtf-tf-badge';
-        resetBtn.innerText = '🌐 Data-TF gelockert auf ' +
-            (_mtfLayers.overrideTargetTf || '?') + ' | Reset';
-        resetBtn.style.cssText =
-            'background:rgba(255,152,0,0.25); border:1px solid #FF9800;' +
-            ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
-            ' padding:2px 8px; border-radius:3px; cursor:pointer;' +
-            ' pointer-events:auto;';
-        resetBtn.addEventListener('click', function() {
-            try {
-                if (pyBridge && pyBridge.onGuardOverrideReset) pyBridge.onGuardOverrideReset();
-            } catch (e) {}
-        });
-        // Unter den TF-Badges positionieren
-        var wrap2 = document.createElement('div');
-        wrap2.className = 'mtf-tf-badge-wrap';
-        wrap2.style.cssText = wrap.style.cssText + ' top:52px;';
-        wrap2.appendChild(resetBtn);
-        layer.appendChild(wrap2);
-    }
-}
-
-// =============================================================================
-// Geister-Marker (Off-Screen Level)
-// =============================================================================
-function _mtfLayersRenderGhostMarkers() {
-    var layer = _mtfLayersEnsureContainer();
-    if (!layer) return;
-    var old = layer.querySelectorAll('.mtf-ghost-marker');
-    for (var i = 0; i < old.length; i++) old[i].remove();
-
-    if (!_mtfLayers.ghostMarkers || _mtfLayers.ghostMarkers.length === 0 || !candleSeries) return;
-
-    for (var m = 0; m < _mtfLayers.ghostMarkers.length; m++) {
-        (function(marker) {
-            var y = candleSeries.priceToCoordinate(marker.price);
-            if (y === null || y === undefined || isNaN(y)) return;
-            var x = (marker.side === 'left') ? 2 : (layer.clientWidth - 26);
-            var el = document.createElement('div');
-            el.className = 'mtf-ghost-marker';
-            el.style.cssText =
-                'position:absolute; left:' + x + 'px; top:' + Math.round(y - 10) + 'px;' +
-                ' background:rgba(30,34,45,0.6); border:1px solid #787B86;' +
-                ' color:#b2b5be; font-size:10px; padding:1px 5px; border-radius:3px;' +
-                ' opacity:0.55; cursor:pointer; pointer-events:auto; white-space:nowrap;';
-            el.innerText = (marker.side === 'left' ? '◀ ' : '▲ ') +
-                (marker.label || (marker.tf + '-Level')) + ' (' +
-                marker.price.toFixed(2) + ')';
-            el.addEventListener('click', function() {
-                try {
-                    if (pyBridge && pyBridge.onGhostMarkerClick) {
-                        pyBridge.onGhostMarkerClick(marker.price, marker.tf || 'D1');
-                    }
-                } catch (e) {}
-            });
-            layer.appendChild(el);
-        })(_mtfLayers.ghostMarkers[m]);
-    }
-}
-
-// Sanfte Viewport-Animation zum Ziel-Level (Preis-/Zeitkoordinaten)
-function animateToGhostLevel(price, targetTf) {
-    if (!chart || !candleSeries) return;
-    _mtfLayers.animStart = null;
-    if (_mtfLayers.animFrame) cancelAnimationFrame(_mtfLayers.animFrame);
-
-    function step(ts) {
-        if (!_mtfLayers.animStart) _mtfLayers.animStart = ts;
-        var progress = Math.min(1.0, (ts - _mtfLayers.animStart) / MTF_GHOST_ANIMATION_MS);
-        var eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-        try {
-            var lr = chart.timeScale().getVisibleLogicalRange();
-            if (!lr) return;
-            var target = candleSeries.coordinateToPrice(50);  // Ziel-Preisbereich Mitte
-            if (target !== null && target !== undefined) {
-                chart.priceScale('right').setVisibleRange({
-                    from: price - Math.abs(price - target) * (1 - eased) - 1,
-                    to: price + Math.abs(price - target) * (1 - eased) + 1,
-                });
-            }
-        } catch (e) {}
-        if (progress < 1.0) {
-            _mtfLayers.animFrame = requestAnimationFrame(step);
-        } else {
-            _mtfLayers.animFrame = null;
-        }
-    }
-    _mtfLayers.animFrame = requestAnimationFrame(step);
-}
-
-// =============================================================================
-// Externe API (Python -> JS via runJavaScript)
-// =============================================================================
-function renderMtfLayers(payload) {
-    // payload: { badges: [{tf,label,active}], ghostMarkers: [{price,tf,label,side}],
-    //            overrideActive: bool, overrideTargetTf: str }
-    if (!payload || typeof payload !== 'object') return;
-    if (Array.isArray(payload.badges)) _mtfLayers.badges = payload.badges;
-    if (Array.isArray(payload.ghostMarkers)) _mtfLayers.ghostMarkers = payload.ghostMarkers;
-    if (typeof payload.overrideActive === 'boolean') _mtfLayers.overrideActive = payload.overrideActive;
-    if (payload.overrideTargetTf) _mtfLayers.overrideTargetTf = payload.overrideTargetTf;
-    _mtfLayersRenderBadges();
-    _mtfLayersRenderGhostMarkers();
-}
-
-function clearMtfLayers() {
-    _mtfLayers.badges = [];
-    _mtfLayers.ghostMarkers = [];
-    _mtfLayers.overrideActive = false;
-    _mtfLayers.overrideTargetTf = null;
-    var layer = document.getElementById('mtf-layers-layer');
-    if (layer) {
-        layer.innerHTML = '';
-        layer.remove();
-    }
-}
-
-// =============================================================================
-// Full-Update-Hook: Layer auf bekannten State zurücksetzen (Muster 06)
-// =============================================================================
-function _onMtfLayersFullUpdate(data) {
-    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
-    _mtfLayers.overrideActive = !!(st.temporaryGuardOverride &&
-        st.temporaryGuardOverride.active);
-    _mtfLayers.overrideTargetTf = (st.temporaryGuardOverride &&
-        st.temporaryGuardOverride.targetTf) || null;
-    _mtfLayersRenderBadges();
-}
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/js/09_mtf_axis.js
-```js
-// chart/js/09_mtf_axis.js
-// Phase 21.03.11 (Bug 4) – TF-spezifische Achsen-Ticks
-//
-// Problem (User-Meldung): Bei M15 statt H1 zeigte die X-Achse weiterhin
-// 12-Stunden-Blöcke – LWC v5 wählt die Tick-Dichte nur aus der Viewport-
-// Breite, nicht aus dem gewählten Timeframe.
-//
-// Lösung: Ein Overlay-Layer (#mtf-axis-layer) rendert Zeit-Tick-Labels,
-// die zum TF des Charts ausgerichtet sind (M15 -> 15-min-Marken, H1 ->
-// 1h-Marken, darunter gröbere Stufen je nach Zoom). Die LWC-eigenen
-// Intraday-Labels liefert der tickMarkFormatter (04_live_updates.js)
-// zugunsten des Overlays zurück (Tagesgrenzen behalten das Datum).
-//
-// Abhängigkeiten: 02_time_utils.js (getBerlinParts, toReal, toCont),
-// 01_core.js (chart, rawCandleData, currentTfInSeconds). Rein additiv,
-// kein Umbau des Kern-Rendering-Pfads.
-
-// =============================================================================
-// Zustand
-// =============================================================================
-let _mtfAxis = {
-    active: false,     // true = Intraday-TF (Overlay aktiv)
-    tfSeconds: 0,      // Sekunden des aktuellen Chart-TF
-};
-
-//: Kleinstmöglicher Label-Abstand in Pixeln (gegen Überlappung).
-const MTF_AXIS_MIN_LABEL_PX = 90;
-
-//: "Schöne" absolute Schritt-Größen (Sekunden), aus denen je Zoom der
-//: erste Wert >= gewünschtem Abstand gewählt wird.
-const MTF_AXIS_STEPS = [
-    60, 120, 300, 600, 900, 1800, 2700, 3600, 5400, 7200, 10800, 14400,
-    21600, 43200, 86400, 3 * 86400, 7 * 86400, 30 * 86400, 365 * 86400,
-];
-
-// =============================================================================
-// Container sicherstellen
-// =============================================================================
-function _mtfAxisContainer() {
-    var c = document.getElementById('chart-container');
-    if (!c) return null;
-    var layer = document.getElementById('mtf-axis-layer');
-    if (!layer) {
-        layer = document.createElement('div');
-        layer.id = 'mtf-axis-layer';
-        layer.style.cssText =
-            'position:absolute; left:0; right:0; bottom:0; height:22px;' +
-            ' pointer-events:none; z-index:998; overflow:hidden;' +
-            ' font-size:10px; color:#787B86; font-family:sans-serif;';
-        c.appendChild(layer);
-    }
-    return layer;
-}
-
-// =============================================================================
-// Render: TF-alignierte Tick-Labels über die Zeitachse legen
-// =============================================================================
-function mtfAxisRender() {
-    var layer = _mtfAxisContainer();
-    if (!layer) return;
-    layer.innerHTML = '';
-
-    if (!_mtfAxis.active || !chart || !rawCandleData ||
-        rawCandleData.length === 0) {
-        return;
-    }
-    var tfSec = _mtfAxis.tfSeconds;
-    if (!tfSec || tfSec <= 0) return;
-
-    var lr;
-    try {
-        lr = chart.timeScale().getVisibleLogicalRange();
-    } catch (e) { return; }
-    if (!lr || lr.from === null || lr.to === null) return;
-
-    var fromIdx = Math.max(0, Math.floor(lr.from));
-    var toIdx = Math.min(rawCandleData.length - 1, Math.ceil(lr.to));
-    if (toIdx <= fromIdx) toIdx = fromIdx + 1;
-
-    var fromReal = toReal(rawCandleData[fromIdx].time);
-    var toRealTs = toReal(rawCandleData[toIdx].time);
-    if (fromReal === undefined || toRealTs === undefined) return;
-
-    var rangeSec = toRealTs - fromReal;
-    if (rangeSec <= 0) return;
-
-    var container = document.getElementById('chart-container');
-    var totalPx = (container && container.clientWidth) || 800;
-    var desired = rangeSec * MTF_AXIS_MIN_LABEL_PX / Math.max(1, totalPx);
-
-    // Nächste "schöne" Schrittgröße >= gewünschtem Abstand. Dabei wird nur
-    // ein Schritt gewählt, der ein Vielfaches des TF ist (Tick aligniert
-    // auf TF-Grenzen). Ist das nicht möglich (sehr großer Zoom), fällt auf
-    // den nächstgrößeren "schönen" Schritt zurück (dann zeigt LWC die
-    // Datums-Labels selbst).
-    var stepSec = null;
-    for (var i = 0; i < MTF_AXIS_STEPS.length; i++) {
-        var s = MTF_AXIS_STEPS[i];
-        if (s >= desired) {
-            stepSec = (s % tfSec === 0) ? s : null;
-            if (stepSec) break;
-        }
-    }
-    if (stepSec === null) {
-        // Fallback: gröberer Schritt, der KEIN Vielfaches des TF ist – dann
-        // trotzdem rendern (Tages-/Stunden-Marken), falls TF < 1 Tag.
-        for (var k = 0; k < MTF_AXIS_STEPS.length; k++) {
-            if (MTF_AXIS_STEPS[k] >= desired) { stepSec = MTF_AXIS_STEPS[k]; break; }
-        }
-    }
-    if (stepSec === null) stepSec = 86400;
-    if (stepSec >= 86400) return;  // LWC zeigt die Datums-Marken selbst
-
-    var first = Math.ceil(fromReal / stepSec) * stepSec;
-    for (var t = first; t <= toRealTs + stepSec / 2; t += stepSec) {
-        var p = getBerlinParts(t);
-        // Tagesgrenzen behält LWC (Datum) – hier überspringen (kein Duplikat).
-        if (p.hour === '00' && p.minute === '00') continue;
-        var cont = toCont(t);
-        if (cont === undefined) continue;
-        var x;
-        try {
-            x = chart.timeScale().timeToCoordinate(cont);
-        } catch (e) { continue; }
-        if (x === null || x === undefined || isNaN(x)) continue;
-        var el = document.createElement('div');
-        el.style.cssText =
-            'position:absolute; top:4px; left:' + Math.round(x) + 'px;' +
-            ' transform:translateX(-50%); white-space:nowrap;';
-        el.innerText = p.hour + ':' + p.minute;
-        layer.appendChild(el);
-    }
-}
-
-// =============================================================================
-// Externe API (04_live_updates.js ruft auf)
-// =============================================================================
-function mtfAxisSetTf(tfSeconds, active) {
-    _mtfAxis.tfSeconds = (typeof tfSeconds === 'number') ? tfSeconds : 0;
-    _mtfAxis.active = !!active;
-    mtfAxisRender();
-}
-
-function mtfAxisClear() {
-    _mtfAxis.active = false;
-    _mtfAxis.tfSeconds = 0;
-    var layer = document.getElementById('mtf-axis-layer');
-    if (layer) {
-        layer.innerHTML = '';
-        layer.remove();
-    }
-}
-
-//: Flag für den tickMarkFormatter (04): Intraday-Labels an das Overlay
-//: abgeben (nur wenn das Overlay aktiv ist).
-window._mtfAxisActive = false;
-
-function _mtfAxisSyncWindowFlag() {
-    window._mtfAxisActive = _mtfAxis.active;
-    return _mtfAxis.active;
-}
-
-// In den Hook-Zyklus einhängen: nach Full-Update + nach Zoom/Range-Change.
-// 04_live_updates.js ruft die optionalen Hooks auf – hier registrieren.
-function _onMtfAxisFullUpdate(data) {
-    if (data && typeof data.timeframe === 'string' &&
-        TF_SECONDS_MAP && TF_SECONDS_MAP[data.timeframe]) {
-        var tfSec = TF_SECONDS_MAP[data.timeframe];
-        mtfAxisSetTf(tfSec, tfSec > 0 && tfSec < 86400);
-    } else {
-        mtfAxisSetTf(0, false);
-    }
-    _mtfAxisSyncWindowFlag();
-}
-
-function _onMtfAxisVisibleRangeChanged() {
-    _mtfAxisSyncWindowFlag();
-    mtfAxisRender();
-}
-
-// Kopplung: 04_live_updates.js ruft die dedizierten optionalen Hooks
-// _onMtfAxisFullUpdate / _onMtfAxisVisibleRangeChanged auf (Muster
-// 06_two_tier.js). Kein Konflikt mit den MTF-FC-Hooks von 07/08.
-
-```
-
---------------------------------------------------
-
 ### DATEI: chart/overlays/__init__.py
 ```py
 # chart/overlays/__init__.py
@@ -9363,9 +8287,15 @@ __all__ = ["LineStyle", "MarkerStyle", "StylePickerDialog", "StylePickerWidget",
 """
 MTF-FC v4 (Kapitel 21.03.07) – MtfFilterBarWidget & Control-Panel.
 
-Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Range-Picker,
-View-Templates (über SchemaMigrator), Tabellen-Sortierung und
-Session-Filter (§4 Säule 1).
+Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Aggregations-TF,
+Range-Picker (Presets 24h/7d/30d/90d/Year, 21.03.15), Tabellen-
+Sortierung und Session-Filter (§4 Säule 1). 21.03.14 (Wunsch 2): Die
+zusaetzlichen View-Template-Buttons wurden rueckgebaut – die Filter-
+Konfiguration laeuft ueber das vorhandene Profil-Management (`sort_mode`
+wird ebenfalls persistiert). 21.03.15 (Bug 3/4): 'YTD' wurde in 'Year'
+umbenannt (365-Tage-Fenster) + '90d' ergaenzt; der benutzerdefinierte
+Von-/Bis-Zeitraum entfaellt, die Session-Checkboxen stehen in Zeile 1
+rechts neben der Sortierung (eine Zeile, keine Zeile 2 mehr).
 
 MVVM (Grundsatz 4): KEINE SQL-Queries, KEINE DB-Connects in der UI.
 Der Zustand wird ausschliesslich über den `MtfFcProvider` im isolierten
@@ -9378,7 +8308,7 @@ emittiert Signale; die eigentliche Verarbeitung (Boundary, Kaskade, Guards)
 liegt in den Engine-Modulen (21.03.02-21.03.05).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -9386,20 +8316,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from analytics.engine.mtf_fc_confluence import WEIGHTS
 from analytics.engine.mtf_fc_provider import MtfFcProvider
-from analytics.engine.mtf_fc_templates import (
-    MtfFcTemplateStore,
-    TemplateError,
-    create_template,
-    migrate_template,
-)
 
 #: Data-TF-Auswahl (Multi + fixierte Timeframes). 21.03.11 (Bug 6):
 #: Labels kompakt, damit die Leiste in 1200-px-Fenster passt (sizeHint war
@@ -9409,8 +8330,14 @@ DATA_TF_OPTIONS = ["🌐 Multi", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "�
 #: Chart-Overlay-TF (Auto-Kaskade vs. manuell fix).
 CHART_TF_OPTIONS = ["⚡ Auto", "🔒 Fix"]
 
-#: Range-Presets.
-RANGE_PRESETS = ["24h", "7d", "30d", "YTD", "Benutzerdefiniert"]
+#: Aggregations-TF (21.03.12, Entscheidung 6a): '⚡ Auto' = Granularitaet
+#: dynamisch an den Range anpassen; '🔒 [TF]' = Daten starr auf diesem
+#: TF-Raster zusammenfassen. Konfigurierbar via `agg_tf_options`.
+AGG_TF_OPTIONS = ["⚡ Auto", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4", "🔒 D1"]
+
+#: Range-Presets (21.03.15, Bug 3): '90d' ergaenzt; 'YTD' (seit
+#: Jahresbeginn) wurde auf 'Year' (letzte 365 Tage) umbenannt.
+RANGE_PRESETS = ["24h", "7d", "30d", "90d", "Year"]
 
 #: Tabellen-Sortierung.
 SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
@@ -9418,7 +8345,7 @@ SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
 #: Session-Filter (Farbbalken im M1/M5-Zoom, 21.03.08).
 SESSION_OPTIONS = ["London", "New York", "Tokio"]
 
-_STRIP_PREFIX = ("🌐 ", "🔒 ", "⚡ ", "🠇", "🠅", " (Multi)", " (Kaskade)", " Manuell Fix", "Benutzerdefiniert")
+_STRIP_PREFIX = ("🌐 ", "🔒 ", "⚡ ", "🠇", "🠅", " (Multi)", " (Kaskade)", " Manuell Fix")
 
 
 def _parse_data_tf(text: str) -> str:
@@ -9451,55 +8378,68 @@ class MtfFilterBarWidget(QWidget):
     Signale (Entkopplung über den Aufrufer, kein Fenster-Know-how):
       * `data_tf_changed(str)`     – 'multi' oder fixierter TF (z. B. 'M15').
       * `chart_tf_changed(str)`    – 'auto' (Kaskade) oder 'fix'.
+      * `agg_tf_changed(str)`      – 'auto' oder konkreter Aggregations-TF
+                                     (21.03.12, Entscheidung 6a).
       * `range_changed(str, int, int)` – Preset-Name, from_ts, to_ts.
       * `sort_mode_changed(str)`   – 'date' | 'signal' | 'tf'.
       * `sessions_changed(list)`   – aktive Sessions (z. B. ['london']).
-      * `template_applied(dict)`   – geladenes View-Template.
       * `guard_override_requested(str, str)` – target_tf, reason (21.03.05).
     """
 
     data_tf_changed = Signal(str)
     chart_tf_changed = Signal(str)
+    agg_tf_changed = Signal(str)
     range_changed = Signal(str, int, int)
     sort_mode_changed = Signal(str)
     sessions_changed = Signal(list)
-    template_applied = Signal(dict)
     guard_override_requested = Signal(str, str)
 
     def __init__(
         self,
         provider: Optional[MtfFcProvider] = None,
-        template_store: Optional[MtfFcTemplateStore] = None,
         parent: Optional[QWidget] = None,
+        # 21.03.12 (Analytics-Integration): Die TF-Listen sind konfigurierbar
+        # (Analytics hat 11 TFs M1..MN1 statt der 6 Chart-Defaults) und der
+        # Range-Referenzpunkt kann injiziert werden (`now_provider` – im
+        # Analytics der letzte Datenpunkt MAX(bar_time) statt time.time()).
+        data_tf_options: Optional[List[str]] = None,
+        agg_tf_options: Optional[List[str]] = None,
+        now_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         super().__init__(parent)
         # Provider ist die EINZIGE Brücke zum shared_state-Namespace (MVVM).
         self._provider = provider or MtfFcProvider()
-        self._store = template_store or MtfFcTemplateStore()
         self._sessions: List[str] = []
+        self._data_tf_options = (
+            list(data_tf_options) if data_tf_options else list(DATA_TF_OPTIONS))
+        self._agg_tf_options = (
+            list(agg_tf_options) if agg_tf_options else list(AGG_TF_OPTIONS))
+        self._now_provider = now_provider or _now_epoch
         self._build_ui()
 
     # ------------------------------------------------------------------
     # UI-Aufbau
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        # 21.03.11 (Bug 6, 2. Fix): ZWEI-ZEILEN-Layout statt einer Zeile.
-        # Der 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
+        # 21.03.11 (Bug 6, 2. Fix): Kompakte EIN-Zeilen-Leiste. Der
+        # 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
         # minimumSizeHint=1209 -> das Fenster wird auf ~1220 px aufgezwungen,
         # Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) waren rechts
-        # abgeschnitten/unsichtbar. Zeile 1 = Kern-Steuerung (Data/Chart/
-        # Range/Sort), Zeile 2 = Sessions + Templates -> sizeHint < 700 px.
+        # abgeschnitten/unsichtbar. Seit 21.03.15 (Bug 4) liegen Data/Chart/
+        # Agg/Range/Sort/Sessions in EINER Zeile (die fruehere Zeile 2 mit
+        # dem benutzerdefinierten Von-/Bis-Panel ist entfallen); die Combos
+        # sind kompakt, die Session-Checkboxen schmal.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(2, 2, 2, 2)
         outer.setSpacing(2)
 
-        # --- Zeile 1: Source-Data-TF / Chart-Overlay-TF / Range / Sort --
+        # --- Zeile 1: Data / Chart / Agg / Range / Sort / Sessions ------
         row1 = QHBoxLayout()
         row1.setSpacing(4)
 
         row1.addWidget(QLabel("Data:"))
         self._data_tf_combo = QComboBox()
-        self._data_tf_combo.addItems(DATA_TF_OPTIONS)
+        self._data_tf_combo.addItems(self._data_tf_options)
         self._data_tf_combo.setMaximumWidth(105)
         self._data_tf_combo.setToolTip(
             "Source-Data-TF: 🌐 alle Timeframes (Multi) vs. 🔒 fixiert auf einen TF")
@@ -9516,13 +8456,28 @@ class MtfFilterBarWidget(QWidget):
         self._chart_tf_combo.currentTextChanged.connect(self._on_chart_tf_changed)
         row1.addWidget(self._chart_tf_combo)
 
+        # 21.03.12 (Entscheidung 6a): Aggregations-TF-Dropdown – nur bei
+        # '🔒 Fix' aktiv; bei '⚡ Auto' deaktiviert und auf 'Auto' gesetzt.
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Agg:"))
+        self._agg_tf_combo = QComboBox()
+        self._agg_tf_combo.addItems(self._agg_tf_options)
+        self._agg_tf_combo.setMaximumWidth(95)
+        self._agg_tf_combo.setToolTip(
+            "Aggregations-TF (21.03.12, 6a): ⚡ Auto = Granularitaet dynamisch "
+            "an den Zeitraum anpassen; 🔒 Fix = Daten starr auf diesem TF-Raster "
+            "zusammenfassen (eigenes Dropdown, unabhaengig von Data-TF).")
+        self._agg_tf_combo.currentTextChanged.connect(self._on_agg_tf_changed)
+        self._agg_tf_combo.setEnabled(False)
+        row1.addWidget(self._agg_tf_combo)
+
         row1.addSpacing(6)
         row1.addWidget(QLabel("Range:"))
         self._range_combo = QComboBox()
         self._range_combo.addItems(RANGE_PRESETS)
         self._range_combo.setMaximumWidth(100)
         self._range_combo.setToolTip(
-            "Zeitfenster-Preset (24h/7d/30d/YTD) – filtert den anzuzeigenden Zeitraum")
+            "Zeitfenster-Preset (24h/7d/30d/90d/Year) – filtert den anzuzeigenden Zeitraum")
         self._range_combo.currentTextChanged.connect(self._on_range_changed)
         row1.addWidget(self._range_combo)
 
@@ -9536,49 +8491,20 @@ class MtfFilterBarWidget(QWidget):
         self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
         row1.addWidget(self._sort_combo)
 
-        row1.addStretch(1)
-        outer.addLayout(row1)
-
-        # --- Zeile 2: Session-Filter + View-Templates -------------------
-        row2 = QHBoxLayout()
-        row2.setSpacing(4)
-
+        # 21.03.15 (Bug 4): Session-Filter rechts neben der Sortierung in
+        # Zeile 1 (die fruehere Zeile 2 mit dem benutzerdefinierten
+        # Von-/Bis-Panel ist entfallen - Platzgewinn, eine Zeile).
+        row1.addSpacing(6)
         self._session_checks: Dict[str, QCheckBox] = {}
         for session in SESSION_OPTIONS:
             cb = QCheckBox(session)
             cb.setToolTip("Session-Farbbalken im M1/M5-Zoom (UTC-Epochs)")
             cb.stateChanged.connect(self._on_sessions_changed)
             self._session_checks[session.lower()] = cb
-            row2.addWidget(cb)
+            row1.addWidget(cb)
 
-        row2.addSpacing(6)
-        self._template_name = QLineEdit()
-        self._template_name.setPlaceholderText("Preset")
-        self._template_name.setMaximumWidth(90)
-        self._template_name.setToolTip("Name des View-Templates")
-        row2.addWidget(self._template_name)
-
-        self._btn_save_template = QPushButton("💾")
-        self._btn_save_template.setToolTip(
-            "Aktuelle Filter-Konfiguration als View-Template speichern")
-        self._btn_save_template.setMaximumWidth(34)
-        self._btn_save_template.clicked.connect(self._save_template)
-        row2.addWidget(self._btn_save_template)
-
-        self._btn_load_template = QPushButton("📂")
-        self._btn_load_template.setToolTip("Gespeichertes View-Template laden")
-        self._btn_load_template.setMaximumWidth(34)
-        self._btn_load_template.clicked.connect(self._load_template)
-        row2.addWidget(self._btn_load_template)
-
-        self._template_combo = QComboBox()
-        self._template_combo.setToolTip("Verfügbare View-Templates")
-        self._template_combo.setMaximumWidth(110)
-        self._template_combo.currentIndexChanged.connect(self._on_template_selected)
-        row2.addWidget(self._template_combo)
-
-        row2.addStretch(1)
-        outer.addLayout(row2)
+        row1.addStretch(1)
+        outer.addLayout(row1)
 
     # ------------------------------------------------------------------
     # Public API (State-Sync über Provider, kein SQL)
@@ -9611,6 +8537,17 @@ class MtfFilterBarWidget(QWidget):
         """Aktiver Chart-Overlay-TF ('auto' oder 'fix')."""
         return _parse_chart_tf(self._chart_tf_combo.currentText())
 
+    def current_agg_tf(self) -> str:
+        """Aktiver Aggregations-TF ('auto' oder konkreter TF, z. B. 'H1')."""
+        text = self._agg_tf_combo.currentText()
+        for prefix in ("⚡ ", "🔒 "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        stripped = text.strip()
+        if not stripped or stripped.lower() in ("auto", "kaskade"):
+            return "auto"
+        return stripped
+
     def current_sort_mode(self) -> str:
         """Aktive Sortierung ('date' | 'signal' | 'tf')."""
         text = self._sort_combo.currentText()
@@ -9620,16 +8557,72 @@ class MtfFilterBarWidget(QWidget):
             return "tf"
         return "date"
 
+    # 21.03.12 (Analytics-Integration): Externe Filterwerte anwenden (z. B.
+    # Profil-/Workspace-Restore des AnalyticsWindow). Setzt die Combos mit
+    # blockSignals und emittiert die Signale danach EXPLIZIT. None = Eintrag
+    # unveraendert lassen.
+    # 21.03.14 (Wunsch 2): `sort_mode` stellt die Tabellen-Sortierung nach
+    # Profil-/Workspace-Restore wieder her (die View-Template-Buttons wurden
+    # rueckgebaut). 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert'
+    # werden auf den neuen Preset-Satz (90d/Year, kein Custom-Panel) gemappt.
+    def apply_external_state(
+        self,
+        data_tf: Optional[str] = None,
+        agg_tf: Optional[str] = None,
+        range_preset: Optional[str] = None,
+        sort_mode: Optional[str] = None,
+    ) -> None:
+        """Wendet externe Filterwerte auf die Combos an (in-memory)."""
+        if data_tf is not None:
+            self._data_tf_combo.blockSignals(True)
+            self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
+            self._data_tf_combo.blockSignals(False)
+            self.data_tf_changed.emit(self.current_data_tf())
+        if agg_tf is not None:
+            self._agg_tf_combo.blockSignals(True)
+            if str(agg_tf).strip().lower() == "auto":
+                self._agg_tf_combo.setCurrentText("⚡ Auto")
+            else:
+                self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
+            self._agg_tf_combo.blockSignals(False)
+            self.agg_tf_changed.emit(self.current_agg_tf())
+        if sort_mode is not None:
+            self._sort_combo.blockSignals(True)
+            self._sort_combo.setCurrentText(
+                {"date": SORT_MODES[0], "signal": SORT_MODES[1],
+                 "tf": SORT_MODES[2]}.get(str(sort_mode), SORT_MODES[0]))
+            self._sort_combo.blockSignals(False)
+            self.sort_mode_changed.emit(self.current_sort_mode())
+        if range_preset is not None:
+            preset = str(range_preset).strip() or None
+            if preset is not None:
+                # 21.03.15 (Bug 3): Alt-Profile (YTD/Custom-Panel) auf den
+                # neuen Preset-Satz abbilden, damit setCurrentText greift.
+                if preset == "YTD":
+                    preset = "Year"
+                elif preset == "Benutzerdefiniert":
+                    preset = "7d"
+                self._range_combo.blockSignals(True)
+                self._range_combo.setCurrentText(preset)
+                self._range_combo.blockSignals(False)
+                self._on_range_changed(preset)
+
+    def set_chart_mode(self, mode: str) -> None:
+        """Setzt den Chart-Modus ('auto'|'fix') – externer Kontext (Analytics).
+
+        'fix' aktiviert das Aggregations-TF-Dropdown (Entscheidung 6a) und
+        stellt einen konkreten Agg-TF sicher; 'auto' deaktiviert es (dynamische
+        Granularitaet). Loeuft ueber die bestehende _on_chart_tf_changed-Logik
+        (Enable/Disable + Vorbelegung) und emittiert chart_tf_changed +
+        agg_tf_changed.
+        """
+        mode = "fix" if str(mode).strip().lower() == "fix" else "auto"
+        self._chart_tf_combo.setCurrentText(
+            CHART_TF_OPTIONS[1] if mode == "fix" else CHART_TF_OPTIONS[0])
+
     def active_sessions(self) -> List[str]:
         """Aktive Session-Filter (klein geschrieben)."""
         return [s for s, cb in self._session_checks.items() if cb.isChecked()]
-
-    def refresh_templates(self) -> None:
-        """Aktualisiert die Template-Dropdown-Liste aus dem Store."""
-        self._template_combo.blockSignals(True)
-        self._template_combo.clear()
-        self._template_combo.addItems(self._store.names())
-        self._template_combo.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Slots
@@ -9638,15 +8631,53 @@ class MtfFilterBarWidget(QWidget):
         self.data_tf_changed.emit(self.current_data_tf())
 
     def _on_chart_tf_changed(self, _text: str) -> None:
-        self.chart_tf_changed.emit(self.current_chart_tf())
+        """Aktiviert/deaktiviert das Aggregations-TF-Dropdown (Entscheidung 6a).
+
+        '⚡ Auto'  -> Agg-Combo deaktiviert und auf 'Auto' gesetzt (Granularitaet
+                     wird dynamisch aus dem Zeitraum abgeleitet).
+        '🔒 Fix'   -> Agg-Combo aktiv; ist noch kein konkreter TF gewaehlt,
+                     wird der erste fixierte Eintrag vorbelegt (damit 'Fix'
+                     IMMER einen konkreten Aggregations-TF liefert).
+        """
+        mode = self.current_chart_tf()
+        self._agg_tf_combo.blockSignals(True)
+        if mode == "auto":
+            self._agg_tf_combo.setCurrentText("⚡ Auto")
+            self._agg_tf_combo.setEnabled(False)
+        else:
+            if self.current_agg_tf() == "auto":
+                for opt in self._agg_tf_options:
+                    if not opt.startswith("⚡"):
+                        self._agg_tf_combo.setCurrentText(opt)
+                        break
+            self._agg_tf_combo.setEnabled(True)
+        self._agg_tf_combo.blockSignals(False)
+        self.chart_tf_changed.emit(mode)
+        self.agg_tf_changed.emit(self.current_agg_tf())
+
+    def _on_agg_tf_changed(self, _text: str) -> None:
+        self.agg_tf_changed.emit(self.current_agg_tf())
 
     def _on_range_changed(self, preset: str) -> None:
-        if preset == "Benutzerdefiniert":
-            return
-        now = _now_epoch()
+        """Range-Combo-Wechsel: Preset-Zeitraum emittieren.
+
+        21.03.12 (Analytics): Referenzpunkt injizierbar – im Analytics der
+        letzte Datenpunkt (MAX(bar_time)) statt time.time(), damit Presets
+        relativ zum letzten Signal und nicht zur Wanduhr rechnen. Defensiv:
+        None/Fehler (z. B. noch kein Symbol/Timeframe gewaehlt) -> time.time().
+        21.03.15 (Bug 3): Preset-Satz 24h/7d/30d/90d/Year; 'Year' = letzte
+        365 Tage (kein Jahresbeginn-Fenster mehr). Das benutzerdefinierte
+        Von-/Bis-Panel ist entfallen.
+        """
+        try:
+            now = int(self._now_provider())
+        except (TypeError, ValueError):
+            now = int(_now_epoch())
         seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
-                   "YTD": _ytd_epoch_offset(now)}.get(preset, 86400)
-        self.range_changed.emit(preset, now - seconds, now)
+                   "90d": 90 * 86400, "Year": 365 * 86400}.get(
+                       preset, 86400)
+        f, t = now - seconds, now
+        self.range_changed.emit(preset, f, t)
 
     def _on_sort_changed(self, _text: str) -> None:
         self.sort_mode_changed.emit(self.current_sort_mode())
@@ -9654,74 +8685,6 @@ class MtfFilterBarWidget(QWidget):
     def _on_sessions_changed(self, _state: int) -> None:
         self._sessions = self.active_sessions()
         self.sessions_changed.emit(list(self._sessions))
-
-    def _save_template(self) -> None:
-        name = self._template_name.text().strip() or "Unbenannt"
-        template = create_template(
-            name=name,
-            data_tf=self.current_data_tf(),
-            chart_tf=self.current_chart_tf(),
-            range_preset=self._range_combo.currentText(),
-            sort_mode=self.current_sort_mode(),
-            session_filters=list(self._sessions),
-        )
-        self._store.save(template)
-        self.refresh_templates()
-        self._template_combo.setCurrentText(name)
-
-    def _load_template(self) -> None:
-        name = self._template_combo.currentText()
-        if not name:
-            return
-        template = self._store.load(name)
-        if template is None:
-            return
-        self._apply_template(template)
-        self.template_applied.emit(template)
-
-    def _on_template_selected(self, index: int) -> None:
-        if index < 0:
-            return
-        self._load_template()
-
-    def _apply_template(self, template: Dict[str, Any]) -> None:
-        """Wendet ein geladenes Template auf die Widgets an (in-memory).
-
-        21.03.11 (Bug 6): Nach der Widget-Anwendung werden die Signale
-        EXPLIZIT emittiert, damit der Orchestrator (chart_win) die Werte
-        übernimmt (blockSignals unterbindet sonst die Signal-Verdrahtung).
-        """
-        data_tf = str(template.get("data_tf") or "multi")
-        self._data_tf_combo.blockSignals(True)
-        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
-        self._data_tf_combo.blockSignals(False)
-
-        range_preset = str(template.get("range_preset") or "7d")
-        self._range_combo.blockSignals(True)
-        self._range_combo.setCurrentText(range_preset)
-        self._range_combo.blockSignals(False)
-
-        sort_mode = str(template.get("sort_mode") or "date")
-        self._sort_combo.blockSignals(True)
-        self._sort_combo.setCurrentText(
-            {"date": SORT_MODES[0], "signal": SORT_MODES[1],
-             "tf": SORT_MODES[2]}.get(sort_mode, SORT_MODES[0]))
-        self._sort_combo.blockSignals(False)
-
-        sessions = template.get("session_filters") or []
-        for key, cb in self._session_checks.items():
-            cb.blockSignals(True)
-            cb.setChecked(key in sessions)
-            cb.blockSignals(False)
-        self._sessions = [s for s in sessions if s in self._session_checks]
-
-        # Explizite Signal-Emission nach der Anwendung (Bug 6).
-        self.data_tf_changed.emit(self.current_data_tf())
-        self.chart_tf_changed.emit(self.current_chart_tf())
-        self.sort_mode_changed.emit(self.current_sort_mode())
-        self.sessions_changed.emit(list(self._sessions))
-        if range_preset and range_preset != "Benutzerdefiniert":
-            self._on_range_changed(range_preset)
 
     # ------------------------------------------------------------------
     # Guard-Override (Ebene 2, 21.03.05) – Klick auf Reset-Badge
@@ -9735,14 +8698,6 @@ def _now_epoch() -> int:
     """Aktuelle Wanduhr-Epoch (Sekunden)."""
     import time
     return int(time.time())
-
-
-def _ytd_epoch_offset(now: int) -> int:
-    """Sekunden seit Jahresbeginn (Wanduhr)."""
-    from datetime import datetime, timezone
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
-    start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
-    return int(now - start.timestamp())
 
 ```
 

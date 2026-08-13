@@ -1,17 +1,17 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Gesamt-Export (alle Projekt-Quellen)
 
 > Gesamt-Export (alle Projekt-Quellen). Teil-Exporte: export_core_app.md, export_service_engine.md, export_analytics.md, export_chart_engine.md, export_data_layer.md, export_analytics_engine.md, export_ui_windows.md, export_project_docs.md, export_rest.md
-> Dateien in dieser Datei: 124
+> Dateien in dieser Datei: 121
 
 ## 0. EXPORT-ÜBERSICHT
 
 | Datei | Inhalt | Dateien |
 |---|---|---|
-| export_Full.md | Gesamt-Export (diese Datei) | 124 |
+| export_Full.md | Gesamt-Export (diese Datei) | 121 |
 | export_core_app.md | Core App & Infrastruktur | 6 |
 | export_service_engine.md | Service-UI & Service-Engine | 17 |
 | export_analytics.md | Analytics-UI & Feature Store | 13 |
-| export_chart_engine.md | Chart-Fenster & Lightweight Charts | 26 |
+| export_chart_engine.md | Chart-Fenster & Lightweight Charts | 23 |
 | export_data_layer.md | Datenzugriff, Sync & Repositories | 10 |
 | export_analytics_engine.md | Analytics-Engine, Features & Auswertung | 27 |
 | export_ui_windows.md | Weitere Fenster, Worker & Konfiguration | 15 |
@@ -104,9 +104,6 @@ PyTrader/
             04_live_updates.js
             05_measurement.js
             06_two_tier.js
-            07_mtf_fc.js
-            08_mtf_layers.js
-            09_mtf_axis.js
         overlays/
             __init__.py
             style_models.py
@@ -299,7 +296,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 
 1. **Niemals die Fortsetzung in eine interaktive Frage/Abfrage setzen:** Die AI darf die Aufforderung zum nächsten Schritt **NIEMALS** in eine User-Interaktion (z. B. `AskQuestion`/Options-Dialog) verpacken. Es besteht die Gefahr, dass der Anwender versehentlich auf „Continue"/Enter/Tab drückt und damit eine Ausführung auslöst, die er nicht angeordnet hat.
 2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
-3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
+3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes durch manuellen prompt anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen. Niemals wird eine Menüvorgabe der CLI gesetzt und dann implementiert. Nur ausschliesslich durch manuellen prompt!!!!
 4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
 
 ---
@@ -4430,7 +4427,7 @@ Weiteres unveraendert bestehen (genutzt vom Legacy-StatisticWindow); dieses
 Repository ist der Ersatz fuer die neue Analytics-UI (15.03).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -4462,6 +4459,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
 
@@ -4470,7 +4474,9 @@ class AnalyticsRepository:
         """
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes, limit=limit)
+            instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -4485,6 +4491,13 @@ class AnalyticsRepository:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -4512,7 +4525,9 @@ class AnalyticsRepository:
         use_metric = metric if metric in metrics else "count"
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
-            feature_ids=feature_ids, instance_hashes=instance_hashes
+            feature_ids=feature_ids, instance_hashes=instance_hashes,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode
         )
         result["metrics"] = metrics
         return result
@@ -4531,6 +4546,8 @@ class AnalyticsRepository:
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> tuple:
         """Verfuegbare Feld-Metriken + Quellen-Zuordnung (Feld-Dropdown).
 
@@ -4570,9 +4587,28 @@ class AnalyticsRepository:
             # Varianten-Hashes.
             by_service = self.reader.feature_keys_by_service(
                 symbol, timeframe, numeric_only=True,
-                feature_id=feature_id, feature_ids=feature_ids)
+                feature_id=feature_id, feature_ids=feature_ids,
+                service_mode=service_mode)
         except Exception:
             by_service = {}
+        # 21.03.20-Bugfix 3: Modus-Fallback - ist ein Modus gewaehlt, aber
+        # noch nicht in der DB berechnet (leere modus-gefilterte Keys),
+        # werden die nicht-technischen output_schema-Keys der selektierten
+        # Services als Ergebnis-Parameter vorgeschlagen (Param-Box bleibt
+        # nutzbar; der konkrete Modus kann danach berechnet/ausgefuehrt
+        # werden). Muster _registry_service_mode_pairs (Registry, rein
+        # lesend, Fehler defensiv).
+        use_mode = (str(service_mode or "").strip()
+                    if str(service_mode or "").strip().lower()
+                    not in ("all", "alle") else "")
+        if use_mode and not by_service:
+            try:
+                fallback_keys = self._registry_output_keys(
+                    feature_ids, feature_id)
+            except Exception:
+                fallback_keys = {}
+            if fallback_keys:
+                by_service = fallback_keys
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
@@ -4615,6 +4651,20 @@ class AnalyticsRepository:
         # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
         # (Preset `[📊 Service-Timeframe]`) – wird an den Reader gereicht.
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing) + optionaler Zeitfilter (Wanduhr-Epochs).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer/
+        # None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -4641,9 +4691,13 @@ class AnalyticsRepository:
         # gecachten Reader-Basis-Scan (EIN DB-Scan; der QUERY_FEATURES-
         # Leichtpfad liefert identische Metadaten OHNE die teure
         # Heatmap-Pivot-Aggregation).
+        # 13.08.2026 (Punkte 1b+8, F1/F8): `service_mode` wird jetzt DURCH-
+        # gereicht - vorher ueberschrieb das QUERY_HEATMAP_GENERIC-Payload
+        # die modus-gefilterte Feld-Liste aus QUERY_FEATURES (die
+        # Parameter-Box zeigte die falschen/ungefilterten Keys).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes, service_mode=service_mode)
         # Numerische Keys aus den Metadaten (ohne count/confluence_count) –
         # Grundlage des E6-Fallbacks fuer Wert-Aggregationen.
         avail_filtered = [m for m in metrics
@@ -4656,12 +4710,39 @@ class AnalyticsRepository:
         if use_agg in ("avg", "sum", "min", "max"):
             if use_field not in avail_filtered:
                 use_field = avail_filtered[0] if avail_filtered else ""
+        # 21.03.20-Bugfix 3: Fehlende Registry-Modi als Achsenpunkte.
+        # 13.08.2026 (Punkt 1a, F1): Die Ergaenzung greift JETZT AUCH bei
+        # konkretem Modus-Filter - die Registry-Paare werden dann auf den
+        # gewaehlten Modus gefiltert. Vorher blieb die service_id-Achse bei
+        # konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt
+        # (ein noch nicht berechneter Modus erzeugte KEINEN Achsenpunkt,
+        # obwohl der Modus im Dropdown waehlbar war).
+        extra_service_modes = None
+        mode_raw = str(service_mode or "").strip()
+        mode_key = mode_raw.lower()
+        try:
+            if mode_key in ("", "all", "alle"):
+                extra_service_modes = sorted(
+                    self._registry_service_mode_pairs(
+                        feature_ids, feature_id))
+            elif mode_raw:
+                extra_service_modes = sorted(
+                    p for p in self._registry_service_mode_pairs(
+                        feature_ids, feature_id)
+                    if "::" in p
+                    and p.rsplit("::", 1)[1].strip().lower() == mode_key)
+        except Exception:
+            extra_service_modes = None
         try:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
                 instance_hashes=instance_hashes, limit=limit,
                 all_timeframes=all_timeframes,
+                bucket_tf=bucket_tf, from_ts=from_ts, to_ts=to_ts,
+                field_pairs=field_pairs,
+                service_mode=service_mode,
+                extra_service_modes=extra_service_modes,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -4747,6 +4828,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
@@ -4777,6 +4865,8 @@ class AnalyticsRepository:
             symbol, timeframe, [x_col, y_col],
             feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes, limit=limit,
+            from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -4811,6 +4901,13 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
@@ -4841,7 +4938,8 @@ class AnalyticsRepository:
         rows = self.reader.fetch_columns(
             symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, instance_hashes=instance_hashes,
-            limit=limit,
+            limit=limit, from_ts=from_ts, to_ts=to_ts,
+            service_mode=service_mode,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -4914,7 +5012,107 @@ class AnalyticsRepository:
         """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung)."""
         return self.reader.get_available_timeframes(symbol)
 
+    @staticmethod
+    def _registry_service_mode_pairs(
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """'{feature_id}::{mode}'-Kombinationen der aktiven Services.
+
+        21.03.20-Bugfix 2/3: Liest parameter_schema["mode"]["options"]
+        der gewaehlten Services (PluginRegistry-Singleton, in-Memory).
+        Leere feature_ids = alle Services (Multi-Modus-faehige Plugins
+        tragen einen "mode"-Key mit nicht-leeren options). Format
+        `{plugin_id.lower()}::{mode}` (case-originaler Modus) - deckungs-
+        gleich mit der service_id-Achsen-Expression des Readers. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv abgefangen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return set()
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Set[str] = set()
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "parameter_schema", None) or {}
+                mode_cfg = schema.get("mode") or {}
+                options = [str(o).strip() for o in (mode_cfg.get("options")
+                                                    or []) if str(o).strip()]
+                if options:
+                    pid_l = str(pid).strip().lower()
+                    for m in options:
+                        out.add(f"{pid_l}::{m}")
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _registry_output_keys(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Nicht-technische output_schema-Keys je Service (Registry).
+
+        21.03.20-Bugfix 3: Fallback fuer die Parameter-Box (Feld-Dropdown),
+        wenn der gewaehlte Modus noch nicht in der DB berechnet wurde
+        (leere modus-gefilterte field_sources). `output_schema`-Felder mit
+        `technical: True` (System-Metrik) werden ausgeschlossen. Rein
+        lesend, kein DB-Zugriff; Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+        except Exception:
+            return {}
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        out: Dict[str, List[str]] = {}
+        try:
+            plugins = reg.plugins or {}
+            for pid, plugin in plugins.items():
+                if wanted and str(pid).strip().lower() not in wanted:
+                    continue
+                schema = getattr(plugin, "output_schema", None) or {}
+                keys = [k for k, v in schema.items()
+                        if k and not (v or {}).get("technical")]
+                if keys:
+                    out[str(pid)] = sorted(keys)
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _registry_source_modes(
+        cls,
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str] = None,
+    ) -> Set[str]:
+        """Mogliche source_mode-Werte der aktiven Services (Registry).
+
+        21.03.20-Bugfix 2: UNION-Quelle fuer das Modus-Dropdown (alle
+        waehlbaren Modi statt nur der DB-geschriebenen). Abgeleitet aus
+        `_registry_service_mode_pairs` (eine Registry-Sammlung).
+        """
+        pairs = cls._registry_service_mode_pairs(feature_ids, feature_id)
+        modes: Set[str] = set()
+        for p in pairs:
+            if "::" in p:
+                modes.add(p.split("::", 1)[1])
+        return modes
+
     def get_available_features(
+
         self,
         symbol: str,
         timeframe: str,
@@ -4923,6 +5121,8 @@ class AnalyticsRepository:
         # Metadaten (metrics/field_sources) im QUERY_FEATURES-Leichtpfad.
         feature_ids: Optional[List[str]] = None,
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
 
@@ -4945,9 +5145,40 @@ class AnalyticsRepository:
         # denselben Reader-Basis-Scan wie die Heatmap (cache-served).
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_ids=feature_ids,
-            instance_hashes=instance_hashes)
+            instance_hashes=instance_hashes,
+            service_mode=service_mode)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
+        # 21.03.20 (Analytics Modus-Filter): source_modes +
+        # Deaktivierungs-Flag im LEICHTEN QUERY_FEATURES-Payload
+        # (Modus-Dropdown im HeatmapWidget; gecachter Reader-Basis-
+        # Scan, kein zusaetzlicher Roundtrip).
+        try:
+            source_modes, has_sm = (
+                self.reader.fetch_available_source_modes(
+                    symbol, timeframe, feature_ids=feature_ids,
+                    instance_hashes=instance_hashes))
+        except Exception:
+            source_modes, has_sm = [], False
+        # 21.03.20-Bugfix 2: UNION der Registry-Modi. Die DB-geschriebenen
+        # source_mode-Werte decken nur die tatsaechlich ausgefuehrten Modi
+        # ab (meist der Default); parameter_schema["mode"]["options"] der
+        # aktiven Services enthaelt ALLE moeglichen Modi (z. B. Swing
+        # Momentum: MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet).
+        # Das Modus-Dropdown zeigt damit alle waehlbaren Modi; ein noch
+        # nicht berechneter Modus liefert bei Auswahl konsistent leere
+        # Zellen (Entscheidung 3, kein Crash). In-Memory-Registry-Singleton
+        # (Worker-Thread, kein DB-Roundtrip).
+        registry_modes = self._registry_source_modes(feature_ids)
+        if registry_modes:
+            merged = list(dict.fromkeys(
+                [str(m) for m in (source_modes or [])]
+                + sorted(registry_modes)))
+            result["source_modes"] = merged
+        else:
+            result["source_modes"] = source_modes
+        result["has_source_mode_services"] = bool(
+            has_sm or registry_modes)
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(
@@ -5056,6 +5287,12 @@ DEBOUNCE_MS = 250
 DEFAULT_BINS = 20
 DEFAULT_LIMIT = 5000
 
+# 21.03.12 (MTF-FC auf Analytics): Alle Haupt-Queries, die beim data_tf-
+# Wechsel neu angestossen werden (OHLCV/DAILY_OHLC sind on-demand und
+# folgen keinem Filterwechsel - identisch zur refresh_all()-Liste).
+_ALL_QUERIES = (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES)
+
 
 class AnalyticsViewModel(QObject):
     """MVVM-ViewModel der Analytics-Engine (kein SQL, kein UI)."""
@@ -5156,6 +5393,33 @@ class AnalyticsViewModel(QObject):
             "table_row_height": 0,
             "table_sort_column": 0,
             "table_sort_order": 1,
+            # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter des
+            # MtfFilterBarWidget. `data_tf` = Analysequelle ('multi' = alle
+            # TFs in einer Query via all_timeframes; sonst fixierter TF, der
+            # den `timeframe`-Filter uebernimmt). `agg_tf` = Aggregations-TF
+            # (Entscheidung 6a: 'auto' oder konkreter TF fuer das Zeitraster
+            # der generischen Heatmap). `range_from`/`range_to` = optionaler
+            # Zeitfilter (bar_time BETWEEN), Basis = letzter Datenpunkt.
+            "data_tf": "multi",
+            "agg_tf": "auto",
+            "range_preset": None,
+            "range_from": None,
+            "range_to": None,
+            # 21.03.12: Von set_data_tf() verwaltetes Flag - True = alle
+            # Timeframes in EINER Query (data_tf='multi'), False = fixierter
+            # TF. Separates Flag von heatmap_all_timeframes (21.01-Preset).
+            "all_timeframes": False,
+            # 21.03.14 (Wunsch 2): Tabellen-Sortierung des MtfFilterBarWidget
+            # ('date' | 'signal' | 'tf'). Reiner UI-Zustand (kein SQL-Filter);
+            # wird im Profil-Payload (Sektion sources) persistiert und beim
+            # Profil-/Workspace-Restore ueber die Filterleiste restauriert
+            # (nach dem Rueckbau der View-Template-Buttons).
+            "sort_mode": "date",
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+            # Multi-Modus-Services. Default "all" = kein Filter (alle Modi).
+            # Wirkt GLOBAL auf alle Analytics-Datenquellen (Entscheidung 1);
+            # wird in der sources-Sektion des Profil-Payloads persistiert.
+            "service_mode": "all",
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -5265,6 +5529,144 @@ class AnalyticsViewModel(QObject):
                          QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
                          QUERY_FEATURES))
 
+    # ------------------------------------------------------------------
+    # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Parameter
+    # ------------------------------------------------------------------
+    def set_data_tf(self, data_tf: str) -> None:
+        """Setzt die Analysequelle des MtfFilterBarWidget ('multi' | TF).
+
+        'multi'  -> alle Timeframes in EINER Query (`all_timeframes=True`,
+                    der `timeframe`-Filter entfaellt im Reader).
+        'M15' o.ae. -> Fixiert auf diesen TF: `all_timeframes=False` und der
+                    `timeframe`-Filter uebernimmt den fixierten TF (die UI
+                    synchronisiert combo_tf daraus).
+        """
+        data_tf = str(data_tf or "").strip() or "multi"
+        if data_tf == "multi":
+            if (self._params.get("data_tf") == "multi"
+                    and not self._params.get("all_timeframes")):
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            elif self._params.get("data_tf") != "multi":
+                self._params["data_tf"] = "multi"
+                self._params["all_timeframes"] = True
+                self._mark_dirty()
+                self._refresh(_ALL_QUERIES)
+            return
+        # Fixiert auf einen konkreten TF.
+        tf = data_tf.upper()
+        changed = (self._params.get("data_tf") != tf
+                   or self._params.get("timeframe") != tf
+                   or self._params.get("all_timeframes"))
+        if not changed:
+            return
+        self._params["data_tf"] = tf
+        self._params["all_timeframes"] = False
+        self._params["timeframe"] = tf
+        self._mark_dirty()
+        self._refresh(_ALL_QUERIES)
+
+    def set_agg_tf(self, agg_tf: str) -> None:
+        """Setzt den Aggregations-TF (Entscheidung 6a: 'auto' | TF).
+
+        'auto' -> Granularitaet wird dynamisch aus dem Zeitraum abgeleitet
+                  (kein Zeit-Bucketing; Verhalten wie bisher).
+        'H1' o.ae. -> Die generische Heatmap fasst die date-Achse starr auf
+                  diesem TF-Raster zusammen (bucket_tf im Reader).
+        """
+        agg_tf = str(agg_tf or "").strip().lower() or "auto"
+        self._set_param("agg_tf", agg_tf, (QUERY_HEATMAP_GENERIC,))
+
+    def set_sort_mode(self, mode: str) -> None:
+        """21.03.14 (Wunsch 2): Speichert die Tabellen-Sortierung.
+
+        `sort_mode` ist 'date' | 'signal' | 'tf' und wird fuer die
+        Profil-Persistenz gemerkt (Sektion sources). Reiner UI-Zustand
+        (die TablePage wendet die Sortierung ueber den EventBus an) -
+        KEIN Query-Refresh, nur Dirty-Markierung (Option B - Explicit
+        Save). Idempotent ohne Aenderung.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("date", "signal", "tf"):
+            mode = "date"
+        if mode == self._params.get("sort_mode"):
+            return
+        self._params["sort_mode"] = mode
+        self._mark_dirty()
+
+    def set_service_mode(self, mode: str) -> None:
+        """21.03.20: Setzt den Modus-Filter (z. B. 'MA_Peak_Hysteresis').
+
+        `"all"` (Default) = kein Filter (alle Modi). Wirkt GLOBAL auf
+        alle Analytics-Datenquellen (Entscheidung 1): Tabelle, beide
+        Heatmaps, Scatter, Verteilung. `QUERY_FEATURES` wird mitrefreshed,
+        damit die dynamische Modus-Liste / das Deaktivierungs-Flag
+        (`has_source_mode_services`) synchron zur Auswahl bleibt. Idempotent
+        ohne Aenderung (kein Refresh/Dirty).
+        """
+        mode = str(mode or "all").strip()
+        if mode == self._params.get("service_mode"):
+            return
+        self._params["service_mode"] = mode
+        self._mark_dirty()
+        self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+
+    def set_range(self, from_ts, to_ts, preset: Optional[str] = None) -> None:
+        """Setzt den Zeitraum-Filter (optional, bar_time BETWEEN).
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int) oder None (kein Filter).
+        `preset` ist der Range-Preset-Name des MtfFilterBarWidget (z. B.
+        '7d'/'90d'/'Year', 21.03.15) und wird fuer die Profil-Persistenz
+        gemerkt. Alt-Werte 'YTD' (bis 21.03.15) bzw. 'Benutzerdefiniert'
+        (entfallenes Custom-Panel) werden auf den neuen Preset-Satz
+        abgebildet. Wird vom Range-Picker des MtfFilterBarWidget gesetzt
+        (Basis = letzter Datenpunkt statt time.time()).
+        """
+        f = int(from_ts) if from_ts is not None else None
+        t = int(to_ts) if to_ts is not None else None
+        preset = str(preset or "").strip() or None
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Preset-Satz (24h/7d/30d/90d/Year) abbilden.
+        if preset == "YTD":
+            preset = "Year"
+        elif preset == "Benutzerdefiniert":
+            preset = "7d"
+        if (f == self._params.get("range_from")
+                and t == self._params.get("range_to")
+                and preset == self._params.get("range_preset")):
+            return
+        self._params["range_from"] = f
+        self._params["range_to"] = t
+        self._params["range_preset"] = preset
+        self._mark_dirty()
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def clear_range(self) -> None:
+        """Entfernt den Zeitraum-Filter (kein Zeitfilter mehr)."""
+        self.set_range(None, None)
+
+    def latest_data_epoch(self) -> Optional[int]:
+        """Neuester Wanduhr-Epoch der Feature-Daten (Range-Referenzpunkt).
+
+        Delegiert lesend an das Repository (`fetch_latest_bar_time` fuer das
+        aktuelle Symbol/Timeframe) – der `now_provider` des MtfFilterBarWidget
+        rechnet die Presets relativ zum letzten Datenpunkt statt zu
+        time.time(). Defensiv: ohne Symbol/Timeframe oder bei Fehler -> None
+        (das Widget faellt dann auf time.time() zurueck).
+        """
+        symbol = str(self._params.get("symbol") or "")
+        timeframe = str(self._params.get("timeframe") or "")
+        if not symbol or not timeframe:
+            return None
+        try:
+            return self._repo.get_latest_bar_time(symbol, timeframe)
+        except Exception:
+            return None
+
     def set_feature_id(self, feature_id: Optional[str]) -> None:
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
         self.set_feature_ids([feature_id] if feature_id else [])
@@ -5323,6 +5725,97 @@ class AnalyticsViewModel(QObject):
         self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
                        QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
                        QUERY_DISTRIBUTION))
+
+    def set_field_selection(self, field_pairs, update_ids: bool = True) -> None:
+        """Setzt die (Service|Parameter)-Auswahl des 'Feld'-Dropdowns.
+
+        12.08.2026 (Option A, Bug 1/2): Die Feld-Auswahl ist eine explizite
+        Liste von '{service_id}|{key}'-Paaren (effective pairs) - der
+        Reader filtert damit auf PARAMETER-Ebene (field_pairs-WHERE:
+        `feature_data->>key IS NOT NULL` je Service). Leere Liste = kein
+        Paar-Filter (reines feature_ids-Verhalten wie bisher).
+
+        `update_ids=True` (USER-Interaktion, ServicePicker-Sync): Die
+        Services werden aus den Paaren abgeleitet und in `feature_ids`
+        uebernommen (Dropdown und Picker bleiben konsistent; Abwaehlen des
+        letzten Parameters eines Services entfernt ihn aus dem Picker).
+
+        `update_ids=False` (PROGRAMMATISCHER Sync am Ende des
+        Dropdown-Rebuilds): `feature_ids` bleibt UNANGETASTET - der
+        ServicePicker ist die Service-Quelle; Services OHNE numerische
+        Feld-Keys duerfen dadurch nicht stillschweigend aus der Auswahl
+        fallen (nur ihre Paare koennen fehlen).
+
+        Im Gegensatz zu set_feature_ids() wird der Refresh auch bei
+        UNVERAENDERTER Service-Menge ausgeloest, wenn sich die Parameter-
+        Auswahl geaendert hat. Idempotent ohne Aenderung (kein
+        Refresh/Dirty).
+        """
+        pairs = self._normalize_field_pairs(field_pairs)
+        ids = self._pairs_to_feature_ids(pairs)
+        current_pairs = self._params.get("field_selection") or []
+        current_ids = self._params.get("feature_ids") or []
+        pairs_changed = pairs != current_pairs
+        ids_changed = update_ids and ids != current_ids
+        if not pairs_changed and not ids_changed:
+            return
+        self._params["field_selection"] = pairs
+        if ids_changed:
+            self._params["feature_ids"] = ids
+        self._mark_dirty()
+        if ids_changed:
+            # Service-Satz geaendert -> ServicePicker + Feld-Metadaten
+            # (QUERY_FEATURES) synchron nachziehen (identisch zu
+            # set_feature_ids).
+            self.feature_ids_changed.emit()
+            self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+        else:
+            # NUR die Parameter-Auswahl hat sich geaendert -> nur die
+            # generische Heatmap neu aggregieren (Bug 1: An/Abwaehlen
+            # eines Parameters muss die Grafik aendern).
+            self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    @staticmethod
+    def _normalize_field_pairs(value) -> List[str]:
+        """Normalisiert '{service_id}|{key}'-Paare (dedupliziert, getrimmt).
+
+        12.08.2026 (Option A): Eintraege ohne `|` oder mit leerer Service-/
+        Key-Seite werden verworfen. Die Keys bleiben case-sensitiv (JSON-
+        Keys aus den Service-Payloads), die Service-ID wird getrimmt.
+        """
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if not s or "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if sid and key and f"{sid}|{key}" not in out:
+                out.append(f"{sid}|{key}")
+        return out
+
+    @staticmethod
+    def _pairs_to_feature_ids(pairs) -> List[str]:
+        """Leitet die aktiven Service-IDs aus '{service_id}|{key}'-Paaren ab.
+
+        12.08.2026 (Option A): Dedupliziert in Paar-Reihenfolge (die
+        Feld-Dropdown-Item-Reihenfolge bestimmt die ServicePicker-Reihenfolge
+        - konsistent zu _checked_field_service_ids()).
+        """
+        out: List[str] = []
+        for p in pairs or []:
+            s = str(p or "")
+            if "|" not in s:
+                continue
+            sid = s.split("|", 1)[0].strip()
+            if sid and sid not in out:
+                out.append(sid)
+        return out
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
@@ -5741,6 +6234,13 @@ class AnalyticsViewModel(QObject):
             # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
             # Stale-Payloads (Queries vor dem letzten Restore).
             "restore_generation": self._restore_generation,
+            # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter
+            # (Wanduhr-Epochs relativ zum letzten Datenpunkt; None = alle).
+            "from_ts": p.get("range_from"),
+            "to_ts": p.get("range_to"),
+            # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+            # (GLOBAL - alle Query-Kinds, Entscheidung 1).
+            "service_mode": p.get("service_mode", "all"),
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -5756,10 +6256,24 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # 12.08.2026 (Option A, Bug 1/2): Explizite (Service|Parameter)-
+            # Auswahl des 'Feld'-Dropdowns -> der Reader filtert auf
+            # PARAMETER-Ebene (feature_data-JSON-Keys je Service). Leer =
+            # kein Paar-Filter (verhalten wie bisher, reiner feature_ids-
+            # Filter). Wird in set_field_selection() gepflegt.
+            base["field_selection"] = p.get("field_selection") or []
             # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
             # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
+            # 21.03.12: OR-verknuepft mit `all_timeframes` (data_tf='multi' -
+            # Analysequelle des MtfFilterBarWidget uebernimmt die Freigabe).
             base["all_timeframes"] = bool(
-                p.get("heatmap_all_timeframes", False))
+                p.get("heatmap_all_timeframes", False)
+                or p.get("all_timeframes", False))
+            # 21.03.12 (Entscheidung 6a): agg_tf -> bucket_tf fuer das
+            # date-Raster der generischen Heatmap ('auto'/leer = kein
+            # Bucketing, dynamische Granularitaet wie bisher).
+            _agg_tf = str(p.get("agg_tf") or "auto").strip().lower()
+            base["bucket_tf"] = None if _agg_tf in ("", "auto") else _agg_tf
             # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
             # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
             # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
@@ -5956,6 +6470,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (Alt-Payloads ohne den
+        # Key -> leer = kein Paar-Filter, Verhalten wie bisher).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # 20.01 (E5) + Runde 9 (Bug 1): Fehlende Services NUR melden -
         # die IDs bleiben im Filter (kein stilles Kuerzen des restaurierten
         # Filters; die DB liefert fuer unbekannte IDs keine Zeilen).
@@ -6032,6 +6551,13 @@ class AnalyticsViewModel(QObject):
                 self._params[key] = flat[key]
         if "instance_hashes" not in flat or not flat.get("instance_hashes"):
             self._params["instance_hashes"] = []
+        # 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert' auf den
+        # neuen Range-Preset-Satz abbilden (das Custom-Panel ist entfallen).
+        _preset = str(self._params.get("range_preset") or "").strip() or None
+        if _preset == "YTD":
+            self._params["range_preset"] = "Year"
+        elif _preset == "Benutzerdefiniert":
+            self._params["range_preset"] = "7d"
 
     def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
         """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
@@ -6064,6 +6590,23 @@ class AnalyticsViewModel(QObject):
                 # Profil-Payload persistieren (Replace-Semantik beim
                 # Restore: fehlt der Key -> garantiert leer, B3-2).
                 "instance_hashes": list(p.get("instance_hashes") or []),
+                # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand
+                # (data_tf/agg_tf/range) im Profil persistieren - die
+                # Analysequelle, die Aggregations-TF und der Zeitraum des
+                # MtfFilterBarWidget werden beim Profilwechsel restauriert.
+                # 21.03.14 (Wunsch 2): `sort_mode` kommt additiv hinzu
+                # (nach dem Rueckbau der View-Template-Buttons).
+                "data_tf": p.get("data_tf"),
+                "agg_tf": p.get("agg_tf"),
+                "range_preset": p.get("range_preset"),
+                "range_from": p.get("range_from"),
+                "range_to": p.get("range_to"),
+                "all_timeframes": p.get("all_timeframes"),
+                "sort_mode": p.get("sort_mode"),
+                # 21.03.20 (Analytics Modus-Filter): source_mode-Filter
+                # wird additiv in der sources-Sektion persistiert
+                # (Restore ueber _restore_params_from_payload).
+                "service_mode": p.get("service_mode"),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),
@@ -6144,6 +6687,11 @@ class AnalyticsViewModel(QObject):
         # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
         self._params["instance_hashes"] = self._normalize_instance_hashes(
             self._params.get("instance_hashes"))
+        # 12.08.2026 (Option A): (Service|Parameter)-Auswahl des
+        # 'Feld'-Dropdowns genauso normalisieren (identisch zu
+        # _apply_profile).
+        self._params["field_selection"] = self._normalize_field_pairs(
+            self._params.get("field_selection"))
         # Runde 9 (Bug 1): Fehlende Services NUR melden, NICHT aus dem
         # Filter entfernen - der Resolver wuerde sonst den restaurierten
         # Filter stillschweigend kuerzen (die DB liefert fuer unbekannte
@@ -6307,6 +6855,13 @@ class AnalyticsViewModel(QObject):
         key = str(plugin_id or "").strip()
         if not key:
             return ""
+        # 21.03.20-Bugfix 3: Die service_id-Dimension traegt seit dem
+        # Modus-Split '{service_id}::{source_mode}' (leerer Suffix =
+        # Service ohne source_mode). Den Modus abspalten und als
+        # ' / {Modus}' anhaengen (nur bei nicht-leerem Wert).
+        mode_suffix = ""
+        if "::" in key:
+            key, mode_suffix = key.split("::", 1)
         model = self._selector_model
         if model is None:
             from analytics.engine.service_selector_model import ServiceSelectorModel
@@ -6315,17 +6870,19 @@ class AnalyticsViewModel(QObject):
         try:
             plugin = model.get_plugin(key)
             if plugin is None:
-                return key
-            meta = getattr(plugin, "metadata", {}) or {}
-            name = str(meta.get("display_name") or key)
-            if name.lower().startswith("srv_"):
-                name = name[4:]
-            category = str(model.plugin_category_path(key) or "")
-            if category:
-                return f"{category} / {name}"
-            return name
+                label = key
+            else:
+                meta = getattr(plugin, "metadata", {}) or {}
+                name = str(meta.get("display_name") or key)
+                if name.lower().startswith("srv_"):
+                    name = name[4:]
+                category = str(model.plugin_category_path(key) or "")
+                label = f"{category} / {name}" if category else name
+            if mode_suffix:
+                label = f"{label} / {mode_suffix}"
+            return label
         except Exception:
-            return key
+            return key + (f" / {mode_suffix}" if mode_suffix else "")
 
     def resolve_service_display_name(self, plugin_id: str,
                                      preset_name: Optional[str] = None,
@@ -6895,6 +7452,14 @@ class AnalyticsAsyncWorker(QThread):
             feature_ids = [p["feature_id"]]
         # Runde 10 (Bug 1): Varianten-Einschraenkung an die Repo-Methoden.
         instance_hashes = p.get("instance_hashes") or []
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter + Bucket-TF.
+        from_ts = p.get("from_ts")
+        to_ts = p.get("to_ts")
+        bucket_tf = p.get("bucket_tf") or None
+        # 21.03.20 (Analytics Modus-Filter): globaler
+        # source_mode-Filter fuer Multi-Modus-Services
+        # (None/"all" = kein Filter).
+        service_mode = p.get("service_mode")
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
@@ -6903,6 +7468,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP:
             return repo.get_heatmap(
@@ -6911,6 +7478,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -6932,6 +7501,15 @@ class AnalyticsAsyncWorker(QThread):
                 # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
                 # (Preset `[📊 Service-Timeframe]`) – Bool aus den Params.
                 all_timeframes=bool(p.get("all_timeframes", False)),
+                # 21.03.12 (Entscheidung 6a): Aggregations-TF fuer das
+                # date-Raster + optionaler Zeitfilter (Wanduhr-Epochs).
+                bucket_tf=bucket_tf,
+                from_ts=from_ts, to_ts=to_ts,
+                # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-
+                # Auswahl des 'Feld'-Dropdowns -> Reader filtert auf
+                # Parameter-Ebene (feature_data-JSON-Keys je Service).
+                field_pairs=p.get("field_selection") or [],
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -6957,6 +7535,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
@@ -6967,6 +7547,8 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                from_ts=from_ts, to_ts=to_ts,
+                service_mode=service_mode,
             )
         if self._query_kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
@@ -6980,6 +7562,9 @@ class AnalyticsAsyncWorker(QThread):
                 presets_data=p.get("presets_data") or None,
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
+                # 21.03.20-Bugfix 3: Modus-Filter fuer die Feld-Metadaten
+                # (modus-spezifische Ergebnis-Parameter im Feld-Dropdown).
+                service_mode=service_mode,
             )
 
         raise ValueError(
@@ -7450,7 +8035,18 @@ DIM_MAPPINGS = {
     "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "timeframe": "LOWER(timeframe)",
-    "service_id": "LOWER(feature_id)",
+    # 21.03.20-Bugfix 3: Die Service-Achse splittet je
+    # (feature_id, source_mode)-Kombination - ein Multi-Modus-Service
+    # (z. B. Swing Momentum mit 3 Modi) belegt bei \"alle Modi\" drei
+    # Achsenpunkte. Services ohne source_mode erhalten den leeren
+    # Modus-Suffix (\"srv_x::\"); das Widget/VM-Resolver zeigt nur bei
+    # nicht-leerem Modus \"Service / Modus\" an. Der Modus-Filter
+    # (service_mode) schraenkt die Rows VOR der Aggregation ein -
+    # bei konkretem Modus bleibt genau ein Achsenpunkt je Service.
+    "service_id": (
+        "LOWER(feature_id) || '::' || COALESCE("
+        "json_extract_string(feature_data, '$.source_mode'), '')"
+    ),
     "symbol": "LOWER(symbol)",
 }
 
@@ -7478,6 +8074,42 @@ OHLCV_SNAPSHOT_LIMIT = 5000
 # Matrix). Das Candle-Overlay aggregiert Tages-Ohlc SQL-seitig ueber bis zu
 # DAILY_OHLC_MAX_DAYS Tage (deckt den gesamten Heatmap-Zeitraum ab).
 DAILY_OHLC_MAX_DAYS = 4000
+
+# 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF ->
+# Bucket-Sekunden fuer das date-Raster der generischen Heatmap (`agg_tf`
+# fixiert auf einen konkreten TF, z. B. 'M15'/'H1'). 'auto' bedeutet KEIN
+# Bucketing (Granularitaet dynamisch, bisheriges Verhalten).
+TF_SECONDS = {
+    "M1": 60, "M2": 120, "M5": 300, "M10": 600, "M15": 900,
+    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
+    "W1": 604800, "MN1": 2592000,
+}
+
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# Pill-Strips (TfStatusBadgeBar), TF-Dropdowns und Verfuegbarkeitslisten.
+# Reihenfolge entspricht der broker-ueblichen Skala M1..MN1 inkl. M2/M10
+# (vorher lieferte `ORDER BY timeframe` die ALPHABETISCHE Reihenfolge:
+# D1, H1, H4, M1, M10, M15, M30, M5, MN1, W1 - falsch im UI).
+CANONICAL_TIMEFRAME_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def canonical_tf_sort(tfs) -> List[str]:
+    """Sortiert Timeframe-Strings kanonisch fein -> grob (13.08.2026, F3).
+
+    Bekannte TFs folgen CANONICAL_TIMEFRAME_ORDER; unbekannte TFs
+    (z. B. neue Broker-TFs) landen deterministisch am Ende. Defensiv
+    gegen None/leer (ruft beide Stellen: fetch_service_tf_status und
+    get_available_timeframes).
+    """
+    order = {tf: i for i, tf in enumerate(CANONICAL_TIMEFRAME_ORDER)}
+    return sorted(
+        (str(t).strip().upper() for t in (tfs or [])
+         if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(tf, 10 ** 6), tf),
+    )
 
 
 class FeatureStoreReader:
@@ -7606,6 +8238,15 @@ class FeatureStoreReader:
         types_by_service: Dict[str, Dict[str, set]] = {}
         hashes_by_service: Dict[str, set] = {}
         null_hash_pids: Set[str] = set()
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Werte je
+        # Service (Multi-Modus-Services srv_swing_*/srv_trend_*) -
+        # Grundlage des Modus-Dropdowns OHNE zusaetzlichen
+        # DB-Roundtrip (gleicher Cache wie die Keys, Runde 15).
+        source_modes_by_service: Dict[str, Set[str]] = {}
+        # 21.03.20-Bugfix 3: JSON-Keys je (Service, source_mode) - Grundlage
+        # modus-spezifischer Ergebnis-Parameter im Feld-Dropdown (modus-
+        # gefilterte Keys statt aller Keys ueber alle Modi hinweg).
+        keys_by_service_mode: Dict[str, Dict[str, Set[str]]] = {}
         for fid, hash_raw, raw in rows:
             data = self._normalize_feature_data(raw)
             if not isinstance(data, dict):
@@ -7632,10 +8273,26 @@ class FeatureStoreReader:
                 hashes_by_service.setdefault(svc_l, set()).add(h_s)
             else:
                 null_hash_pids.add(svc_l)
+            # source_mode (nur nicht-leere String-Werte) - das
+            # Modus-Dropdown zeigt ausschliesslich tatsaechlich
+            # geschriebene Modi (dynamisch, keine Registry-Logik).
+            sm = data.get("source_mode")
+            if sm is not None and str(sm).strip():
+                source_modes_by_service.setdefault(
+                    service, set()).add(str(sm).strip())
+                # 21.03.20-Bugfix 3: Keys DIESER Row sammeln (modus-
+                # spezifische Ergebnis-Parameter fuer das Feld-Dropdown) -
+                # NICHT bucket.keys() (bucket aggregiert ueber ALLE Modi).
+                row_keys = {str(k) for k in data
+                            if k != "schema_version" and str(k).strip()}
+                keys_by_service_mode.setdefault(service, {}).setdefault(
+                    str(sm).strip(), set()).update(row_keys)
         entry = {
             "types_by_service": types_by_service,
             "hashes_by_service": hashes_by_service,
             "null_hash_pids": null_hash_pids,
+            "source_modes_by_service": source_modes_by_service,
+            "keys_by_service_mode": keys_by_service_mode,
         }
         self._meta_put(key, entry)
         return entry
@@ -7721,6 +8378,109 @@ class FeatureStoreReader:
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 
+    @staticmethod
+    def _apply_field_pair_filter(
+        field_pairs: Optional[List[str]],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um den (Service|Parameter)-Paar-Filter.
+
+        12.08.2026 (Option A, Bug 1/2): Jedes Paar '{service_id}|{key}'
+        des 'Feld'-Dropdowns wird zu einer OR-Bedingung
+        `LOWER(TRIM(feature_id)) = ? AND json_extract_string(feature_data,
+        '$.key') IS NOT NULL` - der Reader filtert damit auf PARAMETER-Ebene (nur Rows, deren
+        feature_data den gewaehlten JSON-Key des jeweiligen Services
+        wirklich traegt). Identifier-unsichere Keys werden defensiv
+        uebersprungen (kein SQL-Injection-Risiko, Muster
+        `_is_json_key_identifier`). Leere/None-Liste = kein Filter.
+        """
+        if not field_pairs:
+            return
+        clauses: List[str] = []
+        for pair in field_pairs:
+            s = str(pair or "")
+            if "|" not in s:
+                continue
+            sid, key = s.split("|", 1)
+            sid = sid.strip()
+            key = key.strip()
+            if not sid or not key or not FeatureStoreReader._is_json_key_identifier(key):
+                continue
+            # 12.08.2026 (Option A): `json_extract_string(..., '$.key')` statt
+            # `feature_data->>'key'` - der DuckDB-Arrow-Operator kollidiert in
+            # Kombination mit LOWER/TRIM-Equalities mit einem Optimizer-Bug
+            # (v1.5.5: versucht die JSON-Spalte auf numerisch/BOOL zu casten
+            # und wirft fuer nicht-matchende Zeilen). json_extract_string
+            # liefert NULL fuer fehlende Keys (identische Semantik) und ist
+            # sowohl fuer VARCHAR- als auch JSON-Spalten stabil.
+            clauses.append(
+                f"(LOWER(TRIM(feature_id)) = ? AND "
+                f"json_extract_string(feature_data, '$.{key}') IS NOT NULL)")
+            params.append(sid.lower().strip())
+        if clauses:
+            conditions.append("(" + " OR ".join(clauses) + ")")
+
+    # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+    # Multi-Modus-Services (srv_swing_structure/srv_swing_momentum/...).
+    # Nur die 6 Swing-/Trend-Services schreiben `source_mode` top-level
+    # in jedes feature_data-Record; `"all"`/None/leer = kein Filter.
+    # Muster-Konsistenz (21.03.16): json_extract_string statt
+    # feature_data->>'source_mode' (DuckDB-v1.5.5-Arrow-Optimizer-Bug
+    # in Kombination mit LOWER/TRIM-Equalities). LOWER auf beiden Seiten
+    # = case-tolerantes Matching (z. B. 'ma_peak_hysteresis').
+    @staticmethod
+    def _apply_mode_filter(
+        service_mode: Optional[str],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        if not service_mode or str(service_mode).lower() in ("all", "alle", ""):
+            return
+        conditions.append(
+            "LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)")
+        params.append(str(service_mode).strip())
+
+    # 21.03.12 (MTF-FC auf Analytics): Optionaler bar_time-Zeitfilter.
+    # Wird von allen Daten-Queries (fetch_rows/fetch_columns/fetch_heatmap/
+    # fetch_generic_heatmap) ueber `from_ts`/`to_ts` aufgerufen.
+    @staticmethod
+    def _apply_time_range(
+        from_ts: Optional[Any],
+        to_ts: Optional[Any],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um einen optionalen bar_time-Zeitfilter.
+
+        `from_ts`/`to_ts` sind Wanduhr-Epochs (int, relativ zum letzten
+        Datenpunkt – `now_provider` des MtfFilterBarWidget) oder None.
+        `EXTRACT('epoch' FROM bar_time)` liefert exakt die gespeicherte
+        Wanduhr-Epoch (Invariante 7) – der Vergleich ist damit DST-robust
+        (Wanduhr gegen Wanduhr). Ungueltige Werte werden defensiv
+        ignoriert (kein Filter).
+        """
+        if from_ts is None and to_ts is None:
+            return
+        try:
+            f = int(from_ts)
+        except (TypeError, ValueError):
+            f = None
+        try:
+            t = int(to_ts)
+        except (TypeError, ValueError):
+            t = None
+        if f is not None and t is not None:
+            conditions.append(
+                "EXTRACT('epoch' FROM bar_time)::BIGINT BETWEEN ? AND ?")
+            params.extend([f, t])
+        elif f is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT >= ?")
+            params.append(f)
+        elif t is not None:
+            conditions.append("EXTRACT('epoch' FROM bar_time)::BIGINT <= ?")
+            params.append(t)
+
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
     # ------------------------------------------------------------------
@@ -7733,6 +8493,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
@@ -7768,6 +8535,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -7836,6 +8605,14 @@ class FeatureStoreReader:
         try:
             if dim == "date":
                 if hasattr(value, "strftime"):
+                    # 21.03.12 (bucket_tf): tz-aware Datetimes (Session-TZ)
+                    # auf naive Wanduhr-UTC normalisieren - sonst zeigt das
+                    # Label den Berlin-Nachbar-Datumstag (+2h/+1h).
+                    try:
+                        value = value.astimezone(
+                            _dt_timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        pass
                     return value.strftime("%d.%m.")
                 return str(value)
             if dim == "hour":
@@ -7867,7 +8644,15 @@ class FeatureStoreReader:
             out: List[float] = []
             for v in values:
                 if isinstance(v, _dt_datetime):
-                    out.append(float(int(v.timestamp())))
+                    # 21.03.12 (bucket_tf): Naive Datetimes von to_timestamp
+                    # sind Wanduhr-encoded - als UTC-Darstellung interpretieren
+                    # (Invariante 7), sonst waere die Achse um den Berlin-
+                    # Offset (+2h/+1h) verschoben.
+                    if v.tzinfo is None:
+                        out.append(float(int(
+                            v.replace(tzinfo=_dt_timezone.utc).timestamp())))
+                    else:
+                        out.append(float(int(v.timestamp())))
                 elif hasattr(v, "year") and hasattr(v, "month") \
                         and hasattr(v, "day"):
                     # date-Objekt (CAST AS DATE): Mitternacht Wanduhr-UTC
@@ -7943,6 +8728,8 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
+        # 21.03.20-Bugfix 3: Modus-Filter (modus-spezifische Keys).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -8001,12 +8788,83 @@ class FeatureStoreReader:
                 svc_hashes = hashes_by_service.get(svc_l, set())
                 if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
                     continue
-            keys = sorted(bucket.keys())
+            # 21.03.20-Bugfix 3: Optionaler Modus-Filter - nur Keys, die in
+            # Rows mit diesem source_mode vorkommen (modus-spezifische
+            # Ergebnis-Parameter). Noch nicht berechnete Modi liefern leer
+            # (der output_schema-Fallback im Repository greift dort).
+            use_mode = (str(service_mode or "").strip()
+                        if str(service_mode or "").strip().lower()
+                        not in ("all", "alle") else "")
+            if use_mode:
+                mode_keys = base.get("keys_by_service_mode", {}).get(
+                    service, {}).get(use_mode) or set()
+                keys = sorted(k for k in bucket.keys() if k in mode_keys)
+            else:
+                keys = sorted(bucket.keys())
             if numeric_only:
                 keys = [k for k in keys if bucket[k] == {"num"}]
             if keys:
                 out[service] = keys
         return out
+
+    def fetch_available_source_modes(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
+    ) -> Tuple[List[str], bool]:
+        """Distinct source_mode-Werte je Symbol/TF (21.03.20, Modus-Dropdown).
+
+        Analysiert den gecachten Metadaten-Basis-Scan `_feature_meta_base`
+        (Runde 15, Performance-Fix 3: EIN DB-Scan fuer alle Metadaten-
+        Methoden) - der leichte QUERY_FEATURES-Pfad bekommt die Modus-Liste
+        OHNE zusaetzlichen Roundtrip. Der feature_ids-Filter folgt dem
+        Muster `feature_keys_by_service` (case-insensitiv + whitespace-
+        tolerant): abgewaehlte Services liefern ihre Modi NICHT mehr.
+
+        Returns:
+            (source_modes, has_source_mode_services)
+              source_modes:             sortierte, case-originale Modus-Werte
+                                        (z. B. ['momentum', 'structure'])
+              has_source_mode_services: True, wenn mindestens ein AKTIVER
+                                        Service einen nicht-leeren
+                                        source_mode-Wert schreibt (Combo-
+                                        Deaktivierung im HeatmapWidget).
+        """
+        if not symbol or not timeframe:
+            return [], False
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return [], False
+        modes_by_service = base.get("source_modes_by_service", {})
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        hashes = set()
+        if instance_hashes:
+            hashes = {str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()}
+        hashes_by_service = base["hashes_by_service"]
+        null_hash_pids = base["null_hash_pids"]
+
+        values: Set[str] = set()
+        has = False
+        for service, modes in modes_by_service.items():
+            svc_l = str(service).strip().lower()
+            if wanted and svc_l not in wanted:
+                continue
+            if hashes:
+                svc_hashes = hashes_by_service.get(svc_l, set())
+                if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
+                    continue
+            if modes:
+                values.update(modes)
+                has = True
+        return sorted(values), has
 
     def fetch_columns(
         self,
@@ -8018,6 +8876,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
 
@@ -8056,6 +8921,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -8101,6 +8968,13 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.03.12 (MTF-FC auf Analytics): Optionaler Zeitfilter (Wanduhr-
+        # Epochs relativ zum letzten Datenpunkt; None = kein Filter).
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
 
@@ -8161,6 +9035,8 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
 
         con = self._get_connection()
         try:
@@ -8237,6 +9113,26 @@ class FeatureStoreReader:
         # ist VERWORFEN: der alte Guard `if not symbol or not timeframe:`
         # brach damit mit einer leeren Matrix ab).
         all_timeframes: bool = False,
+        # 21.03.12 (MTF-FC auf Analytics, Entscheidung 6a): Aggregations-TF
+        # fuer das date-Raster (z. B. 'M15'/'H1'; 'auto'/None = kein
+        # Bucketing). Optionaler Zeitfilter (Wanduhr-Epochs relativ zum
+        # letzten Datenpunkt; None = kein Filter).
+        bucket_tf: Optional[str] = None,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # ('{service_id}|{key}') des 'Feld'-Dropdowns - der Reader filtert
+        # auf PARAMETER-Ebene (feature_data->>key IS NOT NULL je Service).
+        # Leer/None = kein Paar-Filter (reines feature_ids-Verhalten).
+        field_pairs: Optional[List[str]] = None,
+        # 21.03.20 (Analytics Modus-Filter): source_mode-Filter fuer
+        # Multi-Modus-Services (None/"all"/leer = kein Filter).
+        service_mode: Optional[str] = None,
+        # 21.03.20-Bugfix 3: optionale '{feature_id}::{mode}'-Kombinationen
+        # der aktiven Services (Registry) - die service_id-Achse zeigt
+        # damit auch noch nicht berechnete Modi als leere Achsenpunkte
+        # (nur bei deaktivem Modus-Filter; leere Liste = kein Effekt).
+        extra_service_modes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -8304,6 +9200,22 @@ class FeatureStoreReader:
         y_key = str(y_dim or "").lower()
         x_expr = DIM_MAPPINGS.get(x_key)
         y_expr = DIM_MAPPINGS.get(y_key)
+        # 21.03.12 (Entscheidung 6a): `bucket_tf` bucketed das date-Raster
+        # auf das Aggregations-TF-Raster (agg_tf). to_timestamp liefert
+        # naive TIMESTAMP-Werte (Wanduhr) - _axis_coords interpretiert sie
+        # als Wanduhr (UTC-Darstellung, Invariante 7).
+        if bucket_tf:
+            _secs = TF_SECONDS.get(str(bucket_tf).strip().upper())
+            if _secs:
+                _bucket_expr = (
+                    f"(to_timestamp((FLOOR(EXTRACT('epoch' FROM bar_time AT "
+                    f"TIME ZONE 'UTC') / {_secs})::BIGINT) * {_secs}) "
+                    f"AT TIME ZONE 'UTC')"
+                )
+                if x_key == "date":
+                    x_expr = _bucket_expr
+                if y_key == "date":
+                    y_expr = _bucket_expr
         if x_expr is None or y_expr is None:
             raise ValueError(
                 f"[FeatureStoreReader] Unbekannte Dimension '{x_dim}/{y_dim}' – "
@@ -8343,6 +9255,14 @@ class FeatureStoreReader:
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
+        # 12.08.2026 (Option A, Bug 1/2): (Service|Parameter)-Paar-Filter
+        # des 'Feld'-Dropdowns - OR-Bedingung je Paar
+        # (`feature_id = ? AND json_extract_string(feature_data, '$.key')
+        # IS NOT NULL`). Leere Liste = kein Paar-Filter (nur
+        # feature_ids-Filter).
+        self._apply_field_pair_filter(field_pairs, conditions, params)
+        self._apply_time_range(from_ts, to_ts, conditions, params)
+        self._apply_mode_filter(service_mode, conditions, params)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
@@ -8390,6 +9310,19 @@ class FeatureStoreReader:
         # Sortierwerte begrenzen (bei date = die neuesten Datumswerte).
         x_values = sorted({r[0] for r in rows})
         y_values = sorted({r[1] for r in rows})
+        # 21.03.20-Bugfix 3: fehlende (Service, Modus)-Kombinationen
+        # aus der Registry ergaenzen (nur service_id-Dimension, leere
+        # Zellen = fill). Der Modus-Filter schraenkt Rows VOR der
+        # Aggregation ein - bei konkretem Modus bleibt die Achse auf
+        # diesen Modus begrenzt (keine Registry-Ergaenzung noetig).
+        if extra_service_modes and (x_key == "service_id"
+                                    or y_key == "service_id"):
+            extra = {str(e) for e in extra_service_modes if str(e).strip()}
+            if extra:
+                if x_key == "service_id":
+                    x_values = sorted(set(x_values) | extra)
+                if y_key == "service_id":
+                    y_values = sorted(set(y_values) | extra)
         if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
             max_x = max(1, MAX_HEATMAP_CELLS // max(1, len(y_values)))
             x_keep = set(x_values[-max_x:])
@@ -8427,8 +9360,15 @@ class FeatureStoreReader:
             "matrix": matrix.tolist(),
             "x_labels": [self._format_dim_value(x_key, v) for v in x_values],
             "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
-            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
-            "x_values": [str(v) for v in x_values],
+            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt).
+            # 21.03.12 (bucket_tf): tz-aware Datetimes (falls DuckDB den
+            # Session-TZ anhaengt) defensiv auf naive Wanduhr-UTC normalisieren.
+            "x_values": [
+                (str(v.astimezone(_dt_timezone.utc).replace(tzinfo=None))
+                 if isinstance(v, _dt_datetime) and v.tzinfo is not None
+                 else str(v))
+                for v in x_values
+            ],
             # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
             # (date -> Mitternachts-Epochs, hour/dow -> Ganzzahlen, dow 1..5
             # Mo-Fr, kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
@@ -8758,7 +9698,11 @@ class FeatureStoreReader:
                 except (AttributeError, ValueError):
                     last_run = ""
             out[str(tf_raw).upper()] = {"count": int(cnt), "last_run": last_run}
-        return out
+        # 13.08.2026 (Punkt 3, F3): Sortierte Rueckgabe (kanonisch fein ->
+        # grob) - die Pill-Strips aller drei Fenster (AnalyticsWindow,
+        # ServicePicker, ServiceWindow) rendern die TFs damit korrekt
+        # sortiert statt alphabetisch.
+        return {tf: out[tf] for tf in canonical_tf_sort(out)}
 
     def fetch_last_execution_dates_by_hash(
         self,
@@ -8914,9 +9858,11 @@ class FeatureStoreReader:
             rows = con.execute("""
                 SELECT DISTINCT timeframe FROM feature_store
                 WHERE LOWER(symbol) = LOWER(?)
-                ORDER BY timeframe
             """, [symbol]).fetchall()
-            return [str(r[0]) for r in rows if r[0] is not None]
+            # 13.08.2026 (Punkt 3, F3): Kanonische Sortierung statt
+            # `ORDER BY timeframe` (alphabetisch).
+            return canonical_tf_sort(
+                [str(r[0]) for r in rows if r[0] is not None])
         except Exception as e:
             print(f"WARN [FeatureStoreReader] get_available_timeframes "
                   f"fehlgeschlagen: {e}")
@@ -10464,9 +11410,12 @@ from analytics.engine.mtf_fc_confluence import WEIGHTS
 MTF_FC_SCHEMA_VERSION = "1.0.0"
 
 #: Bekannte Template-Keys (Whitelist für die Migration).
+# 21.03.15 (Bug 4): `custom_range` ist entfallen (das benutzerdefinierte
+# Von-/Bis-Panel des MtfFilterBarWidget wurde entfernt) - Alt-Templates mit
+# diesem Key verlieren ihn bei der Migration (Whitelist-Semantik).
 _TEMPLATE_KNOWN_KEYS = (
-    "mtf_fc_schema_version", "name", "data_tf", "chart_tf",
-    "range_preset", "custom_range", "sort_mode", "session_filters",
+    "mtf_fc_schema_version", "name", "data_tf", "chart_tf", "agg_tf",
+    "range_preset", "sort_mode", "session_filters",
     "confluence_weighting", "volatility_adaption", "view_templates_meta",
 )
 
@@ -10474,8 +11423,9 @@ _TEMPLATE_KNOWN_KEYS = (
 _TEMPLATE_DEFAULTS: Dict[str, Any] = {
     "data_tf": "multi",
     "chart_tf": "auto",
+    # 21.03.12 (Entscheidung 6a): Aggregations-TF ('auto' oder konkreter TF).
+    "agg_tf": "auto",
     "range_preset": "7d",
-    "custom_range": {"from_ts": None, "to_ts": None},
     "sort_mode": "date",
     "session_filters": [],
     "confluence_weighting": dict(WEIGHTS),
@@ -10526,7 +11476,7 @@ def migrate_template(raw: Any) -> Dict[str, Any]:
             # Pflicht-Keys existieren (defensive Ergänzung, non-destruktiv).
             for key, default in _TEMPLATE_DEFAULTS.items():
                 result.setdefault(key, default)
-            return result
+            return _normalize_obsolete(result)
 
         # 1) Fehlende Schema-Keys mit Defaults ergänzen.
         for key, default in _TEMPLATE_DEFAULTS.items():
@@ -10540,13 +11490,32 @@ def migrate_template(raw: Any) -> Dict[str, Any]:
 
         # 3) Schema-Version anheben.
         result["mtf_fc_schema_version"] = MTF_FC_SCHEMA_VERSION
-        return result
+        return _normalize_obsolete(result)
     except MigrationError:
         raise
     except TemplateError:
         raise
     except Exception as e:
         raise TemplateError(f"Template-Migration fehlgeschlagen: {e}") from e
+
+
+def _normalize_obsolete(result: Dict[str, Any]) -> Dict[str, Any]:
+    """21.03.15 (Bug 3/4): Obsolete Keys/Werte bereinigen (non-destruktiv).
+
+    * `custom_range` (entfallenes Von-/Bis-Panel des MtfFilterBarWidget)
+      wird entfernt - Alt-Templates verlieren den Key auch dann, wenn ihre
+      Schema-Version bereits aktuell ist (sonst bliebe er im
+      Nicht-Migrationspfad erhalten).
+    * Alt-Preset-Werte 'YTD'/'Benutzerdefiniert' werden auf den neuen
+      Preset-Satz (24h/7d/30d/90d/Year) abgebildet.
+    """
+    result.pop("custom_range", None)
+    preset = str(result.get("range_preset") or "").strip() or None
+    if preset == "YTD":
+        result["range_preset"] = "Year"
+    elif preset == "Benutzerdefiniert":
+        result["range_preset"] = "7d"
+    return result
 
 
 class MtfFcTemplateStore:
@@ -19477,6 +20446,7 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_view_model import AnalyticsViewModel
 from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.engine.feature_store_reader import FeatureStoreReader
+from chart.widgets.mtf_filter_bar import MtfFilterBarWidget
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -19497,6 +20467,13 @@ from serviceui.symbols_win import SymbolsWindow
 # Timeframes ohne Feature-Store-Daten werden in der Combo ausgegraut
 # (_refresh_timeframe_combo) und sind nicht auswaehlbar.
 TIMEFRAMES = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+
+# 21.03.12 (MTF-FC auf Analytics): TF-Listen des MtfFilterBarWidget –
+# 11 Analytics-Timeframes (M1..MN1) statt der 6 Chart-Defaults. `data_tf`
+# (Analysequelle: Multi oder fixierter TF) und `agg_tf` (Aggregations-TF,
+# Entscheidung 6a: Auto oder fixierter TF) sind unabhaengige Dropdowns.
+MTF_DATA_TF_OPTIONS = ["🌐 Multi"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
+MTF_AGG_TF_OPTIONS = ["⚡ Auto"] + [f"🔒 {tf}" for tf in TIMEFRAMES]
 
 # Fenstertitel (Option B: '*' = ungespeicherte Parametertrends).
 WINDOW_TITLE_BASE = "PyTrader - Analytics"
@@ -19781,6 +20758,22 @@ class AnalyticsWindow(PersistentWindow):
         filt.addStretch(1)
         root.addLayout(filt)
 
+        # --- 21.03.12 (MTF-FC auf Analytics): Filterleiste des MtfFilterBarWidget ---
+        # Data-TF (Analysequelle: Multi/fixiert), Agg-TF (Aggregations-TF,
+        # Entscheidung 6a), Range-Picker, Sortierung + View-Templates.
+        # now_provider = letzter Datenpunkt (MAX(bar_time)) statt time.time(),
+        # damit Range-Presets relativ zum letzten Signal rechnen. Der
+        # Chart-Modus wird auf '🔒 Fix' gesetzt, damit das Agg-TF-Dropdown
+        # sofort aktiv ist (im Chart gated '⚡ Auto' das Agg-Dropdown).
+        self.mtf_bar = MtfFilterBarWidget(
+            data_tf_options=MTF_DATA_TF_OPTIONS,
+            agg_tf_options=MTF_AGG_TF_OPTIONS,
+            now_provider=self._vm.latest_data_epoch,
+            parent=self,
+        )
+        self.mtf_bar.set_chart_mode("fix")
+        root.addWidget(self.mtf_bar)
+
         # --- Body: Sidebar + Seiten (QStackedWidget) ---
         body = QHBoxLayout()
         # 10.08.2026 (Bugfix, UI-Splitter): Sidebar (links) und Seiten-Stack
@@ -20003,6 +20996,9 @@ class AnalyticsWindow(PersistentWindow):
             print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
         self._sync_profile_filters()
         self._sync_service_filter_button()
+        # 21.03.12 (MTF-FC auf Analytics): Filterleisten-Zustand nach einem
+        # Profil-/Workspace-Restore synchronisieren (data_tf/agg_tf/Range).
+        self._sync_mtf_bar_from_params()
 
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
@@ -20068,9 +21064,22 @@ class AnalyticsWindow(PersistentWindow):
         # Einzel-Ausfuehrung) das Analytics-Hauptfenster (Heatmap/Tabelle)
         # automatisch neu laden. `refresh_all` ist im VM debounced.
         event_bus.service_set_changed.connect(self._on_service_set_changed)
-        # 21.03.11 (Bug 6): Sortier-Aenderung der MTF-FC-Filterleiste (Chart)
+        # 21.03.11/12 (MTF-FC): Sortier-Aenderung der Filterleiste (Analytics)
         # an die TablePage weiterreichen (Entkopplung via EventBus, IoC).
         event_bus.mtf_fc_sort_changed.connect(self._on_mtf_fc_sort_changed)
+        # 21.03.12 (MTF-FC auf Analytics): MtfFilterBarWidget-Signale -> VM.
+        self.mtf_bar.data_tf_changed.connect(self._on_mtf_data_tf_changed)
+        self.mtf_bar.agg_tf_changed.connect(self._vm.set_agg_tf)
+        self.mtf_bar.range_changed.connect(self._on_mtf_range_changed)
+        # 21.03.14 (Wunsch 2): Sortier-Aenderung an den ViewModel
+        # (Profil-Persistenz, Sektion sources) UND ueber den bestehenden
+        # EventBus an die TablePage (set_external_sort_mode, IoC).
+        self.mtf_bar.sort_mode_changed.connect(self._vm.set_sort_mode)
+        self.mtf_bar.sort_mode_changed.connect(
+            event_bus.mtf_fc_sort_changed.emit)
+        # Filterleisten-Zustand aus den VM-Params initial synchronisieren
+        # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
+        self._sync_mtf_bar_from_params()
 
     @Slot()
     def _on_service_set_changed(self) -> None:
@@ -20090,11 +21099,12 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot(str)
     def _on_mtf_fc_sort_changed(self, mode: str) -> None:
-        """21.03.11 (Bug 6): MTF-FC-Sortier-Aenderung auf die TablePage anwenden.
+        """21.03.11/12 (MTF-FC): Sortier-Aenderung auf die TablePage anwenden.
 
-        Die Filterleiste des ChartWindows emittiert `event_bus.mtf_fc_sort_changed`
-        ('date' | 'signal' | 'tf'). Die TablePage setzt daraufhin ihre
-        Anzeige-Sortierung entsprechend (IoC, kein Fenster-Know-how).
+        Die MTF-FC-Filterleiste (AnalyticsWindow) emittiert
+        `event_bus.mtf_fc_sort_changed` ('date' | 'signal' | 'tf'). Die
+        TablePage setzt daraufhin ihre Anzeige-Sortierung entsprechend
+        (IoC, kein Fenster-Know-how).
         """
         if getattr(self, "table_page", None) is None:
             return
@@ -20102,6 +21112,50 @@ class AnalyticsWindow(PersistentWindow):
             self.table_page.set_external_sort_mode(str(mode))
         except Exception as e:
             print(f"WARN [AnalyticsWindow] MTF-FC-Sortierung: {e}")
+
+    @Slot(str)
+    def _on_mtf_data_tf_changed(self, data_tf: str) -> None:
+        """21.03.12: Analysequelle des MtfFilterBarWidget uebernehmen.
+
+        `set_data_tf` setzt bei fixiertem TF auch den `timeframe`-Filter
+        (Analysequelle = Analyse-TF) - die Timeframe-Combo wird dann
+        synchronisiert (Muster set_data_tf-Docstring).
+        """
+        self._vm.set_data_tf(str(data_tf))
+        if str(data_tf).strip().lower() != "multi":
+            self._sync_profile_filters()
+
+    @Slot(str, int, int)
+    def _on_mtf_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
+        """21.03.12: Zeitraum-Preset des MtfFilterBarWidget uebernehmen."""
+        self._vm.set_range(int(from_ts), int(to_ts), str(preset))
+
+    def _sync_mtf_bar_from_params(self) -> None:
+        """Synchronisiert die MTF-FC-Filterleiste aus den VM-Params.
+
+        Wird nach Profil-/Workspace-Restore (params_restored) und initial
+        nach _wire_controls gerufen. `apply_external_state` setzt die Combos
+        mit blockSignals und emittiert die Aenderungs-Signale danach explizit
+        (der VM dedupliziert gleiche Werte, kein Doppel-Refresh).
+        """
+        bar = getattr(self, "mtf_bar", None)
+        if bar is None:
+            return
+        p = self._vm.params
+        try:
+            # 21.03.14 (Wunsch 2): sort_mode stellt die Tabellen-Sortierung
+            # wieder her. 21.03.15 (Bug 3): range_preset wird auf den neuen
+            # Preset-Satz abgebildet (Alt-Werte 'YTD'/'Benutzerdefiniert'
+            # migriert die Filterleiste selbst); range_from/range_to (Custom-
+            # Panel) sind seit 21.03.15 entfallen.
+            bar.apply_external_state(
+                data_tf=str(p.get("data_tf") or "multi"),
+                agg_tf=str(p.get("agg_tf") or "auto"),
+                range_preset=p.get("range_preset"),
+                sort_mode=p.get("sort_mode"),
+            )
+        except (RuntimeError, AttributeError):
+            pass
 
     @Slot(str)
     def _on_limit_text_changed(self, text: str) -> None:
@@ -21500,6 +22554,14 @@ class HeatmapPage(QWidget):
         self._stack_modes.addWidget(self._standard_ui)
         self._stack_modes.addWidget(self._generic)
         lay.addWidget(self._stack_modes)
+        # 13.08.2026 (Bugfix, User-Meldung 'Heatmap wird nicht gezeigt'):
+        # Die Basis-Ansicht ist seit 21.01 IMMER das generische Widget
+        # (Stack Seite 1). set_mode()/_on_mode_changed() setzen Seite 1
+        # ebenfalls, aber ohne diesen Initial-Switch blieb beim frischen
+        # Start (kein Workspace-Restore mit heatmap_mode) die unsichtbare
+        # Legacy-Standard-UI (Index 0) aktiv -> generische Heatmap nie
+        # dargestellt und ihre Controls nicht bedienbar.
+        self._stack_modes.setCurrentIndex(1)
 
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
@@ -21649,7 +22711,11 @@ class HeatmapPage(QWidget):
         )
         matrix = np.asarray(data.get("matrix"), dtype=float)
         if matrix.size == 0:
-            self._stack.setCurrentIndex(1)
+            # 13.08.2026 (Bugfix): Die Standard-Ansicht (dow x hour) ist
+            # seit 21.01 NICHT mehr sichtbar (Stack zeigt immer das
+            # generische Widget). Ihr Datenstand darf die Seiten-
+            # Sichtbarkeit nicht mehr steuern - sonst verdeckt das
+            # No-Data-Overlay das generische Widget (nicht anklickbar).
             return
         self._render(matrix)
         self._stack.setCurrentIndex(0)
@@ -21793,7 +22859,7 @@ pyqtgraph uebergibt an `tickValues` die ACHSEN-LAENGE in Pixeln (3. Param)
 
 import math
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pyqtgraph as pg
@@ -21801,6 +22867,7 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -21836,6 +22903,27 @@ _VIRIDIS = "viridis"
 
 # E6: Wert-Aggregationen benoetigen einen numerischen feature_data-JSON-Key.
 _VALUE_AGGS = ("avg", "sum", "min", "max")
+
+# 13.08.2026 (Punkt 5, F5): Preisartige feature_data-Keys - SUM ueber
+# Preise erzeugt unsinnig hohe Legendenwerte (z. B. SILVER ~43k/Tag bei
+# 5-Min-Summen) und wird fuer diese Felder deaktiviert. Signal-Felder
+# (strength_value) bleiben erlaubt. Abgleich mit den Output-Schemata der
+# srv_*-Plugins (price, reference_price, poc_price, vah_price, val_price,
+# lvn_price, grid_price, vwap_price, vwap_lower, atr_value, lower_band,
+# lower_level, prox_level1..6).
+_PRICE_LIKE_KEY_HINTS = (
+    "price",      # Preisfelder (price, *price, reference_price)
+    "vwap_lower",  # VWAP-Band-Unterkante
+    "atr_value",  # ATR-Magnitude (Punkte)
+    "band",       # lower_band (Trend-Breakout)
+    "level",      # lower_level / prox_level* (Grid-Level)
+)
+
+
+def _is_price_like_key(key: str) -> bool:
+    """True fuer preisartige feature_data-Keys (13.08.2026, F5)."""
+    k = str(key or "").lower()
+    return any(h in k for h in _PRICE_LIKE_KEY_HINTS) if k else False
 
 # Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
 _DAY_SECONDS = 86400
@@ -21949,6 +23037,35 @@ def _format_heatmap_value(val: Any) -> str:
     return f"{fval:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_legend_value(val: Any, span: float) -> str:
+    """Formatiert einen Legenden-Schwellwert mit adaptiver Genauigkeit.
+
+    12.08.2026 (Bug 5): Bei kleinen Werte-Spannen kollabierten die
+    Quartil-Schwellen der Legende unter der .2f-Rundung zu identischen
+    Labels ('0.01 - 0.01' war unsinnig). Die Nachkommastellen-Zahl wird
+    aus der Spanne abgeleitet, sodass die 25-%-Schritte (span/4) der
+    Viridis-Legende GARANTIERT unterscheidbar bleiben. Ganzzahlige
+    Schwellen ohne Nachkommastellen werden als Integer ausgegeben
+    ('25'), Bruchwerte ohne Nullen ('0.0125', '0.02').
+    """
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not math.isfinite(fval):
+        return str(val)
+    if span is None or span <= 0:
+        decimals = 2
+    else:
+        step = span / 4.0
+        if step >= 1.0:
+            decimals = 0
+        else:
+            decimals = int(math.ceil(-math.log10(step))) + 1
+            decimals = max(0, min(decimals, 6))
+    return f"{fval:.{decimals}f}".rstrip("0").rstrip(".")
+
+
 class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
@@ -22057,6 +23174,13 @@ class _HeatmapAxis(pg.AxisItem):
         (LWC `Q_`): Jahres-/Monatsmarken werden immer gesetzt, feinere
         Marken fuellen die Luecken.
         """
+        # 21.03.20-Bugfix 5: Date-Epochs sind Wanduhr-Sekunden seit 1970
+        # (positiv). Negative/riesige Werte (z. B. zusammengefallener
+        # Auto-Range nach 'Keine Daten' -> [-0.5, 0.5]) wuerden in
+        # _date_marks zu datetime.fromtimestamp(-86400) fuehren und auf
+        # Windows/Python 3.14 OSError 22 werfen. Clampen verhindert das.
+        lo = max(0.0, float(lo))
+        hi = max(0.0, float(hi))
         span = hi - lo
         if span <= 0:
             return []
@@ -22087,7 +23211,14 @@ class _HeatmapAxis(pg.AxisItem):
         d1 = int(math.floor(hi / _DAY_SECONDS)) * _DAY_SECONDS
         d = d0
         while d <= d1:
-            dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            # 21.03.20-Bugfix 5: fromtimestamp kann auf Windows OSError 22
+            # fuer ungueltige (negative/riesige) Epochs werfen - ungueltige
+            # Marken ueberspringen statt zu crashen.
+            try:
+                dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            except (OSError, ValueError, OverflowError):
+                d += _DAY_SECONDS
+                continue
             if dt.month == 1 and dt.day == 1:
                 w = 70
             elif dt.day == 1:
@@ -22262,6 +23393,22 @@ class HeatmapWidget(QWidget):
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown fuer
+        # Multi-Modus-Services (srv_swing_*/srv_trend_* schreiben
+        # `source_mode` top-level in jedes feature_data-Record).
+        # Wird aus dem QUERY_FEATURES-Payload befuellt
+        # (`source_modes` + `has_source_mode_services`);
+        # "[Alle Modi]" (data "all") = kein Filter. Deaktiviert,
+        # wenn KEIN aktiver Service source_mode schreibt.
+        self._combo_mode_filter = QComboBox()
+        self._combo_mode_filter.addItem("[Alle Modi]", "all")
+        self._combo_mode_filter.setMinimumWidth(150)
+        self._combo_mode_filter.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self._combo_mode_filter.setToolTip(
+            "Modus-Filter: grenzt die Daten auf einen source_mode "
+            "der Multi-Modus-Services ein (global fuer Tabelle, "
+            "Heatmaps, Scatter, Verteilung).")
         # 20.03.02 (F1c/F7): 'Feld' ist ein CheckableComboBox – die
         # Multi-Auswahl steuert den Datenquellen-Filter `feature_ids`, die
         # Aggregation nutzt genau EIN aktives Hauptfeld (currentData). Bei
@@ -22316,23 +23463,40 @@ class HeatmapWidget(QWidget):
             s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
                          "links = Zoom-Out.")
 
-        ctrl2 = QHBoxLayout()
-        ctrl2.addWidget(self._chk_candle)
-        ctrl2.addWidget(self._label_overlay_tf)
-        ctrl2.addWidget(QLabel("Zoom X:"))
-        ctrl2.addWidget(self._slider_zoom_x)
-        ctrl2.addWidget(QLabel("Zoom Y:"))
-        ctrl2.addWidget(self._slider_zoom_y)
+        # 21.03.20-Bugfix 1+2: Zwei-zeiliges QGridLayout. Zeile 0 traegt die
+        # Werteanzeige (_label_info) EINE ZEILE UEBER der Steuerleiste,
+        # linksbuendig auf Hoehe des Feld-Dropdowns (Spalte des 'Feld:'-
+        # Labels). Bug 2: Modus-Dropdown steht JETZT VOR der Aggregation.
+        # 'Feld' (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
+        ctrl2 = QGridLayout()
+        ctrl2.setHorizontalSpacing(6)
+        ctrl2.setVerticalSpacing(2)
+        _c = 0
+        ctrl2.addWidget(self._chk_candle, 1, _c); _c += 1
+        ctrl2.addWidget(self._label_overlay_tf, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom X:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_x, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Zoom Y:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._slider_zoom_y, 1, _c); _c += 1
         # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
         # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
         # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
-        ctrl2.addSpacing(15)
-        ctrl2.addWidget(QLabel("Aggregation:"))
-        ctrl2.addWidget(self._combo_agg)
-        ctrl2.addSpacing(10)
-        ctrl2.addWidget(QLabel("Feld:"))
-        ctrl2.addWidget(self._combo_field, 1)
-        ctrl2.addWidget(self._label_info)
+        ctrl2.addWidget(QWidget(), 1, _c); _c += 1
+        ctrl2.setColumnMinimumWidth(_c - 1, 15)
+        # 21.03.20-Bugfix 2: Modus-Dropdown VOR der Aggregation (Tausch).
+        ctrl2.addWidget(QLabel("Modus:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_mode_filter, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Aggregation:"), 1, _c); _c += 1
+        ctrl2.addWidget(self._combo_agg, 1, _c); _c += 1
+        ctrl2.addWidget(QLabel("Feld:"), 1, _c); _c += 1
+        _field_col = _c
+        ctrl2.addWidget(self._combo_field, 1, _c); _c += 1
+        ctrl2.setColumnStretch(_field_col, 1)
+        # 21.03.20-Bugfix 1: Werteanzeige eine Zeile ueber der Steuerleiste
+        # (linksbuendig auf Hoehe des Feld-Dropdowns) - die Zeile bleibt
+        # ruhiger, weil das Label nicht mehr rechts am Ende wackelt.
+        ctrl2.addWidget(self._label_info, 0, _field_col,
+                        1, 1, Qt.AlignLeft)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -22434,16 +23598,20 @@ class HeatmapWidget(QWidget):
         self._combo_x.currentIndexChanged.connect(self._on_config_changed)
         self._combo_y.currentIndexChanged.connect(self._on_config_changed)
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
+        # 21.03.20 (Analytics Modus-Filter): Aenderung im Modus-
+        # Dropdown -> globaler ViewModel-Refresh (alle Datenquellen).
+        self._combo_mode_filter.currentIndexChanged.connect(
+            self._on_mode_filter_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
         # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
-        # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung ist ENTFERNT -
-        # das 'Feld'-Dropdown schreibt KEIN feature_ids mehr (kein
-        # Ueberschreiben der ServicePicker-Auswahl bzw. des Restores). Die
-        # Haken spiegeln den aktiven Filter (_sync_combos_from_payload); die
-        # Feld-Auswahl (Current-Item) steuert heatmap_field weiterhin ueber
-        # currentIndexChanged -> _on_config_changed.
-        # self._combo_field.selection_changed.connect(
-        #     self._on_field_selection_changed)
+        # 21.03.15 (Bug 1): Die Verbindung ist WIEDER AKTIV - Check/Uncheck
+        # im 'Feld'-Dropdown schreibt feature_ids ueber den bestehenden
+        # ServicePicker-Pfad (`_on_field_selection_changed` ->
+        # `_reconcile_sammel_checks` -> `_checked_field_service_ids` ->
+        # `set_feature_ids`), damit ServicePicker-Auswahl und Feld-Dropdown
+        # konsistent bleiben.
+        self._combo_field.selection_changed.connect(
+            self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -22519,6 +23687,12 @@ class HeatmapWidget(QWidget):
             self._set_combo_data(
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
+            # 21.03.20 (Analytics Modus-Filter): Modus-Auswahl aus
+            # den VM-Params wiederherstellen (Profil-/Workspace-
+            # Restore; unbekannte Werte werden additiv ergaenzt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(p.get("service_mode") or "all"))
             # Runde 8 (Bugfix 3): Das 'Feld'-Dropdown wird aus den gecachten
             # Feld-Metadaten (self._field_keys/self._field_sources) + den
             # aktuellen VM-Params SYNCHRON neu abgeleitet (Items, Haken,
@@ -22590,6 +23764,24 @@ class HeatmapWidget(QWidget):
         self._slider_zoom_x.setEnabled(True)
         self._slider_zoom_y.setEnabled(True)
         is_value_agg = agg in _VALUE_AGGS
+        # 13.08.2026 (Punkt 5, F5): SUM fuer preisartige Felder sperren
+        # (unsinnig hohe Legendenwerte); Signal-Felder (strength_value)
+        # bleiben erlaubt. Ist SUM gerade aktiv und das Feld preisartig,
+        # wird implizit auf AVG gewechselt (VM-Config + Refresh idempotent).
+        active_field = self._field_key(self._combo_field.currentData())
+        # 13.08.2026 (Punkt 5, F5): Modul-Funktion (kein self.) - die
+        # Helfer ist als reine Funktion definiert (SRP, kein Widget-Zustand).
+        price_like = _is_price_like_key(active_field)
+        sum_idx = self._combo_agg.findData("sum")
+        if sum_idx >= 0:
+            _sum_item = self._combo_agg.model().item(sum_idx)
+            if _sum_item is not None:
+                _sum_item.setEnabled(not price_like)
+        if price_like and agg == "sum":
+            self._set_combo_data(self._combo_agg, "avg")
+            agg = "avg"
+            is_value_agg = True
+            self._apply_config()
         self._combo_field.setEnabled(is_value_agg)
         if is_value_agg:
             self._combo_field.setToolTip(
@@ -22664,6 +23856,19 @@ class HeatmapWidget(QWidget):
         self._apply_config()
         self.request_data()
 
+    def _on_mode_filter_changed(self, *args) -> None:
+        """21.03.20: Modus-Filter-Aenderung -> ViewModel (global).
+
+        `set_service_mode` stoesst intern den Refresh von
+        QUERY_FEATURES + allen Datenquellen an (Tabelle, beide
+        Heatmaps, Scatter, Verteilung - Entscheidung 1). Der
+        _syncing-Guard verhindert Endlos-Schleifen.
+        """
+        if self._syncing or self._view_model is None:
+            return
+        mode = str(self._combo_mode_filter.currentData() or "all")
+        self._view_model.set_service_mode(mode)
+
     def _apply_config(self) -> None:
         self._view_model.set_heatmap_config(
             x_dim=str(self._combo_x.currentData() or "date"),
@@ -22716,14 +23921,13 @@ class HeatmapWidget(QWidget):
     # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
     # ------------------------------------------------------------------
     def _on_field_selection_changed(self, _checked: List[str]) -> None:
-        """CheckState-Wechsel im 'Feld'-Dropdown (nicht mehr verbunden).
+        """CheckState-Wechsel im 'Feld'-Dropdown -> feature_ids-Filter.
 
-        10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung
-        selection_changed -> dieser Handler wurde in __init__ entfernt - das
-        'Feld'-Dropdown schreibt KEIN feature_ids mehr (Single Source of
-        Truth = ServicePicker; kein Ueberschreiben des Restores). Der Handler
-        bleibt als Bestandscode erhalten.
-        -> feature_ids-Filter.
+        21.03.15 (Bug 1): Die Verbindung selection_changed -> dieser
+        Handler ist WIEDER aktiv (siehe __init__) - Check/Uncheck im
+        'Feld'-Dropdown schreibt feature_ids ueber den ServicePicker-
+        Pfad, damit ServicePicker-Auswahl und Feld-Dropdown konsistent
+        bleiben (Single Source of Truth = ServicePicker + Dropdown).
 
         Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
         `set_feature_ids` stoesst den Debounce-Refresh der generischen
@@ -22736,9 +23940,33 @@ class HeatmapWidget(QWidget):
         """
         if self._syncing or self._view_model is None:
             return
+        # 13.08.2026 (Punkt 4, F4): Vor der Reconciliation das AKTIVE Feld
+        # merken - wird es abgehakt, wechselt die Aggregations-/Anzeige-
+        # auswahl implizit auf das naechste angehakte Feld (genau EIN Feld
+        # wird aggregiert/angezeigt; die angehakten Paare bestimmen die
+        # Verfuegbarkeit).
+        prev_ud = str(self._combo_field.currentData() or "")
         self._reconcile_sammel_checks()
-        ids = self._checked_field_service_ids()
-        self._view_model.set_feature_ids(ids)
+        new_ud = str(self._combo_field.currentData() or "")
+        # 12.08.2026 (Option A, Bug 1/2): Die angehakten Items bestimmen die
+        # (Service|Parameter)-Paare (`set_field_selection`) - An/Abwaehlen
+        # eines Parameters aendert die Grafik auch bei unveraenderter
+        # Service-Menge. Leere Auswahl = kein Paar-Filter (alle Features,
+        # ViewModel-Semantik 15.03-E). Alt-/Test-ViewModel ohne
+        # Parameter-Ebene fallen auf den Service-Pfad zurueck.
+        pairs = self._checked_field_pairs()
+        if hasattr(self._view_model, "set_field_selection"):
+            self._view_model.set_field_selection(pairs)
+        else:
+            ids = self._checked_field_service_ids()
+            self._view_model.set_feature_ids(ids)
+        # P4 (F4): Das aktive Feld wurde abgehakt -> die Auswahl ist auf das
+        # naechste angehakte Feld nachgezogen (_sync_field_current_after_-
+        # checks in _reconcile_sammel_checks, blockSignals) -> die
+        # Konfiguration/der Refresh wird hier explizit nachgezogen, damit
+        # das neue Feld auch aggregiert/angezeigt wird.
+        if new_ud and new_ud != prev_ud:
+            self._apply_config()
 
     def _reconcile_sammel_checks(self) -> None:
         """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
@@ -22830,6 +24058,55 @@ class HeatmapWidget(QWidget):
                 if sid and sid not in ids:
                     ids.append(sid)
         return ids
+
+    def _checked_field_pairs(self) -> List[str]:
+        """(Service|Parameter)-Paare der angehakten Feld-Items (12.08.2026).
+
+        Option A (Bug 1/2): Grundlage des Parameter-Filters
+        (`set_field_selection`). `ALL|<key>` expandiert ueber
+        `self._field_sources[key]` auf ALLE Quellen-Services des Keys,
+        `{service_id}|<key>` liefert genau das Paar. Roh-Keys ohne `|`
+        (Legacy) bleiben aussen vor (tragen keine Service-Zuordnung).
+        Dedupliziert, in Item-Reihenfolge.
+        """
+        pairs: List[str] = []
+        for ud in self._combo_field.checked_data():
+            s = str(ud or "")
+            if s.startswith("ALL|"):
+                key = s.split("|", 1)[1]
+                for sid in (self._field_sources.get(key) or []):
+                    if sid and f"{sid}|{key}" not in pairs:
+                        pairs.append(f"{sid}|{key}")
+            elif "|" in s:
+                sid, key = s.split("|", 1)
+                if sid and f"{sid}|{key}" not in pairs:
+                    pairs.append(f"{sid}|{key}")
+        return pairs
+
+    def _sync_field_selection_to_vm(self) -> None:
+        """Spiegelt die effektive Paar-Auswahl in den ViewModel (12.08.2026).
+
+        Wird am Ende jedes `_rebuild_field_dropdown()` gerufen: Die
+        effektiven (Service|Parameter)-Paare (aus der Dropdown-Auswahl)
+        werden via `set_field_selection` persistiert, damit a) die
+        DEFAULT-Vorbelegung (erster Parameter je aktivem Service) auch die
+        Query steuert (Bug 2) und b) verwaiste/entfernte Paare automatisch
+        bereinigt werden. Nur bei aktivem Service-Filter (feature_ids nicht
+        leer) - ohne Filter (alle Features) bleibt field_selection None und
+        die Heatmap zeigt weiterhin alle Features ohne Paar-Filter.
+        Idempotent via set_field_selection (kein Refresh bei Gleichstand).
+        """
+        if self._view_model is None:
+            return
+        p = self._view_model.params
+        if not (p.get("feature_ids") or []):
+            return
+        if not hasattr(self._view_model, "set_field_selection"):
+            return
+        pairs = self._checked_field_pairs()
+        # update_ids=False: feature_ids (ServicePicker) bleibt die
+        # Service-Quelle - der Sync verkleinert die Service-Auswahl nie.
+        self._view_model.set_field_selection(pairs, update_ids=False)
 
     # ------------------------------------------------------------------
     # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
@@ -22996,6 +24273,11 @@ class HeatmapWidget(QWidget):
                 field_sources if isinstance(field_sources, dict) else {})
         else:
             self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+        # 21.03.20 (Analytics Modus-Filter): Modus-Dropdown aus dem
+        # LEICHTEN QUERY_FEATURES-Payload befuellen (`source_modes`
+        # + `has_source_mode_services`; Entscheidung 2: kein Extra-
+        # Roundtrip, Worker-Thread + Reader-Cache).
+        self._sync_mode_filter_from_payload(data)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
         """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
@@ -23009,6 +24291,51 @@ class HeatmapWidget(QWidget):
             self._no_data_variants_error = True
             self._rebuild_field_dropdown(self._field_keys,
                                          self._field_sources)
+
+    def _sync_mode_filter_from_payload(self, data: Dict[str, Any]) -> None:
+        """Befuellt das Modus-Dropdown aus dem QUERY_FEATURES-Payload.
+
+        21.03.20 (Entscheidung 2/4): `source_modes` (distinct, case-original)
+        fuellt die Items (itemData = Modus-Wert). `has_source_mode_services
+        == False` deaktiviert die Combo und setzt den Filter auf "all"
+        zurueck (kein aktiver Service schreibt source_mode). Stale-Payloads
+        werden verworfen (Generation-Guard, Muster _sync_combos_from_payload).
+        """
+        if self._view_model is None:
+            return
+        vm = self._view_model
+        payload_gen = data.get("restore_generation")
+        if (payload_gen is not None
+                and str(payload_gen) != str(
+                    getattr(vm, "restore_generation", 0))):
+            return  # Stale-Payload (Query lief VOR dem letzten Restore)
+        modes = [str(m) for m in (data.get("source_modes") or [])]
+        has_sm = bool(data.get("has_source_mode_services"))
+        self._syncing = True
+        try:
+            self._combo_mode_filter.blockSignals(True)
+            self._combo_mode_filter.clear()
+            self._combo_mode_filter.addItem("[Alle Modi]", "all")
+            for m in modes:
+                if str(m).strip():
+                    self._combo_mode_filter.addItem(
+                        str(m).strip(), str(m).strip())
+            # Deaktivierung: Combo aus + Filter auf "all" zuruecksetzen
+            # (idempotent - set_service_mode("all") refresh-t nur bei
+            # tatsaechlicher Aenderung).
+            if not has_sm:
+                self._combo_mode_filter.setEnabled(False)
+                if str(vm.params.get("service_mode") or "all") != "all":
+                    vm.set_service_mode("all")
+            else:
+                self._combo_mode_filter.setEnabled(True)
+            # Auswahl aus den VM-Params wiederherstellen (Restore gewinnt).
+            self._set_combo_data(
+                self._combo_mode_filter,
+                str(vm.params.get("service_mode") or "all"))
+        finally:
+            self._combo_mode_filter.blockSignals(False)
+            self._syncing = False
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)
@@ -23032,12 +24359,32 @@ class HeatmapWidget(QWidget):
         self._sync_combos_from_payload(data)
         agg = str(data.get("agg") or "count")
 
+        # 21.03.20-Bugfix 4: Achsen-Labels VOR dem Leer-Check konfigurieren -
+        # auch bei 'Keine Daten' (gewaehlter Modus ohne DB-Rows) muss die
+        # Service-Beschriftung (inkl. ' / {Modus}') auf der Achse
+        # aktualisiert werden (vorher blieb der alte Zustand stehen).
+        x_labels = data.get("x_labels") or []
+        y_labels = data.get("y_labels") or []
+        if x_dim == "service_id" and self._view_model is not None:
+            x_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in x_labels]
+        if y_dim == "service_id" and self._view_model is not None:
+            y_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in y_labels]
+        self._axis_x.configure(x_dim, x_labels)
+        self._axis_y.configure(y_dim, y_labels)
+
         if matrix.size == 0:
             self._n_cols = self._n_rows = 0
             self._x_axis = []
             self._y_axis = []
             self._image.clear()
-            self._label_info.setText("Keine Daten")
+            # 21.03.20-Bugfix 4: 'Keine Daten'-Hinweis mit Modus-Kontext
+            # (erklaert, dass der gewaehlte Modus keine DB-Rows hat).
+            _mode_txt = str(self._combo_mode_filter.currentData() or "all")
+            self._label_info.setText(
+                "Keine Daten"
+                + (f" fuer Modus '{_mode_txt}'" if _mode_txt != "all" else ""))
             self._legend.hide()  # 21.01 Bugfix 2: keine Legende ohne Daten
             self._grid_lines.setData([], [])  # 21.01 R3: keine Teiler
             self._clear_overlay()
@@ -23110,20 +24457,6 @@ class HeatmapWidget(QWidget):
         # 21.01 (Bugfix-Runde 3, Entscheidung 2a): Senkrechte Teiler je
         # Dateneinheit (TF-Bar-Intervall) an der X-Achse (date).
         self._update_grid_lines()
-
-        # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
-        # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
-        x_labels = data.get("x_labels") or []
-        y_labels = data.get("y_labels") or []
-        if x_dim == "service_id" and self._view_model is not None:
-            x_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in x_labels]
-        if y_dim == "service_id" and self._view_model is not None:
-            y_labels = [self._view_model.resolve_service_label(str(l))
-                        for l in y_labels]
-        # Dynamische Achsen konfigurieren (Bugfix 5+6).
-        self._axis_x.configure(x_dim, x_labels)
-        self._axis_y.configure(y_dim, y_labels)
 
         # 20.02.01 (E4): Achsen-Label der Tageszeit mit UTC-Offset –
         # DST-robust aus dem neuesten Datumswert der Daten abgeleitet
@@ -23313,7 +24646,63 @@ class HeatmapWidget(QWidget):
                       or self._field_key(self._combo_field.currentData()))
         active_ids = {str(f).strip().lower()
                       for f in (p.get("feature_ids") or [])}
+        # 12.08.2026 (Option A, Bug 1/2): EXPLIZITE (Service|Parameter)-
+        # Auswahl (`field_selection`) gewinnt - sie wird bei Check/Uncheck
+        # persistiert und beim Aggregations-/Restore-Wechsel EXAKT wieder
+        # hergestellt (Bug 2: keine 'alle Parameter'-Vorbelegung mehr; Bug 1:
+        # An/Abwaehlen eines Parameters aendert die Grafik). Ohne explizite
+        # Auswahl greift die DEFAULT-Vorbelegung: bei aktivem Service-Filter
+        # wird je aktivem Service genau der ERSTE Parameter angehakt (fuer
+        # AVG/SUM/MIN/MAX ist genau EIN aktives Hauptfeld sinnvoll), bei
+        # leerem Filter (alle Features) nur der erste Eintrag insgesamt
+        # (Verhalten wie bisher).
+        sel_pairs = [str(x) for x in (p.get("field_selection") or [])]
+        sel_map: Dict[str, Set[str]] = {}
+        for _sp in sel_pairs:
+            if "|" in _sp:
+                _sid, _k = _sp.split("|", 1)
+                sel_map.setdefault(_k, set()).add(_sid.strip().lower())
+        explicit = bool(sel_pairs)
         no_filter = not active_ids
+        # Default-Vorbelegung: erster Parameter je aktivem Service
+        # (sortierte Key-Reihenfolge aus self._field_keys).
+        first_key_by_service: Dict[str, str] = {}
+        if not explicit and not no_filter:
+            for k in sorted(self._field_keys):
+                for sid in self._field_sources.get(k) or []:
+                    sid_l = sid.strip().lower()
+                    if (sid_l in active_ids
+                            and sid_l not in first_key_by_service):
+                        first_key_by_service[sid_l] = k
+        # no_filter-Semantik: genau der ERSTE Eintrag insgesamt wird
+        # vorbelegt (first_done); alle weiteren folgen `match`.
+        first_done = [no_filter and not explicit]
+
+        def _chk(match: bool) -> bool:
+            if first_done[0]:
+                first_done[0] = False
+                return True
+            return match
+
+        def _chk_pair(sid: str, key: str) -> bool:
+            """Check-Vorgabe fuer einen '{sid}|{key}'-Einzel-Eintrag."""
+            sid_l = str(sid).strip().lower()
+            if explicit:
+                # Nur AKTIVE Services: ein Paar eines im ServicePicker
+                # abgewaehlten Services darf nicht angehakt bleiben.
+                return (sid_l in active_ids
+                        and sid_l in sel_map.get(key, ()))
+            return first_key_by_service.get(sid_l) == key
+
+        def _chk_all(key: str, src: List[str]) -> bool:
+            """Check-Vorgabe fuer den 'ALL|<key>'-Sammel-Eintrag."""
+            if explicit:
+                return all(str(s).strip().lower() in active_ids
+                           and str(s).strip().lower() in sel_map.get(key, ())
+                           for s in src)
+            return all(first_key_by_service.get(str(s).strip().lower())
+                       == key for s in src)
+
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
@@ -23326,30 +24715,32 @@ class HeatmapWidget(QWidget):
                     src = self._field_sources.get(k) or []
                     self._combo_field.add_checkable_item(
                         f"Alle Services / {k}", f"ALL|{k}",
-                        checked=no_filter or all(
-                            s.lower() in active_ids for s in src))
+                        checked=_chk(_chk_all(k, src)))
             if self._field_keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
             for k in sorted(self._field_keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
-                    # Eindeutiger Service: nur angehakt, wenn der Service im
-                    # aktiven Filter liegt (oder kein Filter).
+                    # Eindeutiger Service: nur angehakt, wenn das
+                    # (Service|Parameter)-Paar aktiv ist (Default: erster
+                    # Parameter; explizit: field_selection).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
-                        checked=no_filter or sids[0].lower() in active_ids)
+                        checked=_chk(_chk_pair(sids[0], k)))
                 elif not sids:
                     # Legacy ohne field_sources (roher Key, defensiv).
-                    self._combo_field.add_checkable_item(k, k, checked=True)
+                    self._combo_field.add_checkable_item(k, k,
+                                                         checked=_chk(False))
                 else:
-                    # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
-                    # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
-                    all_active = all(s.lower() in active_ids for s in sids)
+                    # Shared Key: je Quelle ein Einzel-Eintrag; der Sammel-
+                    # Eintrag deckt die Quellen ab (Q5/XOR), daher nur
+                    # anhaken, solange NICHT alle Quellen des Keys aktiv.
+                    all_checked = _chk_all(k, sids)
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
-                            checked=no_filter
-                            or (sid.lower() in active_ids and not all_active))
+                            checked=_chk(_chk_pair(sid, k)
+                                         and not all_checked))
             if prev_field in self._field_keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
@@ -23387,6 +24778,10 @@ class HeatmapWidget(QWidget):
                     self._combo_field.setCurrentIndex(fidx)
             else:
                 self._apply_config()
+        # 12.08.2026 (Option A, Bug 1/2): Effektive Paar-Auswahl in den VM
+        # spiegeln (Default-Vorbelegung materialisieren / verwaiste Paare
+        # bereinigen). Idempotent; kein Refresh bei Gleichstand.
+        self._sync_field_selection_to_vm()
 
     def _render_no_data_items(self) -> None:
         """Rendert die No-Data-Hinweise aus dem Payload-Cache (B4-2/B4-5).
@@ -23952,7 +25347,7 @@ class HeatmapWidget(QWidget):
                 time_txt = (f"{days[d_day.weekday()]} {d_day.day:02d}."
                             f"{d_day.month:02d}.{d_day.year % 100:02d} "
                             f"{d_time.hour:02d}:{d_time.minute:02d}  →  ")
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, OSError):
                 time_txt = ""
         if not in_bounds:
             self._label_info.setText(
@@ -23999,22 +25394,31 @@ class HeatmapWidget(QWidget):
                 label = "= {}".format(c) if c < 5 else ">= 5"
                 self._add_legend_swatch(color, label)
         else:
-            # 21.03.11 (Bug 1): Viridis als Intervalle (<= / - / >=).
+            # 12.08.2026 (Bug 5): Viridis als OPERATOR-Intervalle. Die
+            # Schwellen v25/v50/v75/vmax werden mit adaptiver Genauigkeit
+            # formatiert (_format_legend_value, Spannen-abhaengige Nach-
+            # kommastellen), damit sie bei kleinen Spannen (z. B. vmin=0.01,
+            # vmax=0.02) NICHT zusammenfallen ('0.01 - 0.01' war unsinnig).
+            # Die Labels sind eindeutige Operator-Angaben (`<`, `<=`,
+            # `>=`) statt Bindestrich-Bereichen.
             span = vmax - vmin
             v25 = vmin + 0.25 * span
             v50 = vmin + 0.50 * span
             v75 = vmin + 0.75 * span
-            fmt = _format_heatmap_value
+            fmt = lambda v: _format_legend_value(v, span)
+            # 13.08.2026 (Punkt 2, F2): Viridis-Operatoren VOR der Zahl,
+            # kein 'x' mehr - eindeutige Schwellen-Angaben
+            # (<= v25, >= v25, >= v50, >= v75, >= vmax).
             self._add_legend_swatch(cmap.map(0.0, mode="qcolor"),
                                     "<= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.25, mode="qcolor"),
-                                    "{} - {}".format(fmt(v25), fmt(v50)))
+                                    ">= {}".format(fmt(v25)))
             self._add_legend_swatch(cmap.map(0.5, mode="qcolor"),
-                                    "{} - {}".format(fmt(v50), fmt(v75)))
+                                    ">= {}".format(fmt(v50)))
             self._add_legend_swatch(cmap.map(0.75, mode="qcolor"),
-                                    "{} - {}".format(fmt(v75), fmt(vmax)))
-            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
                                     ">= {}".format(fmt(v75)))
+            self._add_legend_swatch(cmap.map(1.0, mode="qcolor"),
+                                    ">= {}".format(fmt(vmax)))
         self._legend.show()
 
     def _add_legend_swatch(self, color, label: str) -> None:
@@ -25083,15 +26487,6 @@ JS_FILES = [
     # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
     # werden (hängt sich über optionale Hooks in 04 ein).
     "06_two_tier.js",
-    # Phase 21.03 (MTF-FC v4): Zoom-Kaskade, Puls-Breadcrumb, Boundary-UI
-    # (07) und interaktive TF-Badges & Geister-Marker (08). Beide hängen
-    # sich über optionale Hooks in 04 ein (Muster 06_two_tier.js).
-    "07_mtf_fc.js",
-    "08_mtf_layers.js",
-    # 21.03.11 (Bug 4): TF-spezifische Achsen-Ticks – Overlay-Layer rendert
-    # Zeit-Tick-Labels aligniert zum gewählten Timeframe (M15 -> 15-min-
-    # Marken, H1 -> 1h-Marken); 04 liefert die Intraday-Labels zurück.
-    "09_mtf_axis.js",
 ]
 
 
@@ -25265,12 +26660,6 @@ class ChartBridge(QObject):
     measurementChanged = Signal(str)
     olderDataRequested = Signal(int, int, int, int)
     jumpToLiveRequested = Signal()
-    # Phase 21.03 (MTF-FC v4): Viewport-Epochs für die Kaskaden-Engine,
-    # interaktive TF-Badges und Geister-Marker (21.03.08/21.03.09).
-    viewportChanged = Signal(int, int)
-    badgeClicked = Signal(str, bool)
-    ghostMarkerClicked = Signal(float, str)
-    guardOverrideReset = Signal()
 
     @Slot(float, float, float)
     def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
@@ -25287,21 +26676,6 @@ class ChartBridge(QObject):
 
     @Slot()
     def onJumpToLive(self): self.jumpToLiveRequested.emit()
-
-    @Slot(int, int)
-    def onViewportChanged(self, from_epoch, to_epoch):
-        self.viewportChanged.emit(from_epoch, to_epoch)
-
-    @Slot(str, bool)
-    def onBadgeClick(self, tf, ctrl):
-        self.badgeClicked.emit(tf, ctrl)
-
-    @Slot(float, str)
-    def onGhostMarkerClick(self, price, target_tf):
-        self.ghostMarkerClicked.emit(price, target_tf)
-
-    @Slot()
-    def onGuardOverrideReset(self): self.guardOverrideReset.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -25485,25 +26859,6 @@ class PyTraderChartWindow(QMainWindow):
         self._js_window_first_real: Optional[int] = None
         self._js_window_last_real: Optional[int] = None
 
-        # Phase 21.03 (MTF-FC v4): Data Provider + Boundary + isolierter
-        # Namespace (Schicht 2, 21.03.01/02). Die Engine-Module sind reine
-        # Logik; die UI greift NIE direkt auf shared_state zu, sondern über
-        # den Provider (MVVM, Grundsatz 4). Der Namespace ist fenster-lokal.
-        self.mtf_fc_provider: MtfFcProvider = MtfFcProvider()
-        self.mtf_fc_boundary: MtfFcBoundary = MtfFcBoundary(provider=self.mtf_fc_provider)
-        self._mtf_fc_context = None  # PluginContext wird lazy je Aufruf erzeugt
-        self._mtf_fc_ns: Dict[str, Any] = default_mtf_fc_state()
-        self._mtf_fc_last_viewport: Optional[Tuple[int, int]] = None
-        # 21.03.11 (Bug 2): Pending-Viewport-Epochs nach einem Kaskaden-TF-
-        # Wechsel. Die persistierten `visible_from/visible_to` sind Bar-Offsets
-        # des ALTEN TF-Fensters (H1) und dürfen NICHT auf das neue Fenster
-        # (z. B. M5) angewendet werden (sonst zeigt der Chart einen winzigen
-        # Ausschnitt und die Kaskade springt direkt weiter). Stattdessen wird
-        # der Zeitbereich des auslösenden Viewports (Wanduhr-Epochs) beim
-        # Refresh beibehalten und in logische Indizes des neuen Fensters
-        # übersetzt (`_resolve_epoch_logical_range`).
-        self._mtf_fc_pending_epochs: Optional[Tuple[int, int]] = None
-
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
         matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
@@ -25644,26 +26999,6 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
-        # Phase 21.03 (MTF-FC v4): Filterleiste (21.03.07) in die Toolbar
-        # einsetzen (nach row2). MVVM: Das Widget enthält KEIN SQL und
-        # kommuniziert ausschliesslich über Signale (Grundsatz 4/5).
-        self.mtf_filter_bar: MtfFilterBarWidget = MtfFilterBarWidget(
-            provider=self.mtf_fc_provider)
-        toolbar_layout = self.ui_widget.findChild(QVBoxLayout, "verticalLayout_toolbar")
-        if toolbar_layout is not None:
-            toolbar_layout.addWidget(self.mtf_filter_bar)
-        self.mtf_filter_bar.data_tf_changed.connect(self._on_mtf_fc_data_tf_changed)
-        self.mtf_filter_bar.chart_tf_changed.connect(self._on_mtf_fc_chart_tf_changed)
-        self.mtf_filter_bar.range_changed.connect(self._on_mtf_fc_range_changed)
-        self.mtf_filter_bar.guard_override_requested.connect(self._on_mtf_fc_guard_override_requested)
-        # 21.03.11 (Bug 6): Fehlende Verdrahtung nachgerüstet – Sortierung,
-        # Session-Filter und Template-Anwendung waren als UI vorhanden, aber
-        # nicht an die Logik angebunden (Dropdowns/Buttons wirkungslos).
-        self.mtf_filter_bar.sort_mode_changed.connect(self._on_mtf_fc_sort_mode_changed)
-        self.mtf_filter_bar.sessions_changed.connect(self._on_mtf_fc_sessions_changed)
-        self.mtf_filter_bar.template_applied.connect(self._on_mtf_fc_template_applied)
-        self.mtf_filter_bar.refresh_templates()
-
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
         self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -25683,11 +27018,6 @@ class PyTraderChartWindow(QMainWindow):
         # Live-Ende („Live"-Button).
         self.bridge.olderDataRequested.connect(self._on_older_data_requested)
         self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
-        # Phase 21.03 (MTF-FC v4): Kaskaden-/Layer-Signale (21.03.08/09).
-        self.bridge.viewportChanged.connect(self._on_mtf_fc_viewport_changed)
-        self.bridge.badgeClicked.connect(self._on_mtf_fc_badge_clicked)
-        self.bridge.ghostMarkerClicked.connect(self._on_mtf_fc_ghost_marker_clicked)
-        self.bridge.guardOverrideReset.connect(self._on_mtf_fc_guard_reset)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -26210,9 +27540,6 @@ class PyTraderChartWindow(QMainWindow):
             # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
             # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
             "hasMoreHistory": self.chart_buffer.has_more_history,
-            # Phase 21.03 (MTF-FC v4): Kaskaden-/Boundary-State für die
-            # JS-Hooks (Breadcrumb, Boundary-UI, Layer-Badges).
-            "mtfFcState": self._mtf_fc_js_state(),
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -26224,19 +27551,8 @@ class PyTraderChartWindow(QMainWindow):
 
         # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
         # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
-        # 21.03.11 (Bug 2): Nach einem Kaskaden-TF-Wechsel (z. B. H1 -> M5)
-        # werden die auslösenden Viewport-EPOCHS beibehalten, statt die
-        # Bar-Offsets des alten TF-Fensters auf das neue Fenster anzuwenden
-        # (die Offsets sind fensterspezifisch -> winziger/verrutschter
-        # Ausschnitt, Kaskade würde sofort weiter springen).
-        if self._mtf_fc_pending_epochs is not None:
-            vp_from, vp_to = self._mtf_fc_pending_epochs
-            self._mtf_fc_pending_epochs = None
-            range_from, range_to = self._resolve_epoch_logical_range(
-                continuous_candles, vp_from, vp_to)
-        else:
-            range_from, range_to = self._resolve_visible_logical_range(
-                len(continuous_candles))
+        range_from, range_to = self._resolve_visible_logical_range(
+            len(continuous_candles))
         if range_from is not None and range_to is not None:
             update_package["rangeFrom"] = range_from
             update_package["rangeTo"] = range_to
@@ -26391,80 +27707,6 @@ class PyTraderChartWindow(QMainWindow):
         f = max(0, min(vf, total - 1))
         t = max(f + 1, min(vt, total))
         return f, t
-
-    def _resolve_epoch_logical_range(
-        self, candles: List[Dict[str, Any]],
-        from_epoch: Optional[int], to_epoch: Optional[int]):
-        """21.03.11 (Bug 2): Übersetzt einen Zeitbereich (Wanduhr-Epochs) in
-        logische Indizes des aktuellen Tier-1-Fensters.
-
-        Nach einem Kaskaden-TF-Wechsel wird der auslösende Viewport-Zeitbereich
-        beibehalten (statt der fensterspezifischen Bar-Offsets). Die konti-
-        nuierlichen Candle-Zeiten werden über `_time_cont_to_real` auf echte
-        Epochs gemappt und per Binärsuche in Indizes übersetzt.
-
-        Args:
-            candles: Tier-1-Kerzen (kontinuierliche Zeiten).
-            from_epoch/to_epoch: Zeitbereich als Wanduhr-Epochs.
-
-        Returns:
-            (range_from, range_to) als ints oder (None, None).
-        """
-        if not candles:
-            return None, None
-        if from_epoch is None or to_epoch is None:
-            return None, None
-        try:
-            from_epoch, to_epoch = int(from_epoch), int(to_epoch)
-        except (TypeError, ValueError):
-            return None, None
-        # Zeitbereich -> kontinuierliche Zeiten (Binärsuche auf cont-Keys).
-        # _time_cont_to_real mappt cont -> real (bijektiv, monoton steigend,
-        # Invariante 7). Die reale Epoch ist in cont monoton wachsend, daher
-        # ist die Binärsuche auf den sortierten cont-Keys korrekt.
-        if not self._time_cont_to_real:
-            return None, None
-        cont_keys = sorted(self._time_cont_to_real.keys())
-        if not cont_keys:
-            return None, None
-        f_cont = self._epoch_to_cont(cont_keys, from_epoch)
-        t_cont = self._epoch_to_cont(cont_keys, to_epoch)
-        if f_cont is None or t_cont is None:
-            return None, None
-        # Kontinuierliche Zeiten -> Indizes im Tier-1-Fenster.
-        f_idx, t_idx = 0, len(candles) - 1
-        for i, c in enumerate(candles):
-            if int(c["time"]) >= f_cont:
-                f_idx = i
-                break
-        for i in range(len(candles) - 1, -1, -1):
-            if int(candles[i]["time"]) <= t_cont:
-                t_idx = i
-                break
-        if t_idx < f_idx:
-            t_idx = f_idx
-        return f_idx, t_idx
-
-    def _epoch_to_cont(self, cont_keys: List[int], epoch: int) -> Optional[int]:
-        """Binärsuche: kontinuierliche Zeit für einen Wanduhr-Epoch.
-
-        Liefert den cont-Key, dessen reale Epoch am nächsten unterhalb der
-        gesuchten liegt (obere Schranke), damit der Viewport den Zeitbereich
-        inklusive der linken Kante abdeckt. Liegt die gesuchte Epoch vor dem
-        ersten Datenpunkt, wird der erste Key geliefert."""
-        if not cont_keys:
-            return None
-        lo, hi = 0, len(cont_keys) - 1
-        best = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            mid_real = self._time_cont_to_real[cont_keys[mid]]
-            if mid_real <= epoch:
-                best = cont_keys[mid]
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best if best is not None else cont_keys[0]
 
     def _on_jump_to_live(self) -> None:
         """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
@@ -26876,267 +28118,6 @@ class PyTraderChartWindow(QMainWindow):
         if not self._is_loading_data:
             self.measurement_state = json.loads(m) if m else None
             self.save_state()
-
-    # ======================================================================
-    # Phase 21.03 – MTF-FC v4 (Kaskade, Boundary, Guards, Filterleiste)
-    # ======================================================================
-
-    def _mtf_fc_js_state(self) -> Dict[str, Any]:
-        """Baut den JS-freundlichen MTF-FC-State für das Update-Payload.
-
-        Keys sind camelCase (JS-Hooks in 07/08) und werden aus dem fenster-
-        lokalen Namespace abgeleitet. `m1_available_from` wird über den
-        Boundary-Resolver live ermittelt (21.03.02)."""
-        hb = dict(self._mtf_fc_ns.get("history_boundaries") or {})
-        try:
-            boundary = self.mtf_fc_boundary.evaluate_coverage(
-                self.current_symbol,
-                self._mtf_fc_last_viewport[0] if self._mtf_fc_last_viewport else None,
-            )
-            hb["m1_available_from"] = boundary.get("m1_available_from")
-            hb["coverage_status"] = boundary.get("coverage_status")
-            hb["source_tf"] = boundary.get("source_tf")
-        except Exception as e:
-            print(f"⚠️ [MTF-FC] Boundary-Evaluierung fehlgeschlagen: {e}")
-        cascade = self._mtf_fc_ns.get("cascade_state") or {}
-        override = self._mtf_fc_ns.get("temporary_guard_override") or {}
-        return {
-            "activeChartTf": self.current_tf,
-            "activeDataTf": self._mtf_fc_ns.get("active_data_tf") or "M15",
-            "historyBoundaries": hb,
-            "transitionStartedAt": cascade.get("transition_started_at", 0.0),
-            "rangeDays": cascade.get("range_days", 0.0),
-            "temporaryGuardOverride": {
-                "active": bool(override.get("active")),
-                "previousDataTf": override.get("previous_data_tf"),
-                "targetTf": override.get("target_tf"),
-                "reason": override.get("reason"),
-            },
-        }
-
-    def _on_mtf_fc_viewport_changed(self, from_ts: int, to_ts: int) -> None:
-        """Kaskaden-Trigger: JS meldet die Viewport-Kanten (Wanduhr-Epochs).
-
-        Ruft die Hysterese-Engine (21.03.03) auf. Bei Zoom-Out/-In über die
-        Schwellwerte und bestandener Transition-Guard-Periode wird der
-        Chart-TF gewechselt (`tf_combo`-Sync + Refresh)."""
-        if self._is_loading_data:
-            return
-        try:
-            from_ts, to_ts = int(from_ts), int(to_ts)
-            self._mtf_fc_last_viewport = (from_ts, to_ts)
-            ns = self._mtf_fc_ns
-            cascade = ns.setdefault("cascade_state", {})
-
-            # Boundary (21.03.02) in den Namespace übernehmen (Level 1).
-            boundary = self.mtf_fc_boundary.evaluate_coverage(
-                self.current_symbol, from_ts)
-            ns["history_boundaries"] = {
-                "m1_available_from": boundary.get("m1_available_from"),
-                "coverage_status": boundary.get("coverage_status"),
-                "source_tf": boundary.get("source_tf"),
-            }
-            if boundary.get("coverage_status") == "fallback":
-                # Ebene 1 – Hard Data Availability Guard: Fallback-TF erzwingen.
-                source_tf = boundary.get("source_tf") or "H1"
-                if source_tf != self.current_tf:
-                    print(f"⚠️ [MTF-FC] Fallback-Guard: {self.current_tf} -> {source_tf}")
-                    self._mtf_fc_switch_tf(source_tf)
-                return
-
-            # 21.03.11 (Bug 2/6): Chart-TF-Modus 'fix' unterbindet die Auto-
-            # Kaskade (kein automatischer TF-Wechsel bei Zoom). Der Modus war
-            # bisher nur gespeichert (Namespace), aber nie ausgewertet.
-            if ns.get("chart_tf_mode") == "fix":
-                return
-
-            # Auto-Kaskade (21.03.03): Kandidat aus Viewport-Breite.
-            cascade["current_tf"] = self.current_tf
-            result = evaluate_cascade(from_ts, to_ts, self.current_tf, cascade)
-            cascade["candidate_tf"] = result["candidate_tf"]
-            cascade["direction"] = result["direction"]
-            cascade["range_days"] = result["range_days"]
-
-            candidate = result["candidate_tf"]
-            if candidate is None:
-                return
-            # Transition Guard: Umschalten erst nach CROSSFADE-Zeit.
-            if not transition_guard_ok(cascade):
-                return
-            if candidate != self.current_tf:
-                telemetry = apply_transition(
-                    cascade, candidate, result["direction"],
-                    result["range_days"])
-                print(f"[MTF-FC] Kaskade: {telemetry}")
-                self._mtf_fc_switch_tf(candidate)
-        except Exception as e:
-            print(f"⚠️ [MTF-FC] Kaskaden-Trigger fehlgeschlagen: {e}")
-
-    def _mtf_fc_switch_tf(self, new_tf: str) -> None:
-        """Wechselt den Chart-TF konsistent (tf_combo-Sync + Refresh).
-
-        Setzt `current_tf` und synchronisiert die ComboBox, damit die
-        bestehende `on_tf_changed`-Logik (Zustand laden, Refresh) sauber
-        läuft. Falls das TF im Dropdown fehlt, wird es additiv ergänzt.
-
-        21.03.11 (Bug 2): Der aktuelle Viewport-ZEITBEREICH (Wanduhr-Epochs)
-        wird als pending übernommen, damit der neue TF nach dem Refresh
-        denselben Zeitausschnitt zeigt (statt der fensterspezifischen
-        Bar-Offsets des alten TF -> sonst winziger/verrutschter Ausschnitt)."""
-        new_tf = str(new_tf or "").upper()
-        if not new_tf or new_tf == self.current_tf:
-            return
-        # Viewport-Epochs für den folgenden Refresh merken (sofern bekannt).
-        if self._mtf_fc_last_viewport is not None:
-            self._mtf_fc_pending_epochs = self._mtf_fc_last_viewport
-        if self.tf_combo is not None:
-            idx = self.tf_combo.findText(new_tf)
-            if idx < 0:
-                self.tf_combo.addItem(new_tf)
-                idx = self.tf_combo.findText(new_tf)
-            if idx >= 0:
-                self.tf_combo.blockSignals(True)
-                self.tf_combo.setCurrentIndex(idx)
-                self.tf_combo.blockSignals(False)
-        self.current_tf = new_tf
-        self._update_window_title()
-        self.refresh_chart_data()
-
-    def _on_mtf_fc_data_tf_changed(self, data_tf: str) -> None:
-        """Filterleiste: Source-Data-TF geändert (multi | fixiert)."""
-        self._mtf_fc_ns["active_data_tf"] = data_tf
-        # Ebene 3 (Fixed Data-TF Guard): Fixierter Data-TF begrenzt den
-        # Chart-TF nach oben (nie höher als das Data-TF).
-        if data_tf and str(data_tf).lower() != "multi":
-            if self.current_tf is not None:
-                from analytics.engine.mtf_fc_guards import _tf_rank
-                if _tf_rank(self.current_tf) > _tf_rank(data_tf):
-                    print(f"⚠️ [MTF-FC] Fixed-Guard: Chart-TF {self.current_tf} "
-                          f"-> {data_tf} (Data-TF fixiert)")
-                    self._mtf_fc_switch_tf(data_tf)
-
-    def _on_mtf_fc_chart_tf_changed(self, mode: str) -> None:
-        """Filterleiste: Chart-Overlay-Modus ('auto' | 'fix')."""
-        self._mtf_fc_ns["chart_tf_mode"] = mode
-
-    def _on_mtf_fc_range_changed(self, preset: str, from_ts: int, to_ts: int) -> None:
-        """Filterleiste: Range-Preset -> Viewport im Namespace + JS-Sync."""
-        self._mtf_fc_ns["viewport_range"] = {"from_ts": from_ts, "to_ts": to_ts}
-        self._mtf_fc_last_viewport = (int(from_ts), int(to_ts))
-        # JS-Viewport auf das Preset-Fenster setzen (sofern Chart geladen).
-        try:
-            self.web_view.page().runJavaScript(
-                "if(window._mtfFcApplyRange) _mtfFcApplyRange("
-                f"{int(from_ts)}, {int(to_ts)});")
-        except (RuntimeError, AttributeError):
-            pass
-
-    def _on_mtf_fc_badge_clicked(self, tf: str, ctrl: bool) -> None:
-        """Interaktives TF-Badge (21.03.09): Klick filtert auf diesen TF.
-
-        Strg+Klick = Multi-Select (in dieser Version: zusätzliches Setzen
-        des aktiven TF im Namespace, ohne harten Wechsel)."""
-        tf = str(tf or "").upper()
-        if not tf:
-            return
-        if ctrl:
-            # Multi-Select: TF dem Namespace-Vektor hinzufügen (kein Wechsel).
-            multi = self._mtf_fc_ns.setdefault("multi_select_tfs", [])
-            if tf not in multi:
-                multi.append(tf)
-            return
-        self._mtf_fc_switch_tf(tf)
-
-    def _on_mtf_fc_ghost_marker_clicked(self, price: float, target_tf: str) -> None:
-        """Geister-Marker-Klick (21.03.09): Ebene-2-Guard-Override.
-
-        Startet den Temporary Override (previous_data_tf = aktives Data-TF)
-        und wechselt auf den Ziel-TF (z. B. D1). Der Reset stellt exakt den
-        vorherigen Data-TF wieder her (21.03.05)."""
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            price = 0.0
-        target_tf = str(target_tf or "D1").upper()
-        ns = self._mtf_fc_ns
-        override = ns.setdefault("temporary_guard_override", {})
-        current_data_tf = str(ns.get("active_data_tf") or "M15")
-        start_override(override, current_data_tf, target_tf, "ghost_marker_click")
-        print(f"[MTF-FC] Guard-Override: Data-TF {current_data_tf} "
-              f"-> temporär {target_tf}")
-        # Override-UI (Reset-Badge) an JS schicken.
-        self._push_mtf_fc_override_ui()
-        self._mtf_fc_switch_tf(target_tf)
-
-    def _on_mtf_fc_guard_override_requested(self, target_tf: str, reason: str) -> None:
-        """Filterleiste: Override angefordert (z. B. Geister-Marker)."""
-        self._on_mtf_fc_ghost_marker_clicked(0.0, target_tf)
-
-    def _on_mtf_fc_guard_reset(self) -> None:
-        """Reset-Badge-Klick: Override zurücksetzen, previous_data_tf wiederherstellen."""
-        ns = self._mtf_fc_ns
-        override = ns.setdefault("temporary_guard_override", {})
-        if not override.get("active"):
-            return
-        restored = reset_override(override)
-        print(f"[MTF-FC] Guard-Reset: Data-TF wiederhergestellt -> {restored}")
-        ns["active_data_tf"] = restored
-        # Filterleisten-State synchronisieren (falls vorhanden).
-        fb = getattr(self, "mtf_filter_bar", None)
-        if fb is not None:
-            fb.apply_namespace_state(self)
-        self._push_mtf_fc_override_ui()
-        if restored and str(restored).lower() != "multi":
-            self._mtf_fc_switch_tf(restored)
-
-    def _on_mtf_fc_sort_mode_changed(self, mode: str) -> None:
-        """Filterleiste: Tabellen-Sortierung ('date' | 'signal' | 'tf').
-
-        21.03.11 (Bug 6): Nachgeruestete Verdrahtung. Der Modus wird im
-        MTF-FC-Namespace persistiert und zusaetzlich ueber den EventBus
-        emittiert (`mtf_fc_sort_changed`) - das AnalyticsWindow wendet ihn
-        auf die TablePage-Sortierung an (Entkopplung, kein Fenster-Know-how).
-        """
-        self._mtf_fc_ns["sort_mode"] = mode
-        try:
-            event_bus.mtf_fc_sort_changed.emit(mode)
-        except Exception as e:  # pragma: no cover
-            print(f"WARN [MTF-FC] Sort-EventBus-Emission fehlgeschlagen: {e}")
-        print(f"[MTF-FC] Sortierung: {mode}")
-
-    def _on_mtf_fc_sessions_changed(self, sessions: list) -> None:
-        """Filterleiste: Session-Farbbalken (London/NY/Tokio) im M1/M5-Zoom."""
-        self._mtf_fc_ns["sessions"] = list(sessions)
-        print(f"[MTF-FC] Sessions: {list(sessions)}")
-
-    def _on_mtf_fc_template_applied(self, template: dict) -> None:
-        """Filterleiste: View-Template geladen.
-
-        Die Werte (Data-TF, Range, Sortierung, Sessions) wurden vom Widget
-        bereits über die Einzelsignale emittiert – hier nur der Log-/Sync-
-        Abschluss, damit die Filterleiste den konsolidierten State zeigt.
-        """
-        print(f"[MTF-FC] Template angewendet: "
-              f"{template.get('name') or 'Unbenannt'}")
-        fb = getattr(self, "mtf_filter_bar", None)
-        if fb is not None:
-            fb.apply_namespace_state(self)
-
-    def _push_mtf_fc_override_ui(self) -> None:
-        """Sendet den Override-Zustand an die JS-Layer (Reset-Badge)."""
-        ns = self._mtf_fc_ns
-        override = ns.get("temporary_guard_override") or {}
-        try:
-            self.web_view.page().runJavaScript(
-                "if(window.renderMtfLayers) renderMtfLayers("
-                + json.dumps({
-                    "badges": [],
-                    "ghostMarkers": [],
-                    "overrideActive": bool(override.get("active")),
-                    "overrideTargetTf": override.get("target_tf"),
-                }) + ");")
-        except (RuntimeError, AttributeError):
-            pass
 
     def save_state(self):
         if not self.state_manager or self._is_loading_data: return
@@ -32655,11 +33636,6 @@ function applyFullChartUpdate(data) {
                         if (isDailyOrHigher || tickMarkType <= 2) {
                             return p.day + '.' + p.month + '.' + p.year.slice(-2);
                         }
-                        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) aktiv -> die
-                        // TF-alignierten Zeit-Ticks rendert das Overlay selbst
-                        // (M15 -> 15-min-Marken statt 12h-Blöcke). LWC-Intraday-
-                        // Labels hier abgeben; Tagesgrenzen behalten das Datum.
-                        if (window._mtfAxisActive) return '';
                         return p.hour + ':' + p.minute;
                     }
                 },
@@ -32711,12 +33687,6 @@ function applyFullChartUpdate(data) {
         // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
         // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
         try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
-        // P21.03 (MTF-FC, 08/12): State-Reset für Kaskade/Boundary/Layer.
-        // Muster 06_two_tier.js – optionaler Hook, kein Umbau des Kern-Pfads.
-        try { if (window._onMtfFcFullUpdate) window._onMtfFcFullUpdate(data); } catch(e) {}
-        try { if (window._onMtfLayersFullUpdate) window._onMtfLayersFullUpdate(data); } catch(e) {}
-        // P21.03.11 (Bug 4): MTF-Axis-Overlay (09) – TF-alignierte Tick-Labels.
-        try { if (window._onMtfAxisFullUpdate) window._onMtfAxisFullUpdate(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -32738,10 +33708,6 @@ function applyFullChartUpdate(data) {
                     // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
                     // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
                     try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
-                    // P21.03 (MTF-FC): Kaskaden-Trigger (Zoom -> Python).
-                    try { if (window._onMtfFcVisibleRangeChanged) window._onMtfFcVisibleRangeChanged(); } catch(e) {}
-                    // P21.03.11 (Bug 4): MTF-Axis-Overlay bei Zoom/Scroll neu rendern.
-                    try { if (window._onMtfAxisVisibleRangeChanged) window._onMtfAxisVisibleRangeChanged(); } catch(e) {}
                 }
             });
 
@@ -33469,641 +34435,6 @@ function _isHistoryView() {
 
 --------------------------------------------------
 
-### DATEI: chart/js/07_mtf_fc.js
-```js
-// chart/js/07_mtf_fc.js
-// Phase 21.03.08 – MTF-FC Chart-Integration (JS-Tier)
-//
-// Zuständigkeiten:
-//   * Zoom-Hook: bei visibleRangeChanged werden die Viewport-Kanten
-//     (reale Wanduhr-Epochs) debounced an Python geschickt
-//     (pyBridge.onViewportChanged) -> Python bewertet die Kaskade (21.03.03)
-//     und liefert {current_tf, candidate_tf} via Payload zurück.
-//   * Puls-Breadcrumb: transparenter Badge `[ ⚡ Kerzen: M5 ]` oben rechts,
-//     der bei TF-Umschaltung kurz hellblau aufleuchtet (§4 Säule 2.2).
-//   * Boundary-UI: `ℹ️ M1 verfügbar ab DD.MM.JJJJ` sowie Fallback-Hinweis
-//     "Keine M1-Rohdaten für diesen Zeitraum" (§4 Säule 1.3, 21.03.02).
-//
-// Dieses Modul wird NACH 04_live_updates.js geladen und hängt sich über die
-// optionalen Hooks ein:
-//   window._onMtfFcFullUpdate(data)        – State-Reset nach Full-Update
-//   window._onMtfFcVisibleRangeChanged()   – Kaskaden-Trigger (Zoom)
-// (04_live_updates.js ruft beide optional auf – Muster 06_two_tier.js.)
-
-// =============================================================================
-// Zustand
-// =============================================================================
-let _mtfFc = {
-    activeChartTf: null,       // aktueller Chart-TF (aus Python-Payload)
-    lastChartTf: null,         // vorheriger Chart-TF (Breadcrumb-Detection)
-    transitionStartedAt: 0,    // Transition Guard (Zeitstempel der letzten Schaltung)
-    rangeDays: 0,
-    historyBoundaries: null,   // { m1AvailableFrom, coverageStatus, sourceTf }
-    breadcrumbTimer: null,
-    viewportTimer: null,       // Debounce-Timer für Kaskaden-Trigger
-};
-
-const MTF_FC_VIEWPORT_DEBOUNCE_MS = 150;  // JS-Debounce für Zoom-Hook
-const MTF_FC_BREADCRUMB_MS = 1500;        // Puls-Dauer des Breadcrumbs
-
-// =============================================================================
-// Helper: Viewport-Epochs aus der logischen Range
-// =============================================================================
-function _mtfFcComputeViewportEpochs() {
-    if (!chart || !rawCandleData || rawCandleData.length === 0) return null;
-    try {
-        var lr = chart.timeScale().getVisibleLogicalRange();
-        if (!lr || lr.from === null || lr.to === null) return null;
-        var fromIdx = Math.max(0, Math.floor(lr.from));
-        var toIdx = Math.min(rawCandleData.length - 1, Math.floor(lr.to));
-        if (toIdx < fromIdx) return null;
-        var fromEpoch = toReal(rawCandleData[fromIdx].time);
-        var toEpoch = toReal(rawCandleData[toIdx].time);
-        if (fromEpoch === undefined || toEpoch === undefined) return null;
-        return { from: fromEpoch, to: toEpoch };
-    } catch (e) {
-        return null;
-    }
-}
-
-// =============================================================================
-// Puls-Breadcrumb (§4 Säule 2.2)
-// =============================================================================
-function _mtfFcEnsureBreadcrumb() {
-    var el = document.getElementById('mtf-fc-breadcrumb');
-    if (el) return el;
-    el = document.createElement('div');
-    el.id = 'mtf-fc-breadcrumb';
-    el.style.cssText =
-        'position:absolute; top:4px; right:70px; background:rgba(41,98,255,0.15);' +
-        ' border:1px solid #2962FF; color:#d1d4dc; font-size:11px; font-weight:bold;' +
-        ' padding:2px 8px; border-radius:3px; z-index:1001; pointer-events:none;' +
-        ' opacity:0; transition:opacity 0.25s;';
-    document.getElementById('chart-container').appendChild(el);
-    return el;
-}
-
-function _mtfFcShowBreadcrumb(text) {
-    var el = _mtfFcEnsureBreadcrumb();
-    el.innerText = text;
-    el.style.opacity = '1';
-    if (_mtfFc.breadcrumbTimer) clearTimeout(_mtfFc.breadcrumbTimer);
-    _mtfFc.breadcrumbTimer = setTimeout(function() {
-        el.style.opacity = '0';
-    }, MTF_FC_BREADCRUMB_MS);
-}
-
-// =============================================================================
-// Boundary-UI (§4 Säule 1.3): ℹ️ M1 verfügbar ab + Fallback-Hinweis
-// =============================================================================
-function _mtfFcUpdateBoundaryInfo() {
-    var hb = _mtfFc.historyBoundaries || {};
-    var fallback = (hb.coverageStatus === 'fallback');
-    var srcTf = hb.sourceTf || 'H1';
-
-    // Fallback-Schraffur-Hinweis (keine Lücke, kein Absturz)
-    var el = document.getElementById('mtf-fc-boundary-info');
-    if (fallback) {
-        if (!el) {
-            el = document.createElement('div');
-            el.id = 'mtf-fc-boundary-info';
-            el.style.cssText =
-                'position:absolute; left:8px; bottom:8px;' +
-                ' background:rgba(242,54,69,0.15); border:1px solid #F23645;' +
-                ' color:#d1d4dc; font-size:11px; padding:3px 8px;' +
-                ' border-radius:3px; z-index:1000; pointer-events:none;';
-            document.getElementById('chart-container').appendChild(el);
-        }
-        el.style.display = 'block';
-        el.innerText = '⚠️ Keine M1-Rohdaten für diesen Zeitraum (' + srcTf + '-Fallback)';
-    } else if (el) {
-        el.style.display = 'none';
-    }
-
-    // ℹ️ M1 verfügbar ab DD.MM.JJJJ
-    var info2 = document.getElementById('mtf-fc-m1-available');
-    var from = hb.m1AvailableFrom;
-    if (typeof from === 'number' && !isNaN(from)) {
-        if (!info2) {
-            info2 = document.createElement('div');
-            info2.id = 'mtf-fc-m1-available';
-            info2.style.cssText =
-                'position:absolute; left:8px; top:4px;' +
-                ' background:rgba(41,98,255,0.12); border:1px solid #2962FF;' +
-                ' color:#d1d4dc; font-size:11px; padding:2px 8px;' +
-                ' border-radius:3px; z-index:1000; pointer-events:none;';
-            document.getElementById('chart-container').appendChild(info2);
-        }
-        var p = getBerlinParts(from);
-        info2.style.display = 'block';
-        info2.innerText = 'ℹ️ M1 verfügbar ab ' + p.day + '.' + p.month + '.' + p.year;
-    } else if (info2) {
-        info2.style.display = 'none';
-    }
-}
-
-// =============================================================================
-// Kaskaden-Trigger (Zoom-Hook)
-// =============================================================================
-function _mtfFcTriggerCascade() {
-    if (!pyBridge || !pyBridge.onViewportChanged) return;
-    if (isUpdatingChart) return;
-    var vp = _mtfFcComputeViewportEpochs();
-    if (!vp) return;
-    if (_mtfFc.viewportTimer) clearTimeout(_mtfFc.viewportTimer);
-    var from = Math.floor(vp.from);
-    var to = Math.floor(vp.to);
-    _mtfFc.viewportTimer = setTimeout(function() {
-        _mtfFc.viewportTimer = null;
-        try {
-            pyBridge.onViewportChanged(from, to);
-        } catch (e) {}
-    }, MTF_FC_VIEWPORT_DEBOUNCE_MS);
-}
-
-// =============================================================================
-// Hooks (04_live_updates.js ruft optional auf)
-// =============================================================================
-function _onMtfFcFullUpdate(data) {
-    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
-    _mtfFc.historyBoundaries = st.historyBoundaries || null;
-    if (st.activeChartTf) {
-        _mtfFc.activeChartTf = st.activeChartTf;
-        if (_mtfFc.lastChartTf && _mtfFc.lastChartTf !== st.activeChartTf) {
-            _mtfFcShowBreadcrumb('⚡ Kerzen: ' + st.activeChartTf);
-        }
-        _mtfFc.lastChartTf = st.activeChartTf;
-    }
-    if (st.transitionStartedAt) {
-        _mtfFc.transitionStartedAt = st.transitionStartedAt;
-    }
-    _mtfFcUpdateBoundaryInfo();
-}
-
-function _onMtfFcVisibleRangeChanged() {
-    _mtfFcTriggerCascade();
-}
-
-// =============================================================================
-// Externe API (Python -> JS via runJavaScript)
-// =============================================================================
-function applyMtfFcCascade(payload) {
-    // Python liefert {current_tf, candidate_tf, direction, range_days}
-    // nach einer Kaskaden-Entscheidung (Breadcrumb + State-Sync).
-    if (!payload || typeof payload !== 'object') return;
-    if (payload.current_tf && payload.current_tf !== _mtfFc.activeChartTf) {
-        _mtfFc.activeChartTf = payload.current_tf;
-        _mtfFcShowBreadcrumb('⚡ Kerzen: ' + payload.current_tf);
-    }
-    if (payload.rangeDays !== undefined) {
-        _mtfFc.rangeDays = payload.rangeDays;
-    }
-    if (payload.transitionStartedAt) {
-        _mtfFc.transitionStartedAt = payload.transitionStartedAt;
-    }
-}
-
-// Viewport auf ein Range-Preset setzen (Python -> JS, 21.03.07).
-function _mtfFcApplyRange(fromEpoch, toEpoch) {
-    if (!chart || !rawCandleData || rawCandleData.length === 0) return;
-    try {
-        var fromIdx = -1, toIdx = -1;
-        for (var i = 0; i < rawCandleData.length; i++) {
-            var real = toReal(rawCandleData[i].time);
-            if (real === undefined) continue;
-            if (fromIdx < 0 && real >= fromEpoch) fromIdx = i;
-            if (real <= toEpoch) toIdx = i;
-        }
-        if (fromIdx < 0) fromIdx = 0;
-        if (toIdx < fromIdx) toIdx = rawCandleData.length - 1;
-        chart.timeScale().setVisibleLogicalRange({ from: fromIdx, to: toIdx });
-    } catch (e) {}
-}
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/js/08_mtf_layers.js
-```js
-// chart/js/08_mtf_layers.js
-// Phase 21.03.09 – Interaktives Layering: TF-Badges & Geister-Marker
-//
-// Zuständigkeiten (§4 Säule 3):
-//   * Interaktive TF-Badges (z. B. `[ H4-Swing ]`): Klick filtert die
-//     aktuelle Ansicht synchron auf diesen Timeframe; Strg+Klick = Multi-
-//     Select. Badge-Klicks werden an Python gereicht
-//     (pyBridge.onBadgeClick(tf, ctrlKey)).
-//   * Geister-Marker (Off-Screen Level): übergeordnete Level außerhalb des
-//     Zoom-Blicks werden am Rand des Viewports als verblasster Pfeil
-//     gerendert (`▲ D1-Widerstand (27.85)`). Klick löst den Guard-Override
-//     aus (pyBridge.onGhostMarkerClick(price, targetTf)) und animiert den
-//     Viewport sanft zum Ziel-Level.
-//   * Reset-Badge `[ 🌐 Data-TF gelockert ]`: Klick auf *Reset* stellt
-//     previous_data_tf wieder her (pyBridge.onGuardOverrideReset()).
-//
-// Verhalten defensiv: Fehlende Elemente/pyBridge werden abgefangen
-// (kein Chart-Abbruch).
-
-// =============================================================================
-// Konstanten & Zustand
-// =============================================================================
-let _mtfLayers = {
-    badges: [],            // [{tf, label, active}]
-    ghostMarkers: [],      // [{price, tf, label, side}]
-    overrideActive: false,
-    overrideTargetTf: null,
-    animFrame: null,
-    animStart: null,
-};
-
-const MTF_GHOST_ANIMATION_MS = 400;  // sanfte Viewport-Animation
-
-// =============================================================================
-// Container sicherstellen
-// =============================================================================
-function _mtfLayersEnsureContainer() {
-    var c = document.getElementById('chart-container');
-    if (!c) return null;
-    var layer = document.getElementById('mtf-layers-layer');
-    if (!layer) {
-        layer = document.createElement('div');
-        layer.id = 'mtf-layers-layer';
-        layer.style.cssText =
-            'position:absolute; left:0; top:0; right:0; bottom:0;' +
-            ' pointer-events:none; z-index:1002; overflow:hidden;';
-        c.appendChild(layer);
-    }
-    return layer;
-}
-
-// =============================================================================
-// TF-Badges
-// =============================================================================
-function _mtfLayersRenderBadges() {
-    var layer = _mtfLayersEnsureContainer();
-    if (!layer) return;
-    var old = layer.querySelectorAll('.mtf-tf-badge');
-    for (var i = 0; i < old.length; i++) old[i].remove();
-
-    if (!_mtfLayers.badges || _mtfLayers.badges.length === 0) return;
-    var wrap = document.createElement('div');
-    wrap.className = 'mtf-tf-badge-wrap';
-    wrap.style.cssText =
-        'position:absolute; left:8px; top:28px; display:flex; gap:4px;' +
-        ' pointer-events:auto; z-index:1003; flex-wrap:wrap; max-width:70%;';
-
-    for (var b = 0; b < _mtfLayers.badges.length; b++) {
-        (function(badge) {
-            var btn = document.createElement('button');
-            btn.className = 'mtf-tf-badge';
-            btn.innerText = badge.label || ('[' + badge.tf + ']');
-            btn.title = (badge.active ? 'Aktiv – Klick: Filter' : 'Klick: Filter auf ' + badge.tf)
-                + ' | Strg+Klick: Multi-Select';
-            var activeStyle = badge.active
-                ? 'background:rgba(41,98,255,0.35); border:1px solid #2962FF;'
-                : 'background:rgba(30,34,45,0.8); border:1px solid #3d4450;';
-            btn.style.cssText = activeStyle +
-                ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
-                ' padding:2px 8px; border-radius:3px; cursor:pointer;';
-            btn.addEventListener('click', function(ev) {
-                try {
-                    if (pyBridge && pyBridge.onBadgeClick) {
-                        pyBridge.onBadgeClick(badge.tf, !!(ev.ctrlKey || ev.metaKey));
-                    }
-                } catch (e) {}
-            });
-            wrap.appendChild(btn);
-        })(_mtfLayers.badges[b]);
-    }
-    layer.appendChild(wrap);
-
-    // Reset-Badge bei aktivem Temporary Override
-    if (_mtfLayers.overrideActive) {
-        var resetBtn = document.createElement('button');
-        resetBtn.className = 'mtf-tf-badge';
-        resetBtn.innerText = '🌐 Data-TF gelockert auf ' +
-            (_mtfLayers.overrideTargetTf || '?') + ' | Reset';
-        resetBtn.style.cssText =
-            'background:rgba(255,152,0,0.25); border:1px solid #FF9800;' +
-            ' color:#d1d4dc; font-size:11px; font-weight:bold;' +
-            ' padding:2px 8px; border-radius:3px; cursor:pointer;' +
-            ' pointer-events:auto;';
-        resetBtn.addEventListener('click', function() {
-            try {
-                if (pyBridge && pyBridge.onGuardOverrideReset) pyBridge.onGuardOverrideReset();
-            } catch (e) {}
-        });
-        // Unter den TF-Badges positionieren
-        var wrap2 = document.createElement('div');
-        wrap2.className = 'mtf-tf-badge-wrap';
-        wrap2.style.cssText = wrap.style.cssText + ' top:52px;';
-        wrap2.appendChild(resetBtn);
-        layer.appendChild(wrap2);
-    }
-}
-
-// =============================================================================
-// Geister-Marker (Off-Screen Level)
-// =============================================================================
-function _mtfLayersRenderGhostMarkers() {
-    var layer = _mtfLayersEnsureContainer();
-    if (!layer) return;
-    var old = layer.querySelectorAll('.mtf-ghost-marker');
-    for (var i = 0; i < old.length; i++) old[i].remove();
-
-    if (!_mtfLayers.ghostMarkers || _mtfLayers.ghostMarkers.length === 0 || !candleSeries) return;
-
-    for (var m = 0; m < _mtfLayers.ghostMarkers.length; m++) {
-        (function(marker) {
-            var y = candleSeries.priceToCoordinate(marker.price);
-            if (y === null || y === undefined || isNaN(y)) return;
-            var x = (marker.side === 'left') ? 2 : (layer.clientWidth - 26);
-            var el = document.createElement('div');
-            el.className = 'mtf-ghost-marker';
-            el.style.cssText =
-                'position:absolute; left:' + x + 'px; top:' + Math.round(y - 10) + 'px;' +
-                ' background:rgba(30,34,45,0.6); border:1px solid #787B86;' +
-                ' color:#b2b5be; font-size:10px; padding:1px 5px; border-radius:3px;' +
-                ' opacity:0.55; cursor:pointer; pointer-events:auto; white-space:nowrap;';
-            el.innerText = (marker.side === 'left' ? '◀ ' : '▲ ') +
-                (marker.label || (marker.tf + '-Level')) + ' (' +
-                marker.price.toFixed(2) + ')';
-            el.addEventListener('click', function() {
-                try {
-                    if (pyBridge && pyBridge.onGhostMarkerClick) {
-                        pyBridge.onGhostMarkerClick(marker.price, marker.tf || 'D1');
-                    }
-                } catch (e) {}
-            });
-            layer.appendChild(el);
-        })(_mtfLayers.ghostMarkers[m]);
-    }
-}
-
-// Sanfte Viewport-Animation zum Ziel-Level (Preis-/Zeitkoordinaten)
-function animateToGhostLevel(price, targetTf) {
-    if (!chart || !candleSeries) return;
-    _mtfLayers.animStart = null;
-    if (_mtfLayers.animFrame) cancelAnimationFrame(_mtfLayers.animFrame);
-
-    function step(ts) {
-        if (!_mtfLayers.animStart) _mtfLayers.animStart = ts;
-        var progress = Math.min(1.0, (ts - _mtfLayers.animStart) / MTF_GHOST_ANIMATION_MS);
-        var eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-        try {
-            var lr = chart.timeScale().getVisibleLogicalRange();
-            if (!lr) return;
-            var target = candleSeries.coordinateToPrice(50);  // Ziel-Preisbereich Mitte
-            if (target !== null && target !== undefined) {
-                chart.priceScale('right').setVisibleRange({
-                    from: price - Math.abs(price - target) * (1 - eased) - 1,
-                    to: price + Math.abs(price - target) * (1 - eased) + 1,
-                });
-            }
-        } catch (e) {}
-        if (progress < 1.0) {
-            _mtfLayers.animFrame = requestAnimationFrame(step);
-        } else {
-            _mtfLayers.animFrame = null;
-        }
-    }
-    _mtfLayers.animFrame = requestAnimationFrame(step);
-}
-
-// =============================================================================
-// Externe API (Python -> JS via runJavaScript)
-// =============================================================================
-function renderMtfLayers(payload) {
-    // payload: { badges: [{tf,label,active}], ghostMarkers: [{price,tf,label,side}],
-    //            overrideActive: bool, overrideTargetTf: str }
-    if (!payload || typeof payload !== 'object') return;
-    if (Array.isArray(payload.badges)) _mtfLayers.badges = payload.badges;
-    if (Array.isArray(payload.ghostMarkers)) _mtfLayers.ghostMarkers = payload.ghostMarkers;
-    if (typeof payload.overrideActive === 'boolean') _mtfLayers.overrideActive = payload.overrideActive;
-    if (payload.overrideTargetTf) _mtfLayers.overrideTargetTf = payload.overrideTargetTf;
-    _mtfLayersRenderBadges();
-    _mtfLayersRenderGhostMarkers();
-}
-
-function clearMtfLayers() {
-    _mtfLayers.badges = [];
-    _mtfLayers.ghostMarkers = [];
-    _mtfLayers.overrideActive = false;
-    _mtfLayers.overrideTargetTf = null;
-    var layer = document.getElementById('mtf-layers-layer');
-    if (layer) {
-        layer.innerHTML = '';
-        layer.remove();
-    }
-}
-
-// =============================================================================
-// Full-Update-Hook: Layer auf bekannten State zurücksetzen (Muster 06)
-// =============================================================================
-function _onMtfLayersFullUpdate(data) {
-    var st = (data && data.mtfFcState) ? data.mtfFcState : {};
-    _mtfLayers.overrideActive = !!(st.temporaryGuardOverride &&
-        st.temporaryGuardOverride.active);
-    _mtfLayers.overrideTargetTf = (st.temporaryGuardOverride &&
-        st.temporaryGuardOverride.targetTf) || null;
-    _mtfLayersRenderBadges();
-}
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/js/09_mtf_axis.js
-```js
-// chart/js/09_mtf_axis.js
-// Phase 21.03.11 (Bug 4) – TF-spezifische Achsen-Ticks
-//
-// Problem (User-Meldung): Bei M15 statt H1 zeigte die X-Achse weiterhin
-// 12-Stunden-Blöcke – LWC v5 wählt die Tick-Dichte nur aus der Viewport-
-// Breite, nicht aus dem gewählten Timeframe.
-//
-// Lösung: Ein Overlay-Layer (#mtf-axis-layer) rendert Zeit-Tick-Labels,
-// die zum TF des Charts ausgerichtet sind (M15 -> 15-min-Marken, H1 ->
-// 1h-Marken, darunter gröbere Stufen je nach Zoom). Die LWC-eigenen
-// Intraday-Labels liefert der tickMarkFormatter (04_live_updates.js)
-// zugunsten des Overlays zurück (Tagesgrenzen behalten das Datum).
-//
-// Abhängigkeiten: 02_time_utils.js (getBerlinParts, toReal, toCont),
-// 01_core.js (chart, rawCandleData, currentTfInSeconds). Rein additiv,
-// kein Umbau des Kern-Rendering-Pfads.
-
-// =============================================================================
-// Zustand
-// =============================================================================
-let _mtfAxis = {
-    active: false,     // true = Intraday-TF (Overlay aktiv)
-    tfSeconds: 0,      // Sekunden des aktuellen Chart-TF
-};
-
-//: Kleinstmöglicher Label-Abstand in Pixeln (gegen Überlappung).
-const MTF_AXIS_MIN_LABEL_PX = 90;
-
-//: "Schöne" absolute Schritt-Größen (Sekunden), aus denen je Zoom der
-//: erste Wert >= gewünschtem Abstand gewählt wird.
-const MTF_AXIS_STEPS = [
-    60, 120, 300, 600, 900, 1800, 2700, 3600, 5400, 7200, 10800, 14400,
-    21600, 43200, 86400, 3 * 86400, 7 * 86400, 30 * 86400, 365 * 86400,
-];
-
-// =============================================================================
-// Container sicherstellen
-// =============================================================================
-function _mtfAxisContainer() {
-    var c = document.getElementById('chart-container');
-    if (!c) return null;
-    var layer = document.getElementById('mtf-axis-layer');
-    if (!layer) {
-        layer = document.createElement('div');
-        layer.id = 'mtf-axis-layer';
-        layer.style.cssText =
-            'position:absolute; left:0; right:0; bottom:0; height:22px;' +
-            ' pointer-events:none; z-index:998; overflow:hidden;' +
-            ' font-size:10px; color:#787B86; font-family:sans-serif;';
-        c.appendChild(layer);
-    }
-    return layer;
-}
-
-// =============================================================================
-// Render: TF-alignierte Tick-Labels über die Zeitachse legen
-// =============================================================================
-function mtfAxisRender() {
-    var layer = _mtfAxisContainer();
-    if (!layer) return;
-    layer.innerHTML = '';
-
-    if (!_mtfAxis.active || !chart || !rawCandleData ||
-        rawCandleData.length === 0) {
-        return;
-    }
-    var tfSec = _mtfAxis.tfSeconds;
-    if (!tfSec || tfSec <= 0) return;
-
-    var lr;
-    try {
-        lr = chart.timeScale().getVisibleLogicalRange();
-    } catch (e) { return; }
-    if (!lr || lr.from === null || lr.to === null) return;
-
-    var fromIdx = Math.max(0, Math.floor(lr.from));
-    var toIdx = Math.min(rawCandleData.length - 1, Math.ceil(lr.to));
-    if (toIdx <= fromIdx) toIdx = fromIdx + 1;
-
-    var fromReal = toReal(rawCandleData[fromIdx].time);
-    var toRealTs = toReal(rawCandleData[toIdx].time);
-    if (fromReal === undefined || toRealTs === undefined) return;
-
-    var rangeSec = toRealTs - fromReal;
-    if (rangeSec <= 0) return;
-
-    var container = document.getElementById('chart-container');
-    var totalPx = (container && container.clientWidth) || 800;
-    var desired = rangeSec * MTF_AXIS_MIN_LABEL_PX / Math.max(1, totalPx);
-
-    // Nächste "schöne" Schrittgröße >= gewünschtem Abstand. Dabei wird nur
-    // ein Schritt gewählt, der ein Vielfaches des TF ist (Tick aligniert
-    // auf TF-Grenzen). Ist das nicht möglich (sehr großer Zoom), fällt auf
-    // den nächstgrößeren "schönen" Schritt zurück (dann zeigt LWC die
-    // Datums-Labels selbst).
-    var stepSec = null;
-    for (var i = 0; i < MTF_AXIS_STEPS.length; i++) {
-        var s = MTF_AXIS_STEPS[i];
-        if (s >= desired) {
-            stepSec = (s % tfSec === 0) ? s : null;
-            if (stepSec) break;
-        }
-    }
-    if (stepSec === null) {
-        // Fallback: gröberer Schritt, der KEIN Vielfaches des TF ist – dann
-        // trotzdem rendern (Tages-/Stunden-Marken), falls TF < 1 Tag.
-        for (var k = 0; k < MTF_AXIS_STEPS.length; k++) {
-            if (MTF_AXIS_STEPS[k] >= desired) { stepSec = MTF_AXIS_STEPS[k]; break; }
-        }
-    }
-    if (stepSec === null) stepSec = 86400;
-    if (stepSec >= 86400) return;  // LWC zeigt die Datums-Marken selbst
-
-    var first = Math.ceil(fromReal / stepSec) * stepSec;
-    for (var t = first; t <= toRealTs + stepSec / 2; t += stepSec) {
-        var p = getBerlinParts(t);
-        // Tagesgrenzen behält LWC (Datum) – hier überspringen (kein Duplikat).
-        if (p.hour === '00' && p.minute === '00') continue;
-        var cont = toCont(t);
-        if (cont === undefined) continue;
-        var x;
-        try {
-            x = chart.timeScale().timeToCoordinate(cont);
-        } catch (e) { continue; }
-        if (x === null || x === undefined || isNaN(x)) continue;
-        var el = document.createElement('div');
-        el.style.cssText =
-            'position:absolute; top:4px; left:' + Math.round(x) + 'px;' +
-            ' transform:translateX(-50%); white-space:nowrap;';
-        el.innerText = p.hour + ':' + p.minute;
-        layer.appendChild(el);
-    }
-}
-
-// =============================================================================
-// Externe API (04_live_updates.js ruft auf)
-// =============================================================================
-function mtfAxisSetTf(tfSeconds, active) {
-    _mtfAxis.tfSeconds = (typeof tfSeconds === 'number') ? tfSeconds : 0;
-    _mtfAxis.active = !!active;
-    mtfAxisRender();
-}
-
-function mtfAxisClear() {
-    _mtfAxis.active = false;
-    _mtfAxis.tfSeconds = 0;
-    var layer = document.getElementById('mtf-axis-layer');
-    if (layer) {
-        layer.innerHTML = '';
-        layer.remove();
-    }
-}
-
-//: Flag für den tickMarkFormatter (04): Intraday-Labels an das Overlay
-//: abgeben (nur wenn das Overlay aktiv ist).
-window._mtfAxisActive = false;
-
-function _mtfAxisSyncWindowFlag() {
-    window._mtfAxisActive = _mtfAxis.active;
-    return _mtfAxis.active;
-}
-
-// In den Hook-Zyklus einhängen: nach Full-Update + nach Zoom/Range-Change.
-// 04_live_updates.js ruft die optionalen Hooks auf – hier registrieren.
-function _onMtfAxisFullUpdate(data) {
-    if (data && typeof data.timeframe === 'string' &&
-        TF_SECONDS_MAP && TF_SECONDS_MAP[data.timeframe]) {
-        var tfSec = TF_SECONDS_MAP[data.timeframe];
-        mtfAxisSetTf(tfSec, tfSec > 0 && tfSec < 86400);
-    } else {
-        mtfAxisSetTf(0, false);
-    }
-    _mtfAxisSyncWindowFlag();
-}
-
-function _onMtfAxisVisibleRangeChanged() {
-    _mtfAxisSyncWindowFlag();
-    mtfAxisRender();
-}
-
-// Kopplung: 04_live_updates.js ruft die dedizierten optionalen Hooks
-// _onMtfAxisFullUpdate / _onMtfAxisVisibleRangeChanged auf (Muster
-// 06_two_tier.js). Kein Konflikt mit den MTF-FC-Hooks von 07/08.
-
-```
-
---------------------------------------------------
-
 ### DATEI: chart/overlays/__init__.py
 ```py
 # chart/overlays/__init__.py
@@ -34342,9 +34673,15 @@ __all__ = ["LineStyle", "MarkerStyle", "StylePickerDialog", "StylePickerWidget",
 """
 MTF-FC v4 (Kapitel 21.03.07) – MtfFilterBarWidget & Control-Panel.
 
-Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Range-Picker,
-View-Templates (über SchemaMigrator), Tabellen-Sortierung und
-Session-Filter (§4 Säule 1).
+Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Aggregations-TF,
+Range-Picker (Presets 24h/7d/30d/90d/Year, 21.03.15), Tabellen-
+Sortierung und Session-Filter (§4 Säule 1). 21.03.14 (Wunsch 2): Die
+zusaetzlichen View-Template-Buttons wurden rueckgebaut – die Filter-
+Konfiguration laeuft ueber das vorhandene Profil-Management (`sort_mode`
+wird ebenfalls persistiert). 21.03.15 (Bug 3/4): 'YTD' wurde in 'Year'
+umbenannt (365-Tage-Fenster) + '90d' ergaenzt; der benutzerdefinierte
+Von-/Bis-Zeitraum entfaellt, die Session-Checkboxen stehen in Zeile 1
+rechts neben der Sortierung (eine Zeile, keine Zeile 2 mehr).
 
 MVVM (Grundsatz 4): KEINE SQL-Queries, KEINE DB-Connects in der UI.
 Der Zustand wird ausschliesslich über den `MtfFcProvider` im isolierten
@@ -34357,7 +34694,7 @@ emittiert Signale; die eigentliche Verarbeitung (Boundary, Kaskade, Guards)
 liegt in den Engine-Modulen (21.03.02-21.03.05).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -34365,20 +34702,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from analytics.engine.mtf_fc_confluence import WEIGHTS
 from analytics.engine.mtf_fc_provider import MtfFcProvider
-from analytics.engine.mtf_fc_templates import (
-    MtfFcTemplateStore,
-    TemplateError,
-    create_template,
-    migrate_template,
-)
 
 #: Data-TF-Auswahl (Multi + fixierte Timeframes). 21.03.11 (Bug 6):
 #: Labels kompakt, damit die Leiste in 1200-px-Fenster passt (sizeHint war
@@ -34388,8 +34716,14 @@ DATA_TF_OPTIONS = ["🌐 Multi", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "�
 #: Chart-Overlay-TF (Auto-Kaskade vs. manuell fix).
 CHART_TF_OPTIONS = ["⚡ Auto", "🔒 Fix"]
 
-#: Range-Presets.
-RANGE_PRESETS = ["24h", "7d", "30d", "YTD", "Benutzerdefiniert"]
+#: Aggregations-TF (21.03.12, Entscheidung 6a): '⚡ Auto' = Granularitaet
+#: dynamisch an den Range anpassen; '🔒 [TF]' = Daten starr auf diesem
+#: TF-Raster zusammenfassen. Konfigurierbar via `agg_tf_options`.
+AGG_TF_OPTIONS = ["⚡ Auto", "🔒 M1", "🔒 M5", "🔒 M15", "🔒 H1", "🔒 H4", "🔒 D1"]
+
+#: Range-Presets (21.03.15, Bug 3): '90d' ergaenzt; 'YTD' (seit
+#: Jahresbeginn) wurde auf 'Year' (letzte 365 Tage) umbenannt.
+RANGE_PRESETS = ["24h", "7d", "30d", "90d", "Year"]
 
 #: Tabellen-Sortierung.
 SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
@@ -34397,7 +34731,7 @@ SORT_MODES = ["Datum 🠇", "Signal 🠇", "TF 🠅"]
 #: Session-Filter (Farbbalken im M1/M5-Zoom, 21.03.08).
 SESSION_OPTIONS = ["London", "New York", "Tokio"]
 
-_STRIP_PREFIX = ("🌐 ", "🔒 ", "⚡ ", "🠇", "🠅", " (Multi)", " (Kaskade)", " Manuell Fix", "Benutzerdefiniert")
+_STRIP_PREFIX = ("🌐 ", "🔒 ", "⚡ ", "🠇", "🠅", " (Multi)", " (Kaskade)", " Manuell Fix")
 
 
 def _parse_data_tf(text: str) -> str:
@@ -34430,55 +34764,68 @@ class MtfFilterBarWidget(QWidget):
     Signale (Entkopplung über den Aufrufer, kein Fenster-Know-how):
       * `data_tf_changed(str)`     – 'multi' oder fixierter TF (z. B. 'M15').
       * `chart_tf_changed(str)`    – 'auto' (Kaskade) oder 'fix'.
+      * `agg_tf_changed(str)`      – 'auto' oder konkreter Aggregations-TF
+                                     (21.03.12, Entscheidung 6a).
       * `range_changed(str, int, int)` – Preset-Name, from_ts, to_ts.
       * `sort_mode_changed(str)`   – 'date' | 'signal' | 'tf'.
       * `sessions_changed(list)`   – aktive Sessions (z. B. ['london']).
-      * `template_applied(dict)`   – geladenes View-Template.
       * `guard_override_requested(str, str)` – target_tf, reason (21.03.05).
     """
 
     data_tf_changed = Signal(str)
     chart_tf_changed = Signal(str)
+    agg_tf_changed = Signal(str)
     range_changed = Signal(str, int, int)
     sort_mode_changed = Signal(str)
     sessions_changed = Signal(list)
-    template_applied = Signal(dict)
     guard_override_requested = Signal(str, str)
 
     def __init__(
         self,
         provider: Optional[MtfFcProvider] = None,
-        template_store: Optional[MtfFcTemplateStore] = None,
         parent: Optional[QWidget] = None,
+        # 21.03.12 (Analytics-Integration): Die TF-Listen sind konfigurierbar
+        # (Analytics hat 11 TFs M1..MN1 statt der 6 Chart-Defaults) und der
+        # Range-Referenzpunkt kann injiziert werden (`now_provider` – im
+        # Analytics der letzte Datenpunkt MAX(bar_time) statt time.time()).
+        data_tf_options: Optional[List[str]] = None,
+        agg_tf_options: Optional[List[str]] = None,
+        now_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         super().__init__(parent)
         # Provider ist die EINZIGE Brücke zum shared_state-Namespace (MVVM).
         self._provider = provider or MtfFcProvider()
-        self._store = template_store or MtfFcTemplateStore()
         self._sessions: List[str] = []
+        self._data_tf_options = (
+            list(data_tf_options) if data_tf_options else list(DATA_TF_OPTIONS))
+        self._agg_tf_options = (
+            list(agg_tf_options) if agg_tf_options else list(AGG_TF_OPTIONS))
+        self._now_provider = now_provider or _now_epoch
         self._build_ui()
 
     # ------------------------------------------------------------------
     # UI-Aufbau
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        # 21.03.11 (Bug 6, 2. Fix): ZWEI-ZEILEN-Layout statt einer Zeile.
-        # Der 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
+        # 21.03.11 (Bug 6, 2. Fix): Kompakte EIN-Zeilen-Leiste. Der
+        # 1-Zeilen-Umbau (max. Breiten) war noch zu breit: sizeHint=1281,
         # minimumSizeHint=1209 -> das Fenster wird auf ~1220 px aufgezwungen,
         # Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) waren rechts
-        # abgeschnitten/unsichtbar. Zeile 1 = Kern-Steuerung (Data/Chart/
-        # Range/Sort), Zeile 2 = Sessions + Templates -> sizeHint < 700 px.
+        # abgeschnitten/unsichtbar. Seit 21.03.15 (Bug 4) liegen Data/Chart/
+        # Agg/Range/Sort/Sessions in EINER Zeile (die fruehere Zeile 2 mit
+        # dem benutzerdefinierten Von-/Bis-Panel ist entfallen); die Combos
+        # sind kompakt, die Session-Checkboxen schmal.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(2, 2, 2, 2)
         outer.setSpacing(2)
 
-        # --- Zeile 1: Source-Data-TF / Chart-Overlay-TF / Range / Sort --
+        # --- Zeile 1: Data / Chart / Agg / Range / Sort / Sessions ------
         row1 = QHBoxLayout()
         row1.setSpacing(4)
 
         row1.addWidget(QLabel("Data:"))
         self._data_tf_combo = QComboBox()
-        self._data_tf_combo.addItems(DATA_TF_OPTIONS)
+        self._data_tf_combo.addItems(self._data_tf_options)
         self._data_tf_combo.setMaximumWidth(105)
         self._data_tf_combo.setToolTip(
             "Source-Data-TF: 🌐 alle Timeframes (Multi) vs. 🔒 fixiert auf einen TF")
@@ -34495,13 +34842,28 @@ class MtfFilterBarWidget(QWidget):
         self._chart_tf_combo.currentTextChanged.connect(self._on_chart_tf_changed)
         row1.addWidget(self._chart_tf_combo)
 
+        # 21.03.12 (Entscheidung 6a): Aggregations-TF-Dropdown – nur bei
+        # '🔒 Fix' aktiv; bei '⚡ Auto' deaktiviert und auf 'Auto' gesetzt.
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Agg:"))
+        self._agg_tf_combo = QComboBox()
+        self._agg_tf_combo.addItems(self._agg_tf_options)
+        self._agg_tf_combo.setMaximumWidth(95)
+        self._agg_tf_combo.setToolTip(
+            "Aggregations-TF (21.03.12, 6a): ⚡ Auto = Granularitaet dynamisch "
+            "an den Zeitraum anpassen; 🔒 Fix = Daten starr auf diesem TF-Raster "
+            "zusammenfassen (eigenes Dropdown, unabhaengig von Data-TF).")
+        self._agg_tf_combo.currentTextChanged.connect(self._on_agg_tf_changed)
+        self._agg_tf_combo.setEnabled(False)
+        row1.addWidget(self._agg_tf_combo)
+
         row1.addSpacing(6)
         row1.addWidget(QLabel("Range:"))
         self._range_combo = QComboBox()
         self._range_combo.addItems(RANGE_PRESETS)
         self._range_combo.setMaximumWidth(100)
         self._range_combo.setToolTip(
-            "Zeitfenster-Preset (24h/7d/30d/YTD) – filtert den anzuzeigenden Zeitraum")
+            "Zeitfenster-Preset (24h/7d/30d/90d/Year) – filtert den anzuzeigenden Zeitraum")
         self._range_combo.currentTextChanged.connect(self._on_range_changed)
         row1.addWidget(self._range_combo)
 
@@ -34515,49 +34877,20 @@ class MtfFilterBarWidget(QWidget):
         self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
         row1.addWidget(self._sort_combo)
 
-        row1.addStretch(1)
-        outer.addLayout(row1)
-
-        # --- Zeile 2: Session-Filter + View-Templates -------------------
-        row2 = QHBoxLayout()
-        row2.setSpacing(4)
-
+        # 21.03.15 (Bug 4): Session-Filter rechts neben der Sortierung in
+        # Zeile 1 (die fruehere Zeile 2 mit dem benutzerdefinierten
+        # Von-/Bis-Panel ist entfallen - Platzgewinn, eine Zeile).
+        row1.addSpacing(6)
         self._session_checks: Dict[str, QCheckBox] = {}
         for session in SESSION_OPTIONS:
             cb = QCheckBox(session)
             cb.setToolTip("Session-Farbbalken im M1/M5-Zoom (UTC-Epochs)")
             cb.stateChanged.connect(self._on_sessions_changed)
             self._session_checks[session.lower()] = cb
-            row2.addWidget(cb)
+            row1.addWidget(cb)
 
-        row2.addSpacing(6)
-        self._template_name = QLineEdit()
-        self._template_name.setPlaceholderText("Preset")
-        self._template_name.setMaximumWidth(90)
-        self._template_name.setToolTip("Name des View-Templates")
-        row2.addWidget(self._template_name)
-
-        self._btn_save_template = QPushButton("💾")
-        self._btn_save_template.setToolTip(
-            "Aktuelle Filter-Konfiguration als View-Template speichern")
-        self._btn_save_template.setMaximumWidth(34)
-        self._btn_save_template.clicked.connect(self._save_template)
-        row2.addWidget(self._btn_save_template)
-
-        self._btn_load_template = QPushButton("📂")
-        self._btn_load_template.setToolTip("Gespeichertes View-Template laden")
-        self._btn_load_template.setMaximumWidth(34)
-        self._btn_load_template.clicked.connect(self._load_template)
-        row2.addWidget(self._btn_load_template)
-
-        self._template_combo = QComboBox()
-        self._template_combo.setToolTip("Verfügbare View-Templates")
-        self._template_combo.setMaximumWidth(110)
-        self._template_combo.currentIndexChanged.connect(self._on_template_selected)
-        row2.addWidget(self._template_combo)
-
-        row2.addStretch(1)
-        outer.addLayout(row2)
+        row1.addStretch(1)
+        outer.addLayout(row1)
 
     # ------------------------------------------------------------------
     # Public API (State-Sync über Provider, kein SQL)
@@ -34590,6 +34923,17 @@ class MtfFilterBarWidget(QWidget):
         """Aktiver Chart-Overlay-TF ('auto' oder 'fix')."""
         return _parse_chart_tf(self._chart_tf_combo.currentText())
 
+    def current_agg_tf(self) -> str:
+        """Aktiver Aggregations-TF ('auto' oder konkreter TF, z. B. 'H1')."""
+        text = self._agg_tf_combo.currentText()
+        for prefix in ("⚡ ", "🔒 "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        stripped = text.strip()
+        if not stripped or stripped.lower() in ("auto", "kaskade"):
+            return "auto"
+        return stripped
+
     def current_sort_mode(self) -> str:
         """Aktive Sortierung ('date' | 'signal' | 'tf')."""
         text = self._sort_combo.currentText()
@@ -34599,16 +34943,72 @@ class MtfFilterBarWidget(QWidget):
             return "tf"
         return "date"
 
+    # 21.03.12 (Analytics-Integration): Externe Filterwerte anwenden (z. B.
+    # Profil-/Workspace-Restore des AnalyticsWindow). Setzt die Combos mit
+    # blockSignals und emittiert die Signale danach EXPLIZIT. None = Eintrag
+    # unveraendert lassen.
+    # 21.03.14 (Wunsch 2): `sort_mode` stellt die Tabellen-Sortierung nach
+    # Profil-/Workspace-Restore wieder her (die View-Template-Buttons wurden
+    # rueckgebaut). 21.03.15 (Bug 3): Alt-Profile mit 'YTD'/'Benutzerdefiniert'
+    # werden auf den neuen Preset-Satz (90d/Year, kein Custom-Panel) gemappt.
+    def apply_external_state(
+        self,
+        data_tf: Optional[str] = None,
+        agg_tf: Optional[str] = None,
+        range_preset: Optional[str] = None,
+        sort_mode: Optional[str] = None,
+    ) -> None:
+        """Wendet externe Filterwerte auf die Combos an (in-memory)."""
+        if data_tf is not None:
+            self._data_tf_combo.blockSignals(True)
+            self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
+            self._data_tf_combo.blockSignals(False)
+            self.data_tf_changed.emit(self.current_data_tf())
+        if agg_tf is not None:
+            self._agg_tf_combo.blockSignals(True)
+            if str(agg_tf).strip().lower() == "auto":
+                self._agg_tf_combo.setCurrentText("⚡ Auto")
+            else:
+                self._agg_tf_combo.setCurrentText(_data_tf_label(agg_tf))
+            self._agg_tf_combo.blockSignals(False)
+            self.agg_tf_changed.emit(self.current_agg_tf())
+        if sort_mode is not None:
+            self._sort_combo.blockSignals(True)
+            self._sort_combo.setCurrentText(
+                {"date": SORT_MODES[0], "signal": SORT_MODES[1],
+                 "tf": SORT_MODES[2]}.get(str(sort_mode), SORT_MODES[0]))
+            self._sort_combo.blockSignals(False)
+            self.sort_mode_changed.emit(self.current_sort_mode())
+        if range_preset is not None:
+            preset = str(range_preset).strip() or None
+            if preset is not None:
+                # 21.03.15 (Bug 3): Alt-Profile (YTD/Custom-Panel) auf den
+                # neuen Preset-Satz abbilden, damit setCurrentText greift.
+                if preset == "YTD":
+                    preset = "Year"
+                elif preset == "Benutzerdefiniert":
+                    preset = "7d"
+                self._range_combo.blockSignals(True)
+                self._range_combo.setCurrentText(preset)
+                self._range_combo.blockSignals(False)
+                self._on_range_changed(preset)
+
+    def set_chart_mode(self, mode: str) -> None:
+        """Setzt den Chart-Modus ('auto'|'fix') – externer Kontext (Analytics).
+
+        'fix' aktiviert das Aggregations-TF-Dropdown (Entscheidung 6a) und
+        stellt einen konkreten Agg-TF sicher; 'auto' deaktiviert es (dynamische
+        Granularitaet). Loeuft ueber die bestehende _on_chart_tf_changed-Logik
+        (Enable/Disable + Vorbelegung) und emittiert chart_tf_changed +
+        agg_tf_changed.
+        """
+        mode = "fix" if str(mode).strip().lower() == "fix" else "auto"
+        self._chart_tf_combo.setCurrentText(
+            CHART_TF_OPTIONS[1] if mode == "fix" else CHART_TF_OPTIONS[0])
+
     def active_sessions(self) -> List[str]:
         """Aktive Session-Filter (klein geschrieben)."""
         return [s for s, cb in self._session_checks.items() if cb.isChecked()]
-
-    def refresh_templates(self) -> None:
-        """Aktualisiert die Template-Dropdown-Liste aus dem Store."""
-        self._template_combo.blockSignals(True)
-        self._template_combo.clear()
-        self._template_combo.addItems(self._store.names())
-        self._template_combo.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Slots
@@ -34617,15 +35017,53 @@ class MtfFilterBarWidget(QWidget):
         self.data_tf_changed.emit(self.current_data_tf())
 
     def _on_chart_tf_changed(self, _text: str) -> None:
-        self.chart_tf_changed.emit(self.current_chart_tf())
+        """Aktiviert/deaktiviert das Aggregations-TF-Dropdown (Entscheidung 6a).
+
+        '⚡ Auto'  -> Agg-Combo deaktiviert und auf 'Auto' gesetzt (Granularitaet
+                     wird dynamisch aus dem Zeitraum abgeleitet).
+        '🔒 Fix'   -> Agg-Combo aktiv; ist noch kein konkreter TF gewaehlt,
+                     wird der erste fixierte Eintrag vorbelegt (damit 'Fix'
+                     IMMER einen konkreten Aggregations-TF liefert).
+        """
+        mode = self.current_chart_tf()
+        self._agg_tf_combo.blockSignals(True)
+        if mode == "auto":
+            self._agg_tf_combo.setCurrentText("⚡ Auto")
+            self._agg_tf_combo.setEnabled(False)
+        else:
+            if self.current_agg_tf() == "auto":
+                for opt in self._agg_tf_options:
+                    if not opt.startswith("⚡"):
+                        self._agg_tf_combo.setCurrentText(opt)
+                        break
+            self._agg_tf_combo.setEnabled(True)
+        self._agg_tf_combo.blockSignals(False)
+        self.chart_tf_changed.emit(mode)
+        self.agg_tf_changed.emit(self.current_agg_tf())
+
+    def _on_agg_tf_changed(self, _text: str) -> None:
+        self.agg_tf_changed.emit(self.current_agg_tf())
 
     def _on_range_changed(self, preset: str) -> None:
-        if preset == "Benutzerdefiniert":
-            return
-        now = _now_epoch()
+        """Range-Combo-Wechsel: Preset-Zeitraum emittieren.
+
+        21.03.12 (Analytics): Referenzpunkt injizierbar – im Analytics der
+        letzte Datenpunkt (MAX(bar_time)) statt time.time(), damit Presets
+        relativ zum letzten Signal und nicht zur Wanduhr rechnen. Defensiv:
+        None/Fehler (z. B. noch kein Symbol/Timeframe gewaehlt) -> time.time().
+        21.03.15 (Bug 3): Preset-Satz 24h/7d/30d/90d/Year; 'Year' = letzte
+        365 Tage (kein Jahresbeginn-Fenster mehr). Das benutzerdefinierte
+        Von-/Bis-Panel ist entfallen.
+        """
+        try:
+            now = int(self._now_provider())
+        except (TypeError, ValueError):
+            now = int(_now_epoch())
         seconds = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
-                   "YTD": _ytd_epoch_offset(now)}.get(preset, 86400)
-        self.range_changed.emit(preset, now - seconds, now)
+                   "90d": 90 * 86400, "Year": 365 * 86400}.get(
+                       preset, 86400)
+        f, t = now - seconds, now
+        self.range_changed.emit(preset, f, t)
 
     def _on_sort_changed(self, _text: str) -> None:
         self.sort_mode_changed.emit(self.current_sort_mode())
@@ -34633,74 +35071,6 @@ class MtfFilterBarWidget(QWidget):
     def _on_sessions_changed(self, _state: int) -> None:
         self._sessions = self.active_sessions()
         self.sessions_changed.emit(list(self._sessions))
-
-    def _save_template(self) -> None:
-        name = self._template_name.text().strip() or "Unbenannt"
-        template = create_template(
-            name=name,
-            data_tf=self.current_data_tf(),
-            chart_tf=self.current_chart_tf(),
-            range_preset=self._range_combo.currentText(),
-            sort_mode=self.current_sort_mode(),
-            session_filters=list(self._sessions),
-        )
-        self._store.save(template)
-        self.refresh_templates()
-        self._template_combo.setCurrentText(name)
-
-    def _load_template(self) -> None:
-        name = self._template_combo.currentText()
-        if not name:
-            return
-        template = self._store.load(name)
-        if template is None:
-            return
-        self._apply_template(template)
-        self.template_applied.emit(template)
-
-    def _on_template_selected(self, index: int) -> None:
-        if index < 0:
-            return
-        self._load_template()
-
-    def _apply_template(self, template: Dict[str, Any]) -> None:
-        """Wendet ein geladenes Template auf die Widgets an (in-memory).
-
-        21.03.11 (Bug 6): Nach der Widget-Anwendung werden die Signale
-        EXPLIZIT emittiert, damit der Orchestrator (chart_win) die Werte
-        übernimmt (blockSignals unterbindet sonst die Signal-Verdrahtung).
-        """
-        data_tf = str(template.get("data_tf") or "multi")
-        self._data_tf_combo.blockSignals(True)
-        self._data_tf_combo.setCurrentText(_data_tf_label(data_tf))
-        self._data_tf_combo.blockSignals(False)
-
-        range_preset = str(template.get("range_preset") or "7d")
-        self._range_combo.blockSignals(True)
-        self._range_combo.setCurrentText(range_preset)
-        self._range_combo.blockSignals(False)
-
-        sort_mode = str(template.get("sort_mode") or "date")
-        self._sort_combo.blockSignals(True)
-        self._sort_combo.setCurrentText(
-            {"date": SORT_MODES[0], "signal": SORT_MODES[1],
-             "tf": SORT_MODES[2]}.get(sort_mode, SORT_MODES[0]))
-        self._sort_combo.blockSignals(False)
-
-        sessions = template.get("session_filters") or []
-        for key, cb in self._session_checks.items():
-            cb.blockSignals(True)
-            cb.setChecked(key in sessions)
-            cb.blockSignals(False)
-        self._sessions = [s for s in sessions if s in self._session_checks]
-
-        # Explizite Signal-Emission nach der Anwendung (Bug 6).
-        self.data_tf_changed.emit(self.current_data_tf())
-        self.chart_tf_changed.emit(self.current_chart_tf())
-        self.sort_mode_changed.emit(self.current_sort_mode())
-        self.sessions_changed.emit(list(self._sessions))
-        if range_preset and range_preset != "Benutzerdefiniert":
-            self._on_range_changed(range_preset)
 
     # ------------------------------------------------------------------
     # Guard-Override (Ebene 2, 21.03.05) – Klick auf Reset-Badge
@@ -34714,14 +35084,6 @@ def _now_epoch() -> int:
     """Aktuelle Wanduhr-Epoch (Sekunden)."""
     import time
     return int(time.time())
-
-
-def _ytd_epoch_offset(now: int) -> int:
-    """Sekunden seit Jahresbeginn (Wanduhr)."""
-    from datetime import datetime, timezone
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
-    start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
-    return int(now - start.timestamp())
 
 ```
 
@@ -36885,6 +37247,25 @@ _STYLE_ERROR = ("background-color: #b04343; color: #ffffff; "
 _STYLE_HINT = ("background-color: #2c3e2c; color: #9fcf9f; "
                "border-radius: 3px; border: 1px solid #4a7a4a;")
 
+# 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob) fuer
+# die Pill-Badges. Die Reader-Rueckgabe (fetch_service_tf_status) ist seit
+# 13.08.2026 bereits kanonisch sortiert; diese Sortierung sichert das
+# Widget zusaetzlich DEFENSIV gegen unsortierte Alt-Daten/Test-Aufrufer ab.
+_TF_CANONICAL_ORDER = [
+    "M1", "M2", "M5", "M10", "M15", "M30",
+    "H1", "H4", "D1", "W1", "MN1",
+]
+
+
+def _sort_tfs_canonical(tfs: list) -> list:
+    """Kanonische TF-Reihenfolge (unbekannte TFs am Ende, alphabetisch)."""
+    order = {tf: i for i, tf in enumerate(_TF_CANONICAL_ORDER)}
+    return sorted(
+        (str(t) for t in (tfs or [])
+        if t is not None and str(t).strip()),
+        key=lambda tf: (order.get(str(tf).upper(), 10 ** 6), str(tf)),
+    )
+
 
 class TfStatusBadgeBar(QWidget):
     """Pill-Badges je Timeframe eines Services (21.01b, Schritt 2).
@@ -36934,10 +37315,15 @@ class TfStatusBadgeBar(QWidget):
         for extra in self._errors:
             if extra not in known_tfs:
                 known_tfs.append(extra)
-        self._rebuild(known_tfs)
+        # 13.08.2026 (Punkt 3, F3): Kanonische TF-Reihenfolge (fein -> grob).
+        self._rebuild(_sort_tfs_canonical(known_tfs))
 
     def _rebuild(self, tfs: list) -> None:
         """Erzeugt/entfernt Badge-Labels so, dass `tfs` angezeigt werden."""
+        # 13.08.2026 (Punkt 3, F3): Defensive kanonische Sortierung - das
+        # Widget rendert TFs unabhaengig von der Aufrufer-Reihenfolge
+        # korrekt (fein -> grob).
+        tfs = _sort_tfs_canonical(tfs)
         wanted = set(tfs)
         # Entfernen nicht mehr benoetigter Badges
         for tf in list(self._labels.keys()):
@@ -37593,7 +37979,10 @@ class MasterTree(QTreeWidget):
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "")
             last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
-            svc_label = f"{svc.get('instance_id')} ({last_exec})"
+            # 13.08.2026 (Punkt 6, F6): Modus-Suffix am Service-Namen
+            # (Format 'swing_momentum [MA_Peak_Hysteresis] (13.08.26)').
+            mode_sfx = self._mode_suffix(plugin_id, svc.get("params"))
+            svc_label = f"{svc.get('instance_id')}{mode_sfx} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
             svc_archived = bool(svc.get("is_archived"))
@@ -37639,11 +38028,53 @@ class MasterTree(QTreeWidget):
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
-            self._apply_badge(svc_item, plugin_id, svc.get("badge") or "")
+            self._apply_badge(
+                svc_item, plugin_id, svc.get("badge") or "",
+                params=svc.get("params"))
             set_item.addChild(svc_item)
         if self._checkable:
             self._apply_set_state(set_item)
         return set_item
+
+    @staticmethod
+    def _mode_suffix(plugin_id: str,
+                     params: Optional[Dict[str, Any]] = None) -> str:
+        """'[{Modus}]'-Suffix fuer MasterTree-Labels (13.08.2026, Punkt 6, F6).
+
+        Nur fuer Multi-Modus-Services: parameter_schema['mode']['options']
+        enthaelt MEHR ALS EINEN Eintrag (z. B. srv_swing_momentum mit
+        MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet). Ein-
+        Modus-Services bleiben ohne Suffix (kein Rauschen im Baum). Der
+        Modus kommt aus den params der Instanz (Clone/Set-Service) bzw.
+        aus dem Schema-Default (flache Plugin-Zeile ohne eigene params).
+        Rein lesend (PluginRegistry-Singleton), Fehler defensiv leer.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            reg = PluginRegistry()
+            plugins = getattr(reg, "plugins", None) or {}
+            pid_l = str(plugin_id or "").strip().lower()
+            plugin = None
+            for k, v in plugins.items():
+                if str(k).strip().lower() == pid_l:
+                    plugin = v
+                    break
+            if plugin is None:
+                return ""
+            schema = getattr(plugin, "parameter_schema", None) or {}
+            mode_cfg = schema.get("mode") or {}
+            options = [str(o).strip() for o in (mode_cfg.get("options") or [])
+                       if str(o).strip()]
+            if len(options) <= 1:
+                return ""
+            mode = ""
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode:
+                mode = str(mode_cfg.get("default") or "").strip()
+            return f" [{mode}]" if mode else ""
+        except Exception:
+            return ""
 
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
@@ -37664,7 +38095,11 @@ class MasterTree(QTreeWidget):
         # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
         # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
         display_pid = pid[4:] if pid.startswith("srv_") else pid
-        plugin_label = display_pid if clones else f"{display_pid} ({last_exec})"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an flachen Plugin-Zeilen
+        # (Plugins MIT Clones zeigen den Modus an den Clone-Zeilen).
+        mode_sfx = "" if clones else self._mode_suffix(pid, None)
+        plugin_label = (display_pid if clones
+                        else f"{display_pid}{mode_sfx} ({last_exec})")
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -37709,16 +38144,22 @@ class MasterTree(QTreeWidget):
         last_exec = str(clone.get("last_execution") or "")
         last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         prefix = "🔹" if archived else "🟢"
+        # 13.08.2026 (Punkt 6, F6): Modus-Suffix an der Variante
+        # (Format '🟢 <Preset> [MA_Peak_Hysteresis] (13.08.26)') - die ID
+        # (#hash) ist seit 10.08.2026 bereits aus dem Label entfernt.
+        mode_sfx = self._mode_suffix(plugin_id, clone.get("params"))
         clone_item = QTreeWidgetItem(
-            [f"{prefix} {preset_name} ({last_exec})", ""])
+            [f"{prefix} {preset_name}{mode_sfx} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
         clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
         clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
         clone_item.setData(0, ROLE_PRESET_NAME, preset_name)
         if archived:
             clone_item.setData(0, ROLE_ARCHIVED, True)
-        # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
+        # Tooltip: Plugin/Preset + Modus + Parameter + Doc-Log (F6c).
         tooltip = f"Plugin: {plugin_id}\nPreset: {preset_name}"
+        if mode_sfx:
+            tooltip += f"\nModus:{mode_sfx}"
         params = clone.get("params") or {}
         if isinstance(params, dict) and params:
             try:
@@ -37746,7 +38187,8 @@ class MasterTree(QTreeWidget):
         return clone_item
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
-                     badge: str) -> None:
+                     badge: str,
+                     params: Optional[Dict[str, Any]] = None) -> None:
         """Setzt die Darstellung eines Service-/Plugin-Items (Spalte 0/1).
 
         * Spalte 1: KEIN Badge-Text mehr (Bugfix 05.08.2026) – den Platz
@@ -37771,6 +38213,12 @@ class MasterTree(QTreeWidget):
                        else f"im {name}")
         else:
             tooltip = ""
+        # 13.08.2026 (Punkt 6, F6c): Modus auch im Tooltip (falls die
+        # Instanz-Params verfuegbar sind - Set-Service-/Clone-Zeile).
+        mode_sfx = self._mode_suffix(plugin_id, params)
+        if mode_sfx:
+            tooltip = (f"{tooltip}\nModus:{mode_sfx}"
+                       if tooltip else f"Modus:{mode_sfx}")
         item.setToolTip(0, tooltip)
         item.setToolTip(1, tooltip)
 
@@ -42624,6 +43072,52 @@ class ServiceSelectorDialog(QDialog):
         except Exception:
             pass
 
+    def _merge_live_param_values(self, definition: Dict[str, Any]) -> None:
+        """13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox.
+
+        Der Picker-Run nutzt sonst die GESPEICHERTE Set-/Plugin-Definition
+        (set_repo.get_set / variant_run_entries + _plugin_config). Wurden
+        in der Parameterbox Werte geaendert, ohne zu speichern (inkl.
+        Modus), gingen sie bei der Ausfuehrung verloren - Wurzel von Bug 4
+        (MA_Slope_Change landete nie im Store, weil der Run mit
+        default_params -> erstem Mode-Eintrag lief). Hier werden die LIVE-
+        Control-Werte der aktuellen Parameterbox in die Run-Definition
+        uebernommen (nur fuer DIESEN Run, keine Persistenz).
+
+        Match: exakte instance_id (Set-Service/Standalone ohne Presets);
+        bei Clone-Runs (instance_id = '<pid>#<hash>') zusaetzlich per
+        plugin_id, sofern in der Definition genau EIN Service matcht
+        (mehrere Varianten = mehrdeutig, dann keine Uebernahme).
+        """
+        host = getattr(self, "_param_host", None)
+        if host is None:
+            return
+        controls = getattr(host, "_service_param_controls", None) or {}
+        if not controls:
+            return
+        services = definition.get("services") or {}
+        for (iid, key), ctrl in controls.items():
+            cfg = services.get(iid)
+            if not isinstance(cfg, dict):
+                matches = [c for c in services.values()
+                           if isinstance(c, dict)
+                           and str(c.get("plugin_id") or "") == str(iid)]
+                if len(matches) == 1:
+                    cfg = matches[0]
+                else:
+                    continue
+            try:
+                value = host._ctrl_value(ctrl)
+            except (RuntimeError, AttributeError):
+                continue
+            if key == "lookback":
+                try:
+                    cfg["lookback"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                cfg.setdefault("params", {})[key] = value
+
     def _on_run_service(self, set_id: str, service_id: str) -> None:
         """'▶️ Diesen Service ausführen' (Picker-MasterTree)."""
         if not set_id or not service_id:
@@ -42655,6 +43149,11 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Implizites Uebernehmen der Parameterbox-
+        # Werte (inkl. Modus) vor der Ausfuehrung - sonst liefe der Run mit
+        # der GESPEICHERTEN Definition (Aenderungen ohne Speichern gehen
+        # verloren).
+        self._merge_live_param_values(definition)
         self._start_run_worker(service_id, definition, instance_id=service_id)
 
     def _on_run_set(self, set_id: str) -> None:
@@ -42687,6 +43186,9 @@ class ServiceSelectorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (sichtbare Set-Service-Spalten), bevor das ganze Set laeuft.
+        self._merge_live_param_values(definition)
         self._start_run_worker(set_id, definition, instance_id=None)
 
     def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
@@ -42737,6 +43239,10 @@ class ServiceSelectorDialog(QDialog):
             "execution_order": [e[0] for e in entries],
             "services": {e[0]: e[1] for e in entries},
         }
+        # 13.08.2026 (Punkt 7, F7): Parameterbox-Werte implizit uebernehmen
+        # (inkl. Modus - Bug 4: der Run nutzte sonst default_params und
+        # lief immer mit dem ersten Mode-Eintrag).
+        self._merge_live_param_values(definition)
         self._start_run_worker(
             plugin_id, definition,
             instance_id=entries[0][0] if single else None)

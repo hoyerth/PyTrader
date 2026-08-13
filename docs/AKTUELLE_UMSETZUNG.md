@@ -1709,4 +1709,12 @@ def _on_mode_filter_changed(self) -> None:
   - `test/check_punkte_1_8.py` (9 Checks): ALLE PASS (F1-Achse wieder gruen nach Guard-Korrektur).
   - `py_compile` aller 5 geaenderten Quelldateien OK.
   - Datenlage (read-only): 5 Multi-Modus-Services; alle aktuellen Store-Modi == Schema-Default (z. B. srv_trend_breakout -> Supertrend_ATR) - die Abweichungs-Anzeige greift, sobald eine Variante mit anderem Modus laeuft.
-- **Commit:** (siehe Git-Log)
+- **Commit:** 3797734 (Code + Doku Runde 1-3 gemeinsam committet)
+
+## Abschluss-Commit (13.08.2026 18:35) - Agents.md-Regel & Export-Clones
+
+- **Agents.md (eigene Regel-Ergaenzung des Benutzers):** Punkt 6.3 (Stopp-Punkte) praezisiert - kein Setzen/Umsetzen von CLI-Menuevorgaben; weitere Schritte NUR auf ausdruecklichen manuellen Prompt ("Niemals wird eine Menuevorgabe der CLI gesetzt und dann implementiert. Nur ausschliesslich durch manuellen prompt!!!!").
+- **docs/Exports/* (6 Dateien):** Regenerierte Export-Clones (export_Full/analytics/chart_engine/project_docs/rest/service_engine) - enthalten den aktuellen Quellcode-Stand inkl. der Agents.md-Regel (export_project_docs). Kein offizieller Quellcode (System-Regel 0), nur Doku-Konsistenz.
+- **Testdateien:** verbleiben lokal in test/ (gitignored, Projekt-Konvention) - keine Commits.
+- **Offener Punkt (bewusst NICHT umgesetzt):** Clone-Modus-Anzeige fuer Varianten ohne params.mode greift auf den Schema-Default zurueck; die Abweichungs-Anzeige (Store-Modus) ist seit Runde 3 implementiert und greift bei naechster Variante mit anderem Modus automatisch.
+- **Commit:** (dieser Abschluss-Commit)

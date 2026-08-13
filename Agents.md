@@ -126,7 +126,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 
 1. **Niemals die Fortsetzung in eine interaktive Frage/Abfrage setzen:** Die AI darf die Aufforderung zum nächsten Schritt **NIEMALS** in eine User-Interaktion (z. B. `AskQuestion`/Options-Dialog) verpacken. Es besteht die Gefahr, dass der Anwender versehentlich auf „Continue"/Enter/Tab drückt und damit eine Ausführung auslöst, die er nicht angeordnet hat.
 2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
-3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
+3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes durch manuellen prompt anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen. Niemals wird eine Menüvorgabe der CLI gesetzt und dann implementiert. Nur ausschliesslich durch manuellen prompt!!!!
 4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
 
 ---
