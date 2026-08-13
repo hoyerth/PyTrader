@@ -1304,3 +1304,219 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   kompatibel), `test/check_custom_range_sortmode.py` (47/47).
 
 - **Commit:** `33c33ce`
+
+---
+
+# 21.03.20 – Analytics Modus-Filter für Multi-Modus-Services (UI Enhancement)
+
+---
+
+## 🎯 1. Problemstellung & Ursachenanalyse
+
+| Symptom / Problem | Technische Ursache im Quellcode |
+| --- | --- |
+| **Vermischung unterschiedlicher Berechnungsverfahren** | Services wie `srv_swing_structure` oder `srv_swing_momentum` besitzen einen `mode`-Parameter mit völlig unterschiedlichen Logiken und Messskalen (z. B. `Williams_Fractal` vs. `ZigZag_ATR` oder `MA_Peak_Hysteresis` vs. `Chande_Kroll_Ratchet`). In `analytics_win.py` / `heatmap_widget.py` fehlte bisher ein Filter-Dropdown für `source_mode`. Dadurch wurden die Ergebnisse verschiedener Modi desselben Services in einer Heatmap-Matrix/Tabelle vermischt und verfälscht. |
+
+**Prämisse (Code-verifiziert, 13.08.2026):** Das Feld `source_mode` wird top-level in **jedes** `feature_data`-JSON-Record geschrieben – verifiziert in 6 Services:
+`analytics/features/definitions/srv_swing_structure.py` (Z. 631, Modi u. a. `Williams_Fractal`, `Standard_Pivot`, `Gann_Mechanical`, `ZigZag_ATR`, `ZigZag_Pct`, `Period_Extrema`), `srv_swing_momentum.py` (Z. 541/564, Modi u. a. `MA_Peak_Hysteresis`, `MA_Slope_Change`, `Chande_Kroll_Ratchet`), sowie `srv_swing_volume_profile.py`, `srv_trend_breakout.py`, `srv_trend_hma_pivot.py`, `srv_trend_regime.py`. Der `mode`-Parameter liegt in `parameter_schema["mode"]["options"]` der jeweiligen Service-Definition.
+
+---
+
+## ✅ 2. Fixierte Entscheidungen des Anwenders (13.08.2026)
+
+> Die Anforderung wurde auf Integrität, Korrektheit, Vollständigkeit und fachliche
+> Sinnhaftigkeit geprüft. Die offenen Punkte wurden vom Anwender wie folgt entschieden:
+
+1. **Scope = GLOBAL:** Der `service_mode`-Filter wirkt auf **alle** Analytics-Datenquellen:
+   * Legacy-Heatmap (`fetch_heatmap`, Dow×Stunde),
+   * generische Heatmap (`fetch_generic_heatmap`),
+   * Tabelle (`fetch_rows`),
+   * Scatter (`fetch_columns`),
+   * Verteilung (`fetch_columns`).
+   Die Refresh-Liste von `set_service_mode` umfasst daher `QUERY_FEATURES`, `QUERY_TABLE`, `QUERY_HEATMAP`, `QUERY_HEATMAP_GENERIC`, `QUERY_SCATTER` und `QUERY_DISTRIBUTION` (analog zu `set_range`/`set_feature_ids`).
+2. **Dropdown-Quelle = DYNAMISCH (Performance-Lösung):** Um keinen teuren Extra-Scan pro UI-Event auszulösen, wird die `SELECT DISTINCT`-Abfrage für `source_mode` **direkt in den leichten `QUERY_FEATURES`-Metadaten-Scan im `FeatureStoreReader` integriert**, der ohnehin im Worker-Thread gecacht läuft. Kein separater DB-Roundtrip für das Dropdown.
+3. **Nur SQL-Filterung (keine Kaskadierung auf das 'Feld'-Dropdown):** Das 'Feld'-Dropdown bleibt unverändert. Die Mode-Auswahl filtert ausschließlich die SQL-WHERE-Bedingung. Ergebnis: Wenn ein angehakter Parameter (`field_pairs`) vom gewählten Modus nicht produziert wird, liefern die betroffenen Zellen/Zeilen leer (0/NaN) – korrekt, keine Fehlermeldung, kein verfälschter Mix.
+4. **Leerer-Modus-Fall = Dropdown ausgrauen/deaktivieren:** Wenn die aktive Service-Auswahl (`feature_ids`/`instance_hashes`) keinen einzigen Service enthält, der `source_mode` in seine Records schreibt, wird `_combo_mode_filter` **deaktiviert (disabled)** und auf `[ Alle Modi ]` zurückgesetzt. Bei `feature_ids = []` (kein Filter = alle Services) gilt das Dropdown als aktiv, sobald im Datenbestand mindestens ein Service `source_mode` schreibt.
+5. **Threading-Kette = VOLLSTÄNDIG (ja):** `service_mode` wird vollständig durchgereicht:
+   `AnalyticsViewModel._current_params()` → `AnalyticsAsyncWorker._execute()` → `AnalyticsRepository.get_table()/get_heatmap()/get_generic_heatmap()/get_scatter()/get_distribution()` → `FeatureStoreReader.fetch_rows()/fetch_columns()/fetch_heatmap()/fetch_generic_heatmap()`.
+
+---
+
+## 🏗️ 3. Fachliches Konzept & Lösungsarchitektur
+
+1. **Einbau `_combo_mode_filter` in `HeatmapWidget`:**
+* **Platzierung:** In der zweiten Steuerzeile (`ctrl2`) von `HeatmapWidget` direkt zwischen **Aggregation** (`_combo_agg`, `COUNT`, `AVG` ...) und **Feld** (`_combo_field`, Ergebnis-Parameter).
+* **Inhalt:** `[ Alle Modi ]` (Item-Data `"all"`) sowie alle dynamisch ermittelten `source_mode`-Werte der aktuellen Datenlage.
+* **Platz-Budget:** Bug-6-Hintergrund beachten – Label + Combo (min. 150 px) müssen in `ctrl2` platzsparend bleiben (sizeHint der Steuerzeile darf nicht aufbrechen).
+
+2. **SQL-Filterung über `source_mode` (GLOBAL):**
+Der `FeatureStoreReader` erweitert die SQL-WHERE-Bedingung aller 4 Daten-Pfade bei gewähltem Modus um:
+
+AND LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)
+
+* **Muster-Konsistenz (21.03.16):** `json_extract_string` statt `feature_data->>'source_mode'` – der DuckDB-Arrow-Operator (v1.5.5) kollidiert in Kombination mit LOWER/TRIM-Equalities mit einem Optimizer-Bug (Cast-Versuch der JSON-Spalte auf numerisch/BOOL). `json_extract_string` liefert identische NULL-Semantik und ist auf JSON- UND VARCHAR-Spalten stabil.
+* **Case-Toleranz:** `LOWER` auf beiden Seiten; ungewöhnliche Schreibweisen (z. B. `ma_peak_hysteresis` vs. `MA_Peak_Hysteresis`) matchen zuverlässig.
+
+3. **Dynamische Modus-Liste ohne Extra-Scan (Performance-Lösung):**
+* Der `QUERY_FEATURES`-Leichtpfad (bestehender Feld-Metadaten-Scan im `FeatureStoreReader`, läuft im Worker-Thread und wird gecacht) liefert additiv ein Payload-Attribut `source_modes: [...]` (distinct, case-original, leer = keine Modi vorhanden) sowie ein Flag `has_source_mode_services: bool`.
+* SQL: `SELECT DISTINCT json_extract_string(feature_data, '$.source_mode') ... WHERE <gleiche Filter wie Metadaten-Scan> AND json_extract_string(feature_data, '$.source_mode') IS NOT NULL` (Wanduhr/Zeitfilter unkritisch – Metadaten-Scan ist ohnehin zeitlich ungefiltert).
+* Das HeatmapWidget befüllt `_combo_mode_filter` aus diesem Attribut (blockSignals, `_syncing`-Guard) – kein separater DB-Zugriff im UI-Thread (Grundsatz 4/MVVM).
+
+4. **Keine Kaskadierung auf das 'Feld'-Dropdown (Entscheidung 3):** `_rebuild_field_dropdown` bleibt unverändert; die `field_pairs`-Logik (21.03.16) und der Mode-Filter wirken unabhängig voneinander als UND-Bedingungen.
+
+5. **ViewModel- & Profil-Persistenz:**
+Der gewählte `service_mode` wird im `AnalyticsViewModel` (`_params`, Default `"all"`) verwaltet und additiv in der `sources`-Sektion des Profil-Payloads persistiert/restauriert (Muster `sort_mode`, 21.03.14). Der Restore erfolgt automatisch über die generische Key-Schleife in `_restore_params_from_payload` (Replace-Semantik, B3-2).
+
+---
+
+## 🛠️ 4. Schritt-für-Schritt Umsetzungsanleitung für die IDE
+
+### Schritt 1: ViewModel-Erweiterung (`analytics/engine/analytics_view_model.py`)
+
+1. **Parameter `service_mode` hinzufügen:** In `_params` den Default `"all"` hinterlegen:
+
+# analytics/engine/analytics_view_model.py
+self._params["service_mode"] = "all"
+
+2. **Setter-Methode `set_service_mode` implementieren (GLOBALER Refresh):**
+
+# analytics/engine/analytics_view_model.py
+def set_service_mode(self, mode: str) -> None:
+    """Setzt den Modus-Filter (z. B. 'MA_Peak_Hysteresis' oder 'all').
+
+    Global: Der Filter wirkt auf Tabelle, beide Heatmaps, Scatter und
+    Verteilung (Entscheidung 1). QUERY_FEATURES wird mitrefreshed, damit
+    die dynamische Modus-Liste / das Deaktivierungs-Flag (has_source_mode_
+    services) synchron zur Auswahl bleibt.
+    """
+    mode = str(mode or "all").strip()
+    if mode == self._params.get("service_mode"):
+        return
+    self._params["service_mode"] = mode
+    self._mark_dirty()
+    self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                   QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                   QUERY_DISTRIBUTION))
+
+3. **In `_current_params()` durchreichen – für ALLE Query-Kinds (global):**
+
+# analytics/engine/analytics_view_model.py (in _current_params, Basis-Dict)
+base["service_mode"] = p.get("service_mode", "all")
+
+4. **Persistenz (`_current_payload`), Sektion `sources` – additiv:**
+
+# analytics/engine/analytics_view_model.py (in _current_payload, sources)
+"service_mode": p.get("service_mode"),
+
+   (Restore läuft automatisch über `_restore_params_from_payload`, sobald der Key im Payload steht – kein Sonderfall.)
+
+### Schritt 2: Reader-SQL-Filterung (`analytics/engine/feature_store_reader.py`)
+
+1. **SQL-Helper für `source_mode` hinzufügen:**
+
+# analytics/engine/feature_store_reader.py
+@staticmethod
+def _apply_mode_filter(service_mode: Optional[str], conditions: List[str], params: List[Any]) -> None:
+    if not service_mode or str(service_mode).lower() in ("all", "alle", ""):
+        return
+    conditions.append("LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)")
+    params.append(str(service_mode).strip())
+
+2. **In ALLEN 4 Daten-Pfaden aufrufen (global, Entscheidung 1):**
+
+# analytics/engine/feature_store_reader.py (in fetch_rows / fetch_columns /
+# fetch_heatmap / fetch_generic_heatmap, jeweils nach _apply_field_pair_filter/
+# _apply_time_range)
+self._apply_mode_filter(service_mode, conditions, params)
+
+   Dafür bekommen alle 4 Methoden einen neuen Parameter `service_mode: Optional[str] = None`.
+
+3. **Dynamischer Modus-Scan (Performance-Lösung, Entscheidung 2) – im `QUERY_FEATURES`-Leichtpfad:**
+
+# analytics/engine/feature_store_reader.py
+def fetch_available_source_modes(self, symbol, timeframe, feature_ids=None,
+                                 instance_hashes=None) -> Dict[str, Any]:
+    """DISTINCT source_mode-Werte (case-original) + Has-Flag für das
+    Modus-Dropdown. Kein separater DB-Roundtrip: wird im bestehenden
+    QUERY_FEATURES-Metadaten-Scan (Worker-Thread, gecacht) mitgeliefert.
+    """
+    # SELECT DISTINCT json_extract_string(feature_data, '$.source_mode')
+    #   FROM feature_store
+    #  WHERE <feature_ids/instance_hashes-Filter wie _apply_feature_filter>
+    #    AND json_extract_string(feature_data, '$.source_mode') IS NOT NULL
+    # return {"source_modes": [...], "has_source_mode_services": bool}
+
+   Integration: `AnalyticsRepository` (QUERY_FEATURES-Pfad bzw. `_field_metadata`) ruft den Scan auf und hängt `source_modes` + `has_source_mode_services` an den Payload. Leere Liste = kein Service mit `source_mode` → UI deaktiviert das Dropdown (Entscheidung 4).
+
+### Schritt 3: Worker- & Repository-Durchreichung (Threading-Kette, Entscheidung 5)
+
+1. **`analytics/engine/analytics_worker.py` (`_execute`):** `service_mode = p.get("service_mode")` einmalig lesen und an **alle 5** Repo-Methoden übergeben:
+   `get_table(..., service_mode=service_mode)`, `get_heatmap(...)`, `get_generic_heatmap(...)`, `get_scatter(...)`, `get_distribution(...)`.
+2. **`analytics/engine/analytics_repository.py`:** Alle 5 Methoden erhalten `service_mode: Optional[str] = None` und reichen ihn an den Reader durch. Der `QUERY_FEATURES`-Pfad liefert zusätzlich `source_modes`/`has_source_mode_services` aus Schritt 2.3.
+
+### Schritt 4: UI-Integration (`analytics/ui/heatmap_widget.py`)
+
+1. **Dropdown in `__init__` anlegen und im Layout platzieren:**
+
+# analytics/ui/heatmap_widget.py
+self._combo_mode_filter = QComboBox()
+self._combo_mode_filter.setMinimumWidth(150)
+self._combo_mode_filter.addItem("Alle Modi", "all")
+self._combo_mode_filter.setEnabled(False)  # bis zum ersten Payload mit Modi
+
+# In Layout ctrl2 zwischen _combo_agg und _combo_field einfügen:
+ctrl2.addWidget(QLabel("Modus:"))
+ctrl2.addWidget(self._combo_mode_filter)
+
+2. **Event-Verbindung & Sync:**
+
+# analytics/ui/heatmap_widget.py
+self._combo_mode_filter.currentIndexChanged.connect(self._on_mode_filter_changed)
+
+def _on_mode_filter_changed(self) -> None:
+    if self._syncing or self._view_model is None:
+        return
+    mode = str(self._combo_mode_filter.currentData() or "all")
+    self._view_model.set_service_mode(mode)
+
+3. **Dynamische Befüllung + Deaktivierung aus dem Payload (Entscheidungen 2 + 4):**
+   Bei eingehendem Payload (in der bestehenden `_apply_payload`-Kette, analog `_rebuild_field_dropdown`):
+   * `source_modes` aus dem Payload lesen; Combo unter `blockSignals`/`_syncing` neu befüllen (`[ Alle Modi ]` + Modi, Item-Data = case-originaler Wert).
+   * `has_source_mode_services == False` → `_combo_mode_filter.setEnabled(False)` und auf `"all"` zurücksetzen (kein stiller Filter); sonst `setEnabled(True)`.
+   * Restore: In der VM-Sync-Methode (Muster `_sync_controls_from_vm` bzw. `_on_params_restored`) wird der Combo-Index aus `vm.params["service_mode"]` gesetzt (blockSignals) – Profil-/Workspace-Restore.
+   * Entfernen veralteter Modi (nicht mehr im Payload) bei jedem Rebuild – keine verwaisten Auswahlwerte.
+
+### Schritt 5: Keine Änderungen (bewusst)
+
+* **Keine Kaskadierung auf `_rebuild_field_dropdown`** (Entscheidung 3 – nur SQL-Filterung).
+* **`analytics/ui/analytics_win.py`:** nur falls der Profil-/Workspace-Restore den Combo-Zustand außerhalb der VM-Params synchronisieren muss (Muster `_sync_mtf_bar_from_params`) – voraussichtlich nicht nötig, da das HeatmapWidget die Combo direkt aus `vm.params` restauriert.
+
+---
+
+## 📊 5. Akzeptanzkriterien für die Validierung (`test/test.py`)
+
+1. **Modus-Filter-SQL-Test (global):** `fetch_generic_heatmap(..., service_mode="MA_Peak_Hysteresis")` UND `fetch_rows`/`fetch_columns`/`fetch_heatmap` erzeugen in der SQL-WHERE-Klausel den Ausdruck `LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)` mit Parameter `'MA_Peak_Hysteresis'` und filtern abweichende Modi aus (`"all"`/None/leer = kein Filter).
+2. **ViewModel-State-Test:** `set_service_mode("ZigZag_ATR")` setzt das Dirty-Flag, aktualisiert `_params["service_mode"]` und stößt die Datenabfragen neu an – Refresh-Liste enthält `QUERY_FEATURES`, `QUERY_TABLE`, `QUERY_HEATMAP`, `QUERY_HEATMAP_GENERIC`, `QUERY_SCATTER`, `QUERY_DISTRIBUTION` (global, Entscheidung 1).
+3. **Threading-Ketten-Test:** `_current_params` → Worker → alle 5 Repo-Methoden → alle 4 Reader-Pfade – `service_mode` erreicht jede Query (Entscheidung 5).
+4. **Metadaten-Scan-Test (Performance-Lösung):** `QUERY_FEATURES`-Payload enthält `source_modes` (distinct, case-original, ohne NULL) und `has_source_mode_services`; der Scan wird **ohne** separaten Roundtrip im bestehenden Metadaten-Scan-Pfad geliefert (Entscheidung 2).
+5. **Deaktivierungs-Test (Entscheidung 4):** `feature_ids` ausschließlich mit Services ohne `source_mode` (z. B. `srv_grid_lines`) → `has_source_mode_services == False` → Combo disabled + auf `"all"` zurückgesetzt; mit `source_mode`-Service → enabled.
+6. **Persistenz-Test:** `sources.service_mode` im Profil-Payload-Roundtrip; `_restore_params_from_payload` stellt `"all"`-Default bzw. gespeicherten Modus korrekt wieder her.
+7. **Leerer-Modus-Ergebnis-Test:** Gewählter Modus, der in den aktiven Services nicht vorkommt → leere Matrix/Tabelle (0/NaN), kein Crash, keine Fehlermeldung.
+
+## 📁 6. Dateien (Übersicht)
+
+| Datei | Art | Inhalt |
+| --- | --- | --- |
+| `analytics/engine/analytics_view_model.py` | geändert | `service_mode`-Param + Setter (globaler Refresh) + `_current_params` + `_current_payload` (sources) |
+| `analytics/engine/analytics_worker.py` | geändert | Durchreichung `service_mode` an alle 5 Repo-Methoden |
+| `analytics/engine/analytics_repository.py` | geändert | `service_mode`-Parameter an 5 Methoden; `source_modes`/`has_source_mode_services` im QUERY_FEATURES-Pfad |
+| `analytics/engine/feature_store_reader.py` | geändert | `_apply_mode_filter` + `service_mode`-Param an 4 Reader-Pfade + `fetch_available_source_modes` |
+| `analytics/ui/heatmap_widget.py` | geändert | `_combo_mode_filter` (Layout, Signal, Payload-Befüllung, Deaktivierung, Restore) |
+| `analytics/ui/analytics_win.py` | ggf. geändert | nur falls Restore den Combo außerhalb der VM-Params braucht (voraussichtlich nicht) |
+
+## ✅ Verifikations-Rahmen (Grundsatz 2)
+
+- Headless: `py_compile` aller geänderten Dateien; Logik-/DB-Tests in `test/` (temporäre `*.duckdb` nur in `test/`, danach Cleanup).
+- Keine UI-/Regressionstests (harte Regel). UI-Verhalten (Dropdown-Sichtbarkeit/Deaktivierung) per Code-Inspektion + manueller Anwender-Prüfung.
+- Implementierungs-Log: Eintrag 21.03.20 in `docs/AKTUELLE_UMSETZUNG.md` nach Anwender-Bestätigung.
+
