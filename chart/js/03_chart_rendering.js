@@ -209,17 +209,29 @@ function renderLineSeries(linesArray) {
         var line = data[m];
         if (!line || !line.id || !line.data) continue;
         var series = _activeLineSeries[line.id];
+        // 22.01g (Bugfix 2): lineType 'withGaps' – LWC-v5-Default 'Simple'
+        // verbindet auch null-Punkte (verbindet zwei SL-Striche diagonal).
+        // Mit WithGaps erzeugt ein {time, value: null}-Punkt eine ECHTE
+        // Luecke: die SL-Striche bleiben isolierte waagerechte Segmente.
+        // 22.01g (Bugfix 1): no_autoscale=true (SL-Serien) nimmt die Serie
+        // aus der Preisskalen-Autoscale -> Toggle On/Off verschiebt die
+        // Skala nicht mehr (Indikator additiv, Grafik bleibt stehen).
+        var opts = {
+            lineWidth: (line.width && line.width > 0) ? line.width : 1,
+            lineStyle: _lwcLineStyle(line.style),
+            lineType: LightweightCharts.LineType.WithGaps,
+            color: line.color || '#26A69A',
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            priceScaleId: 'right'
+        };
+        if (line.no_autoscale) {
+            opts.autoscaleInfoProvider = function() { return null; };
+        }
         if (!series) {
             try {
-                series = chart.addSeries(LightweightCharts.LineSeries, {
-                    lineWidth: (line.width && line.width > 0) ? line.width : 1,
-                    lineStyle: _lwcLineStyle(line.style),
-                    color: line.color || '#26A69A',
-                    lastValueVisible: false,
-                    priceLineVisible: false,
-                    crosshairMarkerVisible: false,
-                    priceScaleId: 'right'
-                });
+                series = chart.addSeries(LightweightCharts.LineSeries, opts);
                 _activeLineSeries[line.id] = series;
             } catch(e) { continue; }
         }
@@ -230,6 +242,7 @@ function renderLineSeries(linesArray) {
             series.applyOptions({
                 lineWidth: (line.width && line.width > 0) ? line.width : 1,
                 lineStyle: _lwcLineStyle(line.style),
+                lineType: LightweightCharts.LineType.WithGaps,
                 color: line.color || '#26A69A'
             });
         } catch(e) {}

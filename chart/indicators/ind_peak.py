@@ -615,6 +615,11 @@ class IndPeak(BaseIndicator):
                 return [{
                     "id": line_id, "data": data,
                     "width": 1, "style": "solid", "title": title,
+                    # 22.01g (Bugfix 1): SL-Serien nehmen NICHT an der
+                    # Preisskalen-Autoscale teil (no_autoscale -> JS setzt
+                    # autoscaleInfoProvider:null). Dadurch bleibt die Skala
+                    # beim On/Off-Toggle unveraendert (Indikator additiv).
+                    "no_autoscale": True,
                 }]
 
             if p.get("show_sl_high", True):
@@ -629,14 +634,51 @@ class IndPeak(BaseIndicator):
             # Trigger-Dreiecke aus srv_peak_grabber (hit_circles-Format, damit
             # die generische Render-Pipeline sie zeichnet - User-Anweisung 3:
             # KEINE Kreise, Orderpunkt = Dreieck ueber/unter der Bar).
+            # 22.01g (Bugfix 3+4): Der Orderpunkt sitzt ~0,15% ueber/unter
+            # der TRIGGER-BAR (nicht bei den Rolling-Fenster-Extrema
+            # peak_high/peak_low - die liegen bei SILVER oft >5$ daneben und
+            # auf M5 ausserhalb der sichtbaren Skala). Preis = Bar-High/Low
+            # der Trigger-Bar (aus df) * (1 ± sl_offset_pct/100).
             hit_circles: List[Dict[str, Any]] = []
+            # Bar-Preise (reale Epochs) fuer die Orderpunkt-Positionierung.
+            bar_ohlc: Dict[int, Tuple[float, float]] = {}
+            try:
+                for _t, _h, _l in zip(df["time"], df["high"], df["low"]):
+                    bar_ohlc[int(_t)] = (float(_h), float(_l))
+            except Exception:
+                pass
+            sl_off = float(p.get("sl_offset_pct", 0.15)) / 100.0
+
+            def _order_price(bt: int, side: str) -> float:
+                """Bar-basierter Orderpunkt: SELL ueber der Bar (High +
+                Offset), BUY unter der Bar (Low - Offset). Fallback auf die
+                persistierten Peak-Preise, falls die Bar nicht im df liegt."""
+                bar = bar_ohlc.get(bt)
+                if side == "SELL" and bar is not None:
+                    return bar[0] * (1.0 + sl_off)
+                if side == "BUY" and bar is not None:
+                    return bar[1] * (1.0 - sl_off)
+                if side == "SELL":
+                    return float(grabber_map.get(bt, {}).get(
+                        "peak_high") or 0.0)
+                return float(grabber_map.get(bt, {}).get(
+                    "peak_low") or 0.0)
+
+            grabber_map: Dict[int, Dict[str, Any]] = {}
+            for r in grabber_recs:
+                try:
+                    grabber_map[int(r["bar_time"])] = r
+                except (TypeError, ValueError, KeyError):
+                    continue
+
             if p.get("show_signals", True):
                 for r in grabber_recs:
                     sig = int(r.get("signal") or 0)
+                    bt = int(r["bar_time"])
                     if sig == 1:  # BUY_TRIGGER -> Dreieck unter der Bar
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_low") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, "BUY"),
                             "color": "#26A69A",
                             "shape": "arrowUp",
                             "size": 2,
@@ -644,18 +686,18 @@ class IndPeak(BaseIndicator):
                         })
                     elif sig == -1:  # SELL_TRIGGER -> Dreieck ueber der Bar
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_high") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, "SELL"),
                             "color": "#EF5350",
                             "shape": "arrowDown",
                             "size": 2,
                             "priority": 8,
                         })
                     elif p.get("show_updates", False):
+                        side = "SELL" if sig == -2 else "BUY"
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_high")
-                                           or r.get("peak_low") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, side),
                             "color": "#90A4AE",
                             "shape": "circle",
                             "size": 1,
@@ -856,6 +898,11 @@ class IndPeak(BaseIndicator):
         Dreieck ueber/unter der aktuellen Bar (arrowDown=SELL / arrowUp=BUY).
         Proximity-Circles und Grid-Lines sind reine Berechnungshilfen und
         werden nie gezeichnet. Deaktivierter Grabber -> leere Overlays.
+
+        22.01g (Bugfix 3): Der Orderpunkt sitzt ~0,15% UEBER/UNTER der Bar
+        (entry_price der Trigger-Bar * (1 ± sl_offset_pct/100)) statt beim
+        Rolling-Fenster-Extremum trig.peak_price - das lag bei SILVER bis zu
+        30$ ueber der Bar und sprengte die sichtbare Skala.
         """
         records = self.update_live_candle(candle)
         if self._live_state is None or not self._live_state.is_btn_active:
@@ -872,18 +919,32 @@ class IndPeak(BaseIndicator):
         if trig is None:
             return []
         ts = self._last_live_trigger_ts or int(candle.get("time", 0))
+        try:
+            sl_off = float((self._last_params or {}).get(
+                "sl_offset_pct", 0.15)) / 100.0
+        except (TypeError, ValueError):
+            sl_off = 0.0015
+        # Bar-basierter Orderpunkt (Entry-Preis der Trigger-Bar + Offset).
+        try:
+            base = float(trig.entry_price or trig.peak_price)
+        except (TypeError, ValueError):
+            base = float(trig.peak_price or 0.0)
+        if trig.direction == SignalDirection.SELL:
+            price = base * (1.0 + sl_off)
+        else:
+            price = base * (1.0 - sl_off)
         if trig.direction == SignalDirection.SELL:
             return [{
                 "kind": "circle", "layer": self.indicator_id,
                 "time": ts,
-                "price": float(trig.peak_price),
+                "price": price,
                 "color": "#EF5350", "shape": "arrowDown",
                 "size": 2, "priority": 10,
             }]
         return [{
             "kind": "circle", "layer": self.indicator_id,
             "time": ts,
-            "price": float(trig.peak_price),
+            "price": price,
             "color": "#26A69A", "shape": "arrowUp",
             "size": 2, "priority": 10,
         }]

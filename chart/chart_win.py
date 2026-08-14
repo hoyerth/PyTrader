@@ -479,6 +479,10 @@ class PyTraderChartWindow(QMainWindow):
         if OrderPreviewDialog is not None:
             event_bus.grabber_event.connect(self._on_grabber_event)
         self.update_indicator_button_style()
+        # 22.01f: PK-Button + Plugin-Zustand aus dem geladenen indicators_state
+        # synchronisieren - sonst zeigt der Button false, waehrend die DB
+        # ind_peak.active=true hat und SL-Linien/Marker gezeichnet werden.
+        self._sync_peak_button_from_state()
 
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
@@ -580,15 +584,47 @@ class PyTraderChartWindow(QMainWindow):
                 except Exception as e:
                     print(f"WARN [chart_win] set_button_active fehlgeschlagen: {e}")
 
-    # 22.01c (Bugfix 3): Live-Trigger (grabber_event, vom Peak-Indikator via
+        # 22.01f (Bugfix): indicators_state['ind_peak']['active'] ist die
+        # Single Source of Truth fuer das RENDERING (_collect_render_payload
+        # ruft ind_peak.calculate() nur bei active=True auf). Der Grabber-
+        # Button war davon entkoppelt (eigener toggled-Pfad), daher wurden
+        # SL-Linien/Marker gezeichnet, obwohl der PK-Button AUS war (DB sagte
+        # active=true, Button sagte false). Hier wird der State nachgezogen,
+        # persistiert und der Chart neu gerendert - Button und Zeichnung sind
+        # damit immer konsistent.
+        st = self.indicators_state.setdefault("ind_peak", {
+            "active": False, "preset": "Default", "params": {}
+        })
+        if bool(st.get("active")) != active:
+            st["active"] = active
+            self.save_state()
+            if self.df_data is not None and not self.df_data.empty:
+                self.render_indicators()
+
+        # 22.01c (Bugfix 3): Live-Trigger (grabber_event, vom Peak-Indikator via
     # ind_peak.update_live_candle emittiert) -> Order-Vorschau im CHART.
     # Lazy Singleton: mehrere Trigger kurz nacheinander aktualisieren denselben
     # Dialog (kein Doppel-Fenster, kein Crash - das erste Fenster bleibt offen).
     # MVVM: keine Order-Platzierung und kein SQL hier (Persistenz uebernimmt der
     # Grabber-Konsument vor dem Emit).
+    # 22.01g (Bugfix 5): NUR EIN Orderfenster pro BAR - mehrere Trigger/
+    # Updates derselben Bar (Live-Ticks) werden unterdrueckt. Ohne das Gate
+    # oeffnete der Dialog bei jedem M5-Tick hintereinander (Orderfenster-
+    # Flut, Grafikeinfrieren durch Event-Storm).
     def _on_grabber_event(self, record: object) -> None:
         if OrderPreviewDialog is None:
             return
+        try:
+            ts = int(record.timestamp.timestamp())
+        except (AttributeError, TypeError, ValueError):
+            ts = 0
+        if ts:
+            from db_service import TF_SECONDS_MAP
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf or "").upper(), 60)
+            bar_key = ts - (ts % t_sec)
+            if getattr(self, "_last_grabber_bar_key", None) == bar_key:
+                return  # gleiche Bar -> kein weiteres Fenster
+            self._last_grabber_bar_key = bar_key
         if not hasattr(self, "_order_preview") or self._order_preview is None:
             self._order_preview = OrderPreviewDialog(self)
         try:
@@ -618,6 +654,29 @@ class PyTraderChartWindow(QMainWindow):
         self.btn_peak_grabber.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; "
             f"border-radius: 4px; padding: 3px 10px;")
+
+    # 22.01f (Bugfix "Linien trotz ausgeschalteter Indikatoren"): Synchronisiert
+    # den PK-Button und den Plugin-Button-Zustand (IndPeak._btn_active) aus
+    # indicators_state. indicators_state['ind_peak']['active'] ist die Single
+    # Source of Truth fuer das RENDERING (_collect_render_payload). Vorher war
+    # der Button davon entkoppelt (eigener toggled-Pfad): Die DB sagte
+    # active=true, der Button zeigte false -> SL-Linien/Marker wurden
+    # gezeichnet, obwohl der Grabber optisch AUS war.
+    def _sync_peak_button_from_state(self) -> None:
+        st = self.indicators_state.get("ind_peak") or {}
+        active = bool(st.get("active", False))
+        if self.btn_peak_grabber is not None and self.btn_peak_grabber.isChecked() != active:
+            self.btn_peak_grabber.blockSignals(True)
+            self.btn_peak_grabber.setChecked(active)
+            self.btn_peak_grabber.blockSignals(False)
+        plugin = self.indicators.get("ind_peak")
+        setter = getattr(plugin, "set_button_active", None)
+        if callable(setter):
+            try:
+                setter(active)
+            except Exception:
+                pass
+        self._apply_peak_grabber_button_style()
 
     def toggle_fixed_grid_proximity_lines(self):
         """Schaltet den Plugin-Indikator ('Ind_FixedGridProximity') an/aus."""
@@ -793,6 +852,11 @@ class PyTraderChartWindow(QMainWindow):
                 "preset": preset,
                 "params": dict(payload or {}),
             }
+        # 22.01f: Der ind_peak-Einstellungs-Dialog setzt active=True - PK-Button
+        # und Plugin-Zustand synchron halten, damit Button und Zeichnung
+        # konsistent sind (Bugfix "Linien trotz ausgeschalteter Indikatoren").
+        if ind_id == "ind_peak":
+            self._sync_peak_button_from_state()
         self.save_state()
         self.render_indicators()
 
@@ -1578,9 +1642,9 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
-                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Phase 15 (U15-B4): Alt-'grid'-Eintraege beim Symbol/TF-
                     # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
-                    # Instanz mehr, erhält kein Set).
+                    # Instanz mehr, erhaelt kein Set).
                     self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
@@ -1596,6 +1660,12 @@ class PyTraderChartWindow(QMainWindow):
 
             # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
             # keine signal_results-Writes mehr, keine Signal-Marker.
+            # 22.01f: PK-Button aus dem (gemergten) indicators_state des neuen
+            # Symbol:TF synchronisieren - der Chart rendert ind_peak nur, wenn
+            # Button UND State uebereinstimmen (Bugfix "Linien trotz aus").
+            self._sync_peak_button_from_state()
+            # 22.01g (Bugfix 5): Bar-Gate zuruecksetzen (neuer Symbol-Kontext).
+            self._last_grabber_bar_key = None
             self.refresh_chart_data()
 
     def on_tf_changed(self, t):
@@ -1620,9 +1690,9 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
-                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Phase 15 (U15-B4): Alt-'grid'-Eintraege beim Symbol/TF-
                     # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
-                    # Instanz mehr, erhält kein Set).
+                    # Instanz mehr, erhaelt kein Set).
                     self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
@@ -1638,8 +1708,13 @@ class PyTraderChartWindow(QMainWindow):
 
             # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
             # keine signal_results-Writes mehr, keine Signal-Marker.
+            # 22.01f: PK-Button aus dem (gemergten) indicators_state des neuen
+            # Symbol:TF synchronisieren - der Chart rendert ind_peak nur, wenn
+            # Button UND State uebereinstimmen (Bugfix "Linien trotz aus").
+            self._sync_peak_button_from_state()
+            # 22.01g (Bugfix 5): Bar-Gate zuruecksetzen (neuer TF-Kontext).
+            self._last_grabber_bar_key = None
             self.refresh_chart_data()
-
     def fit_chart(self):
         try:
             self.visible_from = self.visible_to = None
