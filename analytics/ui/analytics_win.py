@@ -60,6 +60,7 @@ from analytics.ui.heatmap_page import HeatmapPage
 from analytics.ui.scatter_page import ScatterPage
 from analytics.ui.distribution_page import DistributionPage
 from analytics.ui.equity_page import EquityPage
+from analytics.ui.order_preview_dialog import OrderPreviewDialog
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
@@ -366,6 +367,16 @@ class AnalyticsWindow(PersistentWindow):
             "color: #c62828; font-weight: bold;")
         self.label_missing_warning.setVisible(False)
         filt.addWidget(self.label_missing_warning)
+        # 22.01 (14.08.2026): Peak-Grabber (Frage 5) - Toggle-Button.
+        # Das ChartWindow schaltet ueber event_bus.grabber_toggle den
+        # ind_peak-Indikator (Trigger/Updates im Yellow Window).
+        self.btn_grabber_peak = QPushButton("🎯 Peak Grabber", self)
+        self.btn_grabber_peak.setCheckable(True)
+        self.btn_grabber_peak.setToolTip(
+            "Aktiviert den Peak-Grabber (Trigger/Updates im "
+            "Yellow Window). An/Aus wird an das ChartWindow "
+            "weitergeleitet (EventBus, IoC).")
+        filt.addWidget(self.btn_grabber_peak)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -719,6 +730,29 @@ class AnalyticsWindow(PersistentWindow):
         # Filterleisten-Zustand aus den VM-Params initial synchronisieren
         # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
         self._sync_mtf_bar_from_params()
+        # 22.01 (14.08.2026): Peak-Grabber (Frage 5) - Toggle-Bindung
+        # und Grabber-Event (IoC via EventBus, kein Direct-Call).
+        self.btn_grabber_peak.toggled.connect(self._on_grabber_toggled)
+        event_bus.grabber_event.connect(self._on_grabber_event)
+
+    # 22.01 (14.08.2026): Peak-Grabber - Button-Toggle -> EventBus.
+    # Das Payload traegt die REALEN Combo-Werte (combo_symbol/combo_tf),
+    # damit das ChartWindow den Indikator korrekt schalten kann.
+    def _on_grabber_toggled(self, checked: bool) -> None:
+        payload = {
+            "active": bool(checked),
+            "symbol": self.combo_symbol.currentText() or "SILVER",
+            "timeframe": self.combo_tf.currentText() or "M1",
+        }
+        event_bus.grabber_toggle.emit(payload)
+
+    # 22.01 (14.08.2026): Ein GrabberResultRecord ist fertig - die
+    # Order-Vorschau oeffnen (lazy Singleton, MVVM: keine SQL-Persistenz
+    # hier, die uebernimmt das ChartWindow/GrabberRepository vor dem Emit).
+    def _on_grabber_event(self, record: object) -> None:
+        if not hasattr(self, "_order_preview"):
+            self._order_preview = OrderPreviewDialog(self)
+        self._order_preview.show_record(record)
 
     @Slot()
     def _on_service_set_changed(self) -> None:

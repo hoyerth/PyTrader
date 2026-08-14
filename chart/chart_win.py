@@ -37,11 +37,13 @@ try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
     from chart.indicators.ind_moving_averages import MultiMovingAverageIndicator
+    from chart.indicators.ind_peak import IndPeak
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
     from indicators.ind_moving_averages import MultiMovingAverageIndicator
+    from indicators.ind_peak import IndPeak
     from indicator_dialog import IndicatorSettingsDialog
 
 # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
@@ -255,6 +257,9 @@ class PyTraderChartWindow(QMainWindow):
         self.indicators: Dict[str, BaseIndicator] = {
             "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
             "ind_moving_averages": MultiMovingAverageIndicator(),
+            # 22.01: Peak-Grabber (live) - set_button_active-Hook via
+            # grabber_toggle (IoC, §9.3).
+            "ind_peak": IndPeak(),
         }
         # Phase 13 Schritt 6: Neuer Close im Ind_FixedGridProximity-Indikator → NUR ein
         # debounced Refresh (Cache-Neuaufbau), nicht bei jedem Tick.
@@ -405,6 +410,8 @@ class PyTraderChartWindow(QMainWindow):
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
         # Phase 16.05 (D1): Multi-MA-Button (btn_indicator_ma, Text "MA").
         self.btn_indicator_ma = self.ui_widget.findChild(QPushButton, "btn_indicator_ma")
+        # 22.01 (14.08.2026): Peak-Grabber-Button (btn_peak_grabber, Text "PK").
+        self.btn_peak_grabber = self.ui_widget.findChild(QPushButton, "btn_peak_grabber")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
         if self.symbol_combo:
@@ -447,6 +454,18 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_ma.setCheckable(True)
             self.btn_indicator_ma.clicked.connect(self.toggle_moving_averages)
             self.btn_indicator_ma.installEventFilter(self)
+        # 22.01 (14.08.2026): Peak-Grabber-Button (btn_peak_grabber, §9.5).
+        # Eigener aufrufender Button im ChartWindow - emittiert denselben
+        # grabber_toggle-Payload wie der AnalyticsWindow-Button (§9.2).
+        if self.btn_peak_grabber is not None:
+            self.btn_peak_grabber.setCheckable(True)
+            self.btn_peak_grabber.toggled.connect(self._on_peak_grabber_toggled)
+            self.btn_peak_grabber.installEventFilter(self)  # Rechtsklick -> Einstellungen
+            self._apply_peak_grabber_button_style()
+        # 22.01 (§9.3): Subscription auf grabber_toggle - generisches Routing
+        # an alle Indikatoren mit set_button_active-Hook (IoC, kein
+        # Indikator-Sonderfall, kein `if ind_id == ...`-Branch).
+        event_bus.grabber_toggle.connect(self._on_grabber_toggle)
         self.update_indicator_button_style()
 
         self.web_view = QWebEngineView()
@@ -481,6 +500,8 @@ class PyTraderChartWindow(QMainWindow):
             for button, ind_id in (
                 (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
                 (self.btn_indicator_ma, "ind_moving_averages"),
+                # 22.01: Peak-Grabber-Button -> ind_peak-Einstellungen.
+                (self.btn_peak_grabber, "ind_peak"),
             ):
                 if button is not None and watched == button:
                     self._toggle_settings_dialog(ind_id)
@@ -506,6 +527,8 @@ class PyTraderChartWindow(QMainWindow):
         for button, ind_id in (
             (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
             (self.btn_indicator_ma, "ind_moving_averages"),
+            # 22.01: Peak-Grabber-Button (eigene Akzentfarbe §9.5 §2C).
+            (self.btn_peak_grabber, "ind_peak"),
         ):
             self._apply_indicator_button_style(button, ind_id)
 
@@ -513,10 +536,60 @@ class PyTraderChartWindow(QMainWindow):
         """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
         if button is None:
             return
+        # 22.01 (§9.5 §2C): Der Peak-Grabber-Button nutzt eine eigene
+        # Akzentfarbe (#e65100) statt des Indikator-Gruen (#2e7d32).
+        if ind_id == "ind_peak":
+            self._apply_peak_grabber_button_style()
+            return
         is_active = self.indicators_state.get(ind_id, {}).get("active", False)
         color = "#2e7d32" if is_active else "#37474f"
         button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
+
+    # 22.01 (§9.3): Reicht den Grabber-Zustand (active) an alle
+    # Indikatoren mit set_button_active weiter (Open/Closed - neue
+    # Indikatoren brauchen keinen chart_win-Branch). symbol/timeframe
+    # des Payloads dienen optional der Kontext-Pruefung.
+    def _on_grabber_toggle(self, payload: Dict[str, Any]) -> None:
+        active = bool((payload or {}).get("active", False))
+        # 9.5: Eigener ChartButton bleibt synchron (blockSignals gegen
+        # Rekursion, da der Button selbst grabber_toggle emittiert).
+        if self.btn_peak_grabber is not None and self.btn_peak_grabber.isChecked() != active:
+            self.btn_peak_grabber.blockSignals(True)
+            self.btn_peak_grabber.setChecked(active)
+            self.btn_peak_grabber.blockSignals(False)
+            self._apply_peak_grabber_button_style()
+        # _get_active_plugins() existiert nicht -> self.indicators.
+        for plugin in self.indicators.values():
+            setter = getattr(plugin, "set_button_active", None)
+            if callable(setter):
+                try:
+                    setter(active)
+                except Exception as e:
+                    print(f"WARN [chart_win] set_button_active fehlgeschlagen: {e}")
+
+    # 22.01 (§9.5 §2B): ChartButton -> EventBus. Gleicher Payload wie
+    # AnalyticsWindow-Button (§9.2); chart_win subscribed selbst (§9.3)
+    # -> generischer Routing-Pfad. Kein Loop: set_button_active
+    # emittiert nicht zurueck.
+    def _on_peak_grabber_toggled(self, active: bool) -> None:
+        event_bus.grabber_toggle.emit({
+            "active": bool(active),
+            "symbol": str(self.current_symbol or ""),
+            "timeframe": str(self.current_tf or ""),
+        })
+        self._apply_peak_grabber_button_style()
+
+    # 22.01 (§9.5 §2C): Eigene Styling-Methode + eigene Akzentfarbe
+    # (Grabber-Modus != Indikator-An/Aus), Zustand sofort sichtbar.
+    def _apply_peak_grabber_button_style(self) -> None:
+        if self.btn_peak_grabber is None:
+            return
+        active = self.btn_peak_grabber.isChecked()
+        color = "#e65100" if active else "#37474f"  # tiefes Orange = aktiv
+        self.btn_peak_grabber.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; "
+            f"border-radius: 4px; padding: 3px 10px;")
 
     def toggle_fixed_grid_proximity_lines(self):
         """Schaltet den Plugin-Indikator ('Ind_FixedGridProximity') an/aus."""

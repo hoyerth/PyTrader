@@ -230,6 +230,34 @@
            </property>
           </widget>
          </item>
+         <item>
+          <widget class="QPushButton" name="btn_peak_grabber">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Peak Grabber (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
+           </property>
+           <property name="text">
+            <string>PK</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </item>
        <item>

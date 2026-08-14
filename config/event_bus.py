@@ -54,6 +54,16 @@ class EventBus(QObject):
     service_run_started = Signal()
     service_run_finished = Signal()
 
+    # 22.01 (14.08.2026): Peak-Grabber (Frage 5). Der AnalyticsWindow-Button
+    # emittiert grabber_toggle(dict) mit {"active", "symbol", "timeframe"} –
+    # chart_win subscribed und ruft generisch set_button_active(active) auf
+    # allen Indikatoren mit diesem Hook auf (IoC). Live-Trigger/-Updates
+    # emittieren grabber_event(GrabberResultRecord) – das AnalyticsWindow
+    # persistiert über GrabberRepository und öffnet die OrderPreviewDialog
+    # (UI ohne SQL, MVVM).
+    grabber_toggle = Signal(dict)
+    grabber_event = Signal(object)
+
     _instance: ClassVar[Optional["EventBus"]] = None
 
     def __init__(self) -> None:
