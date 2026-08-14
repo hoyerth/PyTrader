@@ -301,9 +301,14 @@ _PEAK_SCHEMA: Dict[str, Dict[str, Any]] = {
 
 
 class IndPeak(BaseIndicator):
-    """Peak-Grabber-Indikator: SL-Linien + Trigger-Marker (Hist & Live)."""
+    """Peak-Grabber-Indikator: SL-Linien + Trigger-Marker (Hist & Live).
 
-    def __init__(self) -> None:
+    22.01d: Zeichnet AUSSCHLIESSLICH persistierte Service-Daten aus dem
+    feature_store (keine In-Memory-Berechnung). `reader` ist optional
+    injizierbar (Tests mit Test-DB; Default = FeatureStoreReader()).
+    """
+
+    def __init__(self, reader: Any = None) -> None:
         super().__init__()
         self._symbol: Optional[str] = None
         self._timeframe: Optional[str] = None
@@ -312,6 +317,8 @@ class IndPeak(BaseIndicator):
         self._executor = PluginExecutor()
         self._evaluator = ServiceSetEvaluator(self._executor)
         self._last_params: Dict[str, Any] = {}
+        # 22.01d: Injizierbarer Store-Reader (Tests) - None = Default.
+        self._reader: Any = reader
 
         # Live-Komponenten (ring buffer, Zero-GC, B5)
         self._buffer_size: int = 2000
@@ -329,6 +336,14 @@ class IndPeak(BaseIndicator):
         self._last_live_rounded: Optional[int] = None
 
         self._live_state: Optional[PeakGrabberLiveState] = None
+        # 22.01d (User-Anweisung 3): Letzter Live-Trigger (Orderpunkt) -
+        # wird als Dreieck ueber/unter der Bar gezeichnet (statt der alten
+        # SL-Kreise). Kein Kreis-Rendering mehr.
+        self._last_live_trigger: Optional[GrabberResultRecord] = None
+        self._last_live_trigger_ts: int = 0
+        # 22.01d: Button-Zustand ueberlebt den Live-State-Reset (leerer
+        # Store vor Servicelauf); wird beim naechsten Bootstrap uebertragen.
+        self._btn_active: bool = False
 
     # ------------------------------------------------------------- Identität
     @property
@@ -373,8 +388,14 @@ class IndPeak(BaseIndicator):
     # ------------------------------------------------------------- Live-Hook
     def set_button_active(self, active: bool) -> None:
         """Wird von chart_win generisch über event_bus.grabber_toggle gerufen."""
+        self._btn_active = bool(active)
         if self._live_state is not None:
             self._live_state.set_button_active(active)
+        if not active:
+            # 22.01d: Deaktivieren raeumt den Live-Trigger-Marker auf
+            # (keine Zeichnung bei deaktiviertem Grabber, User-Anweisung 1).
+            self._last_live_trigger = None
+            self._last_live_trigger_ts = 0
 
     # ------------------------------------------------ Ringpuffer (B5, Zero-GC)
     def _push(self, ts: int, sl_high: float, sl_low: float) -> None:
@@ -466,95 +487,170 @@ class IndPeak(BaseIndicator):
 
     def calculate(self, df: pd.DataFrame,
                   params: Dict[str, Any]) -> Dict[str, Any]:
-        empty = {"lines": [], "markers": [], "status_info": {}}
+        """22.01d (User-Anweisungen 1-3): Zeichnet AUSSCHLIESSLICH
+        persistierte Service-Daten aus dem feature_store - KEINE In-Memory-
+        Berechnung mehr (keine Fantasie-Linien vor dem Servicelauf).
+
+        * srv_peak_finder-Records  -> waagerechte SL-Striche je Peak-Bar
+          (2 Punkte ueber die Barbreite, NIE miteinander verbunden).
+        * srv_peak_grabber-Records -> Trigger-Dreiecke (hit_circles-Format)
+          ueber/unter der Bar (arrowDown=SELL / arrowUp=BUY).
+        * Keine Daten (vor Servicelauf) -> leeres Ergebnis + Live-State-
+          Reset (keine Zeichnung, keine Alt-Zustaende).
+        """
+        empty = {"lines": [], "price_lines": [], "hit_circles": [],
+                 "status_info": {}}
         if df is None or df.empty:
             return empty
         try:
             p = dict(params or {})
             self._last_params = dict(p)
-            context = PluginContext(
-                symbol=self._symbol or "",
-                timeframe=self._timeframe or "",
-                mode="chart",
-                settings=self._get_app_settings(),
-            )
-            definition = self._build_set_definition(p)
-            results = self._evaluator.execute_set(definition, df, context)
+            symbol = str(self._symbol or "")
+            timeframe = str(self._timeframe or "")
+            if not symbol or not timeframe:
+                return empty
 
-            # SL-Linien aus srv_peak_finder (sl_high/sl_low je Bar)
-            finder_recs = ((results.get("peak_1") or {}).get(
-                "feature_store_payload") or {}).get("records") or []
-            grabber_recs = ((results.get("grab_1") or {}).get(
-                "feature_store_payload") or {}).get("records") or []
-            stats = ((results.get("grab_1") or {}).get(
-                "feature_store_payload") or {}).get("metadata") or {}
+            # NUR aus dem feature_store lesen (read-only, keine Berechnung).
+            try:
+                if self._reader is not None:
+                    reader = self._reader
+                else:
+                    from analytics.engine.feature_store_reader import FeatureStoreReader
+                    reader = FeatureStoreReader()
+                finder_recs = reader.fetch_plugin_records(
+                    symbol, timeframe, "srv_peak_finder")
+                grabber_recs = reader.fetch_plugin_records(
+                    symbol, timeframe, "srv_peak_grabber")
+            except Exception as e:
+                print(f"[IndPeak] Feature-Store-Lesen fehlgeschlagen: {e}")
+                return empty
+
+            # User-Anweisung 1: vor Servicelauf keine Daten -> keine Zeichnung.
+            if not finder_recs:
+                self._reset_live_state()
+                return empty
+
+            # Zeit der jeweils naechsten Bar (Strich-Endpunkt; die naechste
+            # Bar ist in der Zeit-Map -> kein Phantom-Slot). Nur die ALLER-
+            # LETZTE df-Bar hat keinen Nachfolger -> dort nur 1 Punkt
+            # (Punkt statt Strich, Edge-Case offene Live-Bar).
+            from db_service import TF_SECONDS_MAP
+            tf_sec = TF_SECONDS_MAP.get(timeframe.upper(), 60)
+            times = df["time"].tolist()
+            next_time: Dict[int, int] = {}
+            for i in range(len(times) - 1):
+                try:
+                    next_time[int(times[i])] = int(times[i + 1])
+                except (TypeError, ValueError):
+                    continue
 
             lines: List[Dict[str, Any]] = []
+            # Waagerechte SL-Striche je Peak-Record (separate LineSeries pro
+            # Bar - NIE verbunden; User-Anweisung 2).
             if p.get("show_sl_high", True):
-                lines.append({
-                    "id": "sl_high",
-                    "data": [{"time": int(r["bar_time"]),
-                              "value": float(r["sl_high"]),
-                              "color": p.get("sl_high_color", "#EF5350")}
-                             for r in finder_recs],
-                    "width": 1, "style": "solid", "title": "SL High",
-                })
+                for r in finder_recs:
+                    t0 = int(r["bar_time"])
+                    if next_time.get(t0) is None:
+                        data = [{"time": t0, "value": float(r["sl_high"]),
+                                 "color": p.get("sl_high_color", "#EF5350")}]
+                    else:
+                        t1 = int(next_time[t0])
+                        data = [
+                            {"time": t0, "value": float(r["sl_high"]),
+                             "color": p.get("sl_high_color", "#EF5350")},
+                            {"time": t1, "value": float(r["sl_high"]),
+                             "color": p.get("sl_high_color", "#EF5350")},
+                        ]
+                    lines.append({
+                        "id": f"sl_high_{t0}",
+                        "data": data,
+                        "width": 1, "style": "solid", "title": "SL High",
+                    })
             if p.get("show_sl_low", True):
-                lines.append({
-                    "id": "sl_low",
-                    "data": [{"time": int(r["bar_time"]),
-                              "value": float(r["sl_low"]),
-                              "color": p.get("sl_low_color", "#26A69A")}
-                             for r in finder_recs],
-                    "width": 1, "style": "solid", "title": "SL Low",
-                })
+                for r in finder_recs:
+                    t0 = int(r["bar_time"])
+                    if next_time.get(t0) is None:
+                        data = [{"time": t0, "value": float(r["sl_low"]),
+                                 "color": p.get("sl_low_color", "#26A69A")}]
+                    else:
+                        t1 = int(next_time[t0])
+                        data = [
+                            {"time": t0, "value": float(r["sl_low"]),
+                             "color": p.get("sl_low_color", "#26A69A")},
+                            {"time": t1, "value": float(r["sl_low"]),
+                             "color": p.get("sl_low_color", "#26A69A")},
+                        ]
+                    lines.append({
+                        "id": f"sl_low_{t0}",
+                        "data": data,
+                        "width": 1, "style": "solid", "title": "SL Low",
+                    })
 
-            markers: List[Dict[str, Any]] = []
+            # Trigger-Dreiecke aus srv_peak_grabber (hit_circles-Format, damit
+            # die generische Render-Pipeline sie zeichnet - User-Anweisung 3:
+            # KEINE Kreise, Orderpunkt = Dreieck ueber/unter der Bar).
+            hit_circles: List[Dict[str, Any]] = []
             if p.get("show_signals", True):
                 for r in grabber_recs:
-                    sig = int(r["signal"])
-                    if sig in (1, -1):  # Trigger
-                        markers.append({
+                    sig = int(r.get("signal") or 0)
+                    if sig == 1:  # BUY_TRIGGER -> Dreieck unter der Bar
+                        hit_circles.append({
                             "time": int(r["bar_time"]),
-                            "position": "aboveBar" if sig == 1 else "belowBar",
-                            "color": "#26A69A" if sig == 1 else "#EF5350",
-                            "shape": "arrowUp" if sig == 1 else "arrowDown",
+                            "price": float(r.get("peak_low") or 0.0),
+                            "color": "#26A69A",
+                            "shape": "arrowUp",
                             "size": 2,
-                            "text": "BUY" if sig == 1 else "SELL",
                             "priority": 8,
                         })
-                    elif p.get("show_updates", False):  # Update
-                        markers.append({
+                    elif sig == -1:  # SELL_TRIGGER -> Dreieck ueber der Bar
+                        hit_circles.append({
                             "time": int(r["bar_time"]),
-                            "position": "aboveBar" if sig == 2 else "belowBar",
+                            "price": float(r.get("peak_high") or 0.0),
+                            "color": "#EF5350",
+                            "shape": "arrowDown",
+                            "size": 2,
+                            "priority": 8,
+                        })
+                    elif p.get("show_updates", False):
+                        hit_circles.append({
+                            "time": int(r["bar_time"]),
+                            "price": float(r.get("peak_high")
+                                           or r.get("peak_low") or 0.0),
                             "color": "#90A4AE",
                             "shape": "circle",
                             "size": 1,
-                            "text": "upd",
                             "priority": 5,
                         })
 
-            # Bootstrap des Live-States (B4): Batch-Endwerte übernehmen.
-            # 22.01b: Zusaetzlich das Rolling-Window-Tail aus dem
-            # shared_state des Finders (Paritaet Batch -> Live).
-            window_tail = ((context.shared_state or {}).get(
-                "peak_1") or {}).get("window_tail")
-            self._bootstrap_live_state(finder_recs, p,
-                                       window_tail=window_tail)
+            # Bootstrap des Live-States aus den persistierten Finder-Records
+            # (Fallback: der letzte Record ist das aktuelle Fenster-Extremum).
+            self._bootstrap_live_state(finder_recs, p)
 
             return {
                 "lines": lines,
-                "markers": markers,
+                "hit_circles": hit_circles,
                 "status_info": {
                     "is_btn_active": bool(
                         self._live_state and self._live_state.is_btn_active),
-                    "trigger_count": int((stats.get("statistics") or {}).get(
-                        "trigger_count", 0)),
+                    "trigger_count": len(hit_circles),
                 },
             }
         except Exception as e:
-            print(f"[IndPeak] Service-Pipeline fehlgeschlagen: {e}")
+            print(f"[IndPeak] Feature-Store-Pfad fehlgeschlagen: {e}")
             return empty
+
+    def _reset_live_state(self) -> None:
+        """22.01d: Setzt den Live-State zurueck (keine Daten / deaktiviert).
+
+        Raeumt Live-Trigger, Bar-Zaehler und Ringpuffer - danach zeichnet
+        und triggert der Indikator nichts mehr (User-Anweisung 1)."""
+        self._live_state = None
+        self._last_live_trigger = None
+        self._last_live_trigger_ts = 0
+        self._live_bar_idx = None
+        self._last_live_rounded = None
+        self._filled = 0
+        self._head = 0
 
     def _bootstrap_live_state(self, finder_recs: List[Dict[str, Any]],
                               p: Dict[str, Any],
@@ -589,6 +685,9 @@ class IndPeak(BaseIndicator):
                 self._symbol or "",
                 self._timeframe or "",
             )
+        # 22.01d: Button-Zustand uebertragen (ueberlebt den Reset bei
+        # leerem Store; der User muss den Grabber nicht neu aktivieren).
+        self._live_state.set_button_active(self._btn_active)
         if window_tail:
             self._live_state.finder.seed_window(window_tail)
             self._live_bar_base = int(window_tail[-1][0])
@@ -691,41 +790,43 @@ class IndPeak(BaseIndicator):
 
     # ---------------------------------------------------- Overlay-Hooks (P14-03)
     def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Live-SL-Punkte als generische Overlays (kind='circle').
+        """22.01d (User-Anweisung 3): KEINE SL-Kreise mehr.
 
-        22.01c (Bugfix 1): Gating - die Live-Kreise werden NUR gezeichnet,
-        wenn der Grabber-Modus aktiv ist (btn_peak_grabber / grabber_toggle
-        -> set_button_active) UND die jeweilige SL-Serie sichtbar ist
-        (show_sl_high / show_sl_low). Vorher wurden die Kreise unabhaengig
-        vom Toggle-Zustand bei jedem Tick gezeichnet, sobald cur_*_sl != NaN
-        war -> "Peak-Linien trotz deaktiviertem Grabber". Der Finder/die
-        State-Machine laeuft weiter (update_live_candle), nur das Zeichnen
-        wird gegated.
+        Der Live-Grabber zeichnet nur den letzten Orderpunkt (Trigger) als
+        Dreieck ueber/unter der aktuellen Bar (arrowDown=SELL / arrowUp=BUY).
+        Proximity-Circles und Grid-Lines sind reine Berechnungshilfen und
+        werden nie gezeichnet. Deaktivierter Grabber -> leere Overlays.
         """
-        self.update_live_candle(candle)
-        if self._live_state is None:
+        records = self.update_live_candle(candle)
+        if self._live_state is None or not self._live_state.is_btn_active:
             return []
-        if not self._live_state.is_btn_active:
+        for rec in records:
+            if rec.is_update:
+                continue
+            self._last_live_trigger = rec
+            try:
+                self._last_live_trigger_ts = int(rec.timestamp.timestamp())
+            except Exception:
+                self._last_live_trigger_ts = int(candle.get("time", 0))
+        trig = self._last_live_trigger
+        if trig is None:
             return []
-        p = self._last_params
-        overlays = []
-        if p.get("show_sl_high", True) and not np.isnan(self._live_state.finder.cur_high_sl):
-            overlays.append({
+        ts = self._last_live_trigger_ts or int(candle.get("time", 0))
+        if trig.direction == SignalDirection.SELL:
+            return [{
                 "kind": "circle", "layer": self.indicator_id,
-                "time": int(candle.get("time", 0)),
-                "price": float(self._live_state.finder.cur_high_sl),
-                "color": p.get("sl_high_color", "#EF5350"),
-                "priority": 10,
-            })
-        if p.get("show_sl_low", True) and not np.isnan(self._live_state.finder.cur_low_sl):
-            overlays.append({
-                "kind": "circle", "layer": self.indicator_id,
-                "time": int(candle.get("time", 0)),
-                "price": float(self._live_state.finder.cur_low_sl),
-                "color": p.get("sl_low_color", "#26A69A"),
-                "priority": 10,
-            })
-        return overlays
+                "time": ts,
+                "price": float(trig.peak_price),
+                "color": "#EF5350", "shape": "arrowDown",
+                "size": 2, "priority": 10,
+            }]
+        return [{
+            "kind": "circle", "layer": self.indicator_id,
+            "time": ts,
+            "price": float(trig.peak_price),
+            "color": "#26A69A", "shape": "arrowUp",
+            "size": 2, "priority": 10,
+        }]
 
     def remember_live_time(self, ts: int) -> None:
         try:

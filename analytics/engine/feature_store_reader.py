@@ -2522,6 +2522,55 @@ class FeatureStoreReader:
             "feature_data": self._normalize_feature_data(row[1]),
         }
 
+    def fetch_plugin_records(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """22.01d: Liefert die persistierten Records eines Plugin-Services
+        (feature_data + bar_time) aufsteigend nach bar_time.
+
+        Reine Lese-Methode (MVVM, Praeambel 4) - kein Schreibzugriff. Der
+        Indikator ind_peak liest damit die srv_peak_finder/srv_peak_grabber-
+        Daten AUSSCHLIESSLICH aus dem feature_store (keine In-Memory-
+        Fantasie-Linien; User-Anweisung 1: vor Servicelauf keine Zeichnung).
+
+        Returns:
+            Liste von Dicts, je Record = feature_data (geparstes JSON inkl.
+            schema_version-Default) zzgl. `bar_time` (Wanduhr-Epoch, int).
+        """
+        if not symbol or not timeframe or not feature_id:
+            return []
+        if limit is None:
+            limit = 20000
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND LOWER(TRIM(feature_id)) = LOWER(?)
+                  AND feature_data IS NOT NULL
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, [symbol, timeframe, feature_id, limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_plugin_records "
+                  f"fehlgeschlagen: {e}")
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            fd = self._normalize_feature_data(r[1])
+            if not isinstance(fd, dict):
+                continue
+            rec = dict(fd)
+            rec["bar_time"] = int(r[0])
+            out.append(rec)
+        return out
+
     def exists(self) -> bool:
         """True, wenn die analytics.duckdb-Datei existiert."""
         return os.path.exists(self.db_path)
