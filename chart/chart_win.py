@@ -848,6 +848,12 @@ class PyTraderChartWindow(QMainWindow):
                     if key == "lines":
                         # LineSeries-Format: {id, data:[{time, value, color}]}
                         # – die Zeit steckt in den Datenpunkten (data).
+                        # 22.01e (Performance-Fix): Series, deren Datenpunkte
+                        # nach dem Zeitfenster-Filter vollstaendig ausserhalb
+                        # liegen, werden VERWORFEN (nicht an JS gesendet) –
+                        # vorher ging z. B. jede ind_peak-Strich-Serie (auch
+                        # leere) als addSeries an LWC -> tausende Series.
+                        filtered_items = []
                         for item in items:
                             if not isinstance(item, dict):
                                 continue
@@ -872,6 +878,9 @@ class PyTraderChartWindow(QMainWindow):
                                 pt["time"] = self._time_real_to_cont.get(pt_t, pt_t)
                                 keep_pts.append(pt)
                             item["data"] = keep_pts
+                            if keep_pts:
+                                filtered_items.append(item)
+                        items = filtered_items
                     else:
                         # Marker-Format: {time, price, ...} – Zeit auf oberster
                         # Ebene des Items (Circle).

@@ -344,6 +344,12 @@ class IndPeak(BaseIndicator):
         # 22.01d: Button-Zustand ueberlebt den Live-State-Reset (leerer
         # Store vor Servicelauf); wird beim naechsten Bootstrap uebertragen.
         self._btn_active: bool = False
+        # 22.01e (Performance-Fix): Yellow-Flag-Cache - die srv_proximity-
+        # Abfrage laeuft pro NEUER Candle (gerundete Zeit wechselt), nicht
+        # bei jedem Tick (vorher: DB-Query/FeatureStoreReader-Instanz pro
+        # Tick -> UI-Thread-Last, Maus-Panning blockiert).
+        self._yellow_rounded: Optional[int] = None
+        self._yellow_value: bool = True
 
     # ------------------------------------------------------------- Identität
     @property
@@ -511,16 +517,20 @@ class IndPeak(BaseIndicator):
                 return empty
 
             # NUR aus dem feature_store lesen (read-only, keine Berechnung).
+            # 22.01e (Performance-Fix): Records auf das df-Fenster begrenzen
+            # (up_to_epoch = letzte df-Bar) - aeltere Records werden im
+            # Render-Payload ohnehin verworfen, spart DB-Last/JSON-Parsing.
             try:
                 if self._reader is not None:
                     reader = self._reader
                 else:
                     from analytics.engine.feature_store_reader import FeatureStoreReader
                     reader = FeatureStoreReader()
+                up_to = int(max(df["time"]))
                 finder_recs = reader.fetch_plugin_records(
-                    symbol, timeframe, "srv_peak_finder")
+                    symbol, timeframe, "srv_peak_finder", up_to_epoch=up_to)
                 grabber_recs = reader.fetch_plugin_records(
-                    symbol, timeframe, "srv_peak_grabber")
+                    symbol, timeframe, "srv_peak_grabber", up_to_epoch=up_to)
             except Exception as e:
                 print(f"[IndPeak] Feature-Store-Lesen fehlgeschlagen: {e}")
                 return empty
@@ -543,48 +553,78 @@ class IndPeak(BaseIndicator):
                     next_time[int(times[i])] = int(times[i + 1])
                 except (TypeError, ValueError):
                     continue
+            times_int: List[int] = []
+            for t in times:
+                try:
+                    times_int.append(int(t))
+                except (TypeError, ValueError):
+                    continue
 
+            def _next_bar_after(t: int) -> Optional[int]:
+                """Naechste echte df-Bar-Zeit nach t (oder None). Wird als
+                Luecken-Zeit genutzt -> immer eine echte Bar-Zeit, daher kein
+                Phantom-Slot in der Timescale (22.01-Lektion)."""
+                lo, hi = 0, len(times_int)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if times_int[mid] <= t:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                return times_int[lo] if lo < len(times_int) else None
+
+            # 22.01e (Performance-Fix, User-Anweisung 2): Die SL-Striche als
+            # ZWEI Sammel-Series (sl_high/sl_low) statt einer separaten
+            # LineSeries pro Record. Vorher erzeugte calculate() bei jedem
+            # Rebuild bis zu tausende LWC-Series (addSeries je Strich) ->
+            # Chart-Aufbau dauert ewig, Skalen blockieren, Maus-Panning
+            # haengt. Zwischen zwei Strichen wird ein Luecken-Marker
+            # {time, value: None} eingefuegt (LWC-null = Luecke) -> die
+            # Striche bleiben NIE verbunden, die Serie ist trotzdem EINE.
             lines: List[Dict[str, Any]] = []
-            # Waagerechte SL-Striche je Peak-Record (separate LineSeries pro
-            # Bar - NIE verbunden; User-Anweisung 2).
+
+            def _stroke_series(records, key: str, color: str,
+                               line_id: str, title: str) -> List[Dict[str, Any]]:
+                data: List[Dict[str, Any]] = []
+                for i, r in enumerate(records):
+                    try:
+                        t0 = int(r["bar_time"])
+                        v = float(r[key])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    t1 = next_time.get(t0)
+                    # Start des naechsten Strichs (fuer Luecken-Kollision).
+                    t_next: Optional[int] = None
+                    if i + 1 < len(records):
+                        try:
+                            t_next = int(records[i + 1]["bar_time"])
+                        except (TypeError, ValueError, KeyError):
+                            pass
+                    if t1 is None or t1 == t_next:
+                        # Letzte Bar oder direkt benachbarter naechster Strich:
+                        # nur 1 Punkt (kein doppelter Zeitstempel; minimale
+                        # Verbindung im seltenen Nachbar-Fall akzeptiert).
+                        data.append({"time": t0, "value": v, "color": color})
+                        continue
+                    data.append({"time": t0, "value": v, "color": color})
+                    data.append({"time": t1, "value": v, "color": color})
+                    gap_t = _next_bar_after(t1)
+                    if gap_t is not None and (t_next is None
+                                              or gap_t < t_next):
+                        data.append({"time": gap_t, "value": None})
+                return [{
+                    "id": line_id, "data": data,
+                    "width": 1, "style": "solid", "title": title,
+                }]
+
             if p.get("show_sl_high", True):
-                for r in finder_recs:
-                    t0 = int(r["bar_time"])
-                    if next_time.get(t0) is None:
-                        data = [{"time": t0, "value": float(r["sl_high"]),
-                                 "color": p.get("sl_high_color", "#EF5350")}]
-                    else:
-                        t1 = int(next_time[t0])
-                        data = [
-                            {"time": t0, "value": float(r["sl_high"]),
-                             "color": p.get("sl_high_color", "#EF5350")},
-                            {"time": t1, "value": float(r["sl_high"]),
-                             "color": p.get("sl_high_color", "#EF5350")},
-                        ]
-                    lines.append({
-                        "id": f"sl_high_{t0}",
-                        "data": data,
-                        "width": 1, "style": "solid", "title": "SL High",
-                    })
+                lines.extend(_stroke_series(
+                    finder_recs, "sl_high", p.get("sl_high_color", "#EF5350"),
+                    "sl_high", "SL High"))
             if p.get("show_sl_low", True):
-                for r in finder_recs:
-                    t0 = int(r["bar_time"])
-                    if next_time.get(t0) is None:
-                        data = [{"time": t0, "value": float(r["sl_low"]),
-                                 "color": p.get("sl_low_color", "#26A69A")}]
-                    else:
-                        t1 = int(next_time[t0])
-                        data = [
-                            {"time": t0, "value": float(r["sl_low"]),
-                             "color": p.get("sl_low_color", "#26A69A")},
-                            {"time": t1, "value": float(r["sl_low"]),
-                             "color": p.get("sl_low_color", "#26A69A")},
-                        ]
-                    lines.append({
-                        "id": f"sl_low_{t0}",
-                        "data": data,
-                        "width": 1, "style": "solid", "title": "SL Low",
-                    })
+                lines.extend(_stroke_series(
+                    finder_recs, "sl_low", p.get("sl_low_color", "#26A69A"),
+                    "sl_low", "SL Low"))
 
             # Trigger-Dreiecke aus srv_peak_grabber (hit_circles-Format, damit
             # die generische Render-Pipeline sie zeichnet - User-Anweisung 3:
@@ -651,6 +691,9 @@ class IndPeak(BaseIndicator):
         self._last_live_rounded = None
         self._filled = 0
         self._head = 0
+        # 22.01e: Yellow-Flag-Cache ebenfalls zuruecksetzen (neue Bar-Basis).
+        self._yellow_rounded = None
+        self._yellow_value = True
 
     def _bootstrap_live_state(self, finder_recs: List[Dict[str, Any]],
                               p: Dict[str, Any],
@@ -775,15 +818,32 @@ class IndPeak(BaseIndicator):
     def _is_current_bar_yellow(self, ts: int) -> bool:
         """Frage 3 (Live): Zone-Hit ∧ Zeitfenster der aktuellen Bar aus dem
         letzten srv_proximity-Record; **Fallback `True`** ohne Proximity-
-        Signal (Gate offen)."""
+        Signal (Gate offen).
+
+        22.01e (Performance-Fix): Die Abfrage laeuft pro NEUER Candle
+        (gerundete Zeit wechselt) und wird gecacht - bei jedem Tick derselben
+        Bar wird der Cache-Wert zurueckgegeben (vorher: neue Reader-Instanz +
+        DB-Query pro Tick -> UI-Thread-Last, Maus-Panning blockiert).
+        """
         try:
+            from db_service import TF_SECONDS_MAP
+            t_sec = TF_SECONDS_MAP.get(str(self._timeframe or "").upper(), 60)
+            rounded = int(ts) - (int(ts) % t_sec)
+            if rounded == self._yellow_rounded:
+                return self._yellow_value
             from analytics.engine.feature_store_reader import FeatureStoreReader
-            reader = FeatureStoreReader(db_path=None)
+            reader = FeatureStoreReader()
             rec = reader.latest_proximity_record(
                 self._symbol or "", self._timeframe or "", int(ts))
             if rec:
                 fd = rec.get("feature_data") or {}
-                return bool(fd.get("in_time_window") and (fd.get("levels_hit") or []))
+                val = bool(fd.get("in_time_window")
+                           and (fd.get("levels_hit") or []))
+            else:
+                val = True
+            self._yellow_rounded = rounded
+            self._yellow_value = val
+            return val
         except Exception:
             pass
         return True

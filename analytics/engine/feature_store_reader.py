@@ -2528,6 +2528,8 @@ class FeatureStoreReader:
         timeframe: str,
         feature_id: str,
         limit: Optional[int] = None,
+        up_to_epoch: Optional[int] = None,
+        from_epoch: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """22.01d: Liefert die persistierten Records eines Plugin-Services
         (feature_data + bar_time) aufsteigend nach bar_time.
@@ -2537,6 +2539,16 @@ class FeatureStoreReader:
         Daten AUSSCHLIESSLICH aus dem feature_store (keine In-Memory-
         Fantasie-Linien; User-Anweisung 1: vor Servicelauf keine Zeichnung).
 
+        Args:
+            up_to_epoch: optionale Zeitfenster-Obergrenze (Wanduhr-Epoch,
+                inklusiv) - begrenzt die DB-Last auf den relevanten
+                Chart-Bereich (Records jenseits der letzten df-Bar werden
+                im Render-Payload ohnehin verworfen; Performance-Fix 22.01e).
+            from_epoch: optionale Zeitfenster-Untergrenze (Wanduhr-Epoch,
+                inklusiv) - analog; beide Filter werden als
+                `EXTRACT('epoch' FROM bar_time)::BIGINT` auf die Spalte
+                angewendet (identisch zu latest_proximity_record).
+
         Returns:
             Liste von Dicts, je Record = feature_data (geparstes JSON inkl.
             schema_version-Default) zzgl. `bar_time` (Wanduhr-Epoch, int).
@@ -2545,18 +2557,32 @@ class FeatureStoreReader:
             return []
         if limit is None:
             limit = 20000
+        conds = ["LOWER(symbol) = LOWER(?)",
+                 "LOWER(timeframe) = LOWER(?)",
+                 "LOWER(TRIM(feature_id)) = LOWER(?)",
+                 "feature_data IS NOT NULL"]
+        params = [symbol, timeframe, feature_id]
+        try:
+            if up_to_epoch is not None:
+                conds.append(
+                    "EXTRACT('epoch' FROM bar_time)::BIGINT <= ?")
+                params.append(int(up_to_epoch))
+            if from_epoch is not None:
+                conds.append(
+                    "EXTRACT('epoch' FROM bar_time)::BIGINT >= ?")
+                params.append(int(from_epoch))
+        except (TypeError, ValueError):
+            return []
+        params.append(limit)
         con = self._get_connection()
         try:
             rows = con.execute("""
                 SELECT EXTRACT('epoch' FROM bar_time)::BIGINT, feature_data
                 FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND LOWER(TRIM(feature_id)) = LOWER(?)
-                  AND feature_data IS NOT NULL
+                WHERE """ + " AND ".join(conds) + """
                 ORDER BY bar_time ASC
                 LIMIT ?
-            """, [symbol, timeframe, feature_id, limit]).fetchall()
+            """, params).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_plugin_records "
                   f"fehlgeschlagen: {e}")
