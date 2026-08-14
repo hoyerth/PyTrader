@@ -3,22 +3,22 @@
 ## 1. Allgemeine Grundsätze & Architektur-Invarianten (Phase 21)
 
 1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase10_step1`, `phase21_step1` usw.).
-2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte im Unterordner `test/`.
+2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte im Unterordner `../../test`.
 3. **Codebase-Formatierung:** Exakt **4 Leerzeichen** Einrückung (PEP8-Standard) und **exakt 1 Leerzeile** Spacing zwischen Methoden und Funktionsblöcken. Kein Umformatieren unbeteiligter Altbestand-Dateien.
 4. **Strikte Trennung & MVVM (Kein SQL in UI):** UI-Klassen enthalten **keine SQL-Queries**. Datenfluss: `DuckDB` $\rightarrow$ `FeatureStoreReader` / `Repositories` $\rightarrow$ `Worker/ViewModel` $\rightarrow$ `UI-Pages`. `MasterTree`-Selektionen übergeben aufgelöste `feature_ids` sowie `instance_hashes` direkt an `view_model.set_feature_ids(ids, hashes)`.
 5. **Zentraler `EventBus`:** Fenster und Worker kommunizieren schwellenfrei über Events (`favorites_changed`, `profile_changed`, `service_set_changed`), um zirkuläre Abhängigkeiten zu vermeiden.
-6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`db/db_pool.py`) – eine Verbindung pro Thread und DB-Datei. Die Fassade `db_service.py` bleibt als Re-Export-Wrapper für bestehende Caller erhalten.
+6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`../../db/db_pool.py`) – eine Verbindung pro Thread und DB-Datei. Die Fassade `../../db_service.py` bleibt als Re-Export-Wrapper für bestehende Caller erhalten.
 7. **Tree-Persistenz & Kategorisierung:** 
    - Service-Kategorien werden primär im Code/Plugin über `metadata["category"]` (Slash-separierter Ordnerpfad) deklariert.
    - Ordner-Kategorien für Service-Sets werden im `category`-Feld der `ServiceSetDefinition` / des `save_set()`-Payloads persistiert.
    - Parameter-Varianten (Clones/Presets) werden transparent über `indicator_presets` und `instance_hash` im FeatureStore geführt.
 8. **Wanduhr-Garantie (Invariante 7):** MT5-Epochs sind bereits Berlin-Wanduhr-encoded. SQL-Extraktionen (Heatmap, DOW, Hour, Date) nutzen strikt `bar_time AT TIME ZONE 'UTC'`, um eine fehlerhafte automatische Umrechnung durch DuckDB in Lokalzeiten zu unterbinden.
 9. **Concurrency-Guard & Timer-Pausierung:** Solange im ServiceWindow intensive Service-Berechnungen laufen (`ServiceRunWorker` / `HistoricalScanner`), wird der 45s-`sync_timer` entkoppelt via `EventBus` pausiert, um Locking-Konflikte und UI-Ruckler zu verhindern.
-10. **Isolierter Test-Workspace & Cleanup:** Neue Test-Skripte und temporäre `*.duckdb`-Dateien gehören strikt nach `test/`. Nach Abschluss jedes Phasenkapitels wird `test/` aufgeräumt – es verbleibt nur der Test-Harness `test/test.py`.
+10. **Isolierter Test-Workspace & Cleanup:** Neue Test-Skripte und temporäre `*.duckdb`-Dateien gehören strikt nach `../../test`. Nach Abschluss jedes Phasenkapitels wird `../../test` aufgeräumt – es verbleibt nur der Test-Harness `../../test/test.py`.
 11. **Open/Closed-Principle & Code-Preserving:** Erweiterungen erfolgen strikt additiv durch neue Dateien. Auskommentierter Bestandscode darf nicht gelöscht werden; bestehende Kern-Klassen bleiben geschützt.
 12. **Naming Conventions & PineScript-Input-Zone:** 
-    - Services in `analytics/features/definitions/` nutzen strikt das Präfix `srv_` (`plugin_id = "srv_..."`).
-    - Indikatoren in `chart/indicators/` nutzen strikt das Präfix `ind_` (`indicator_id = "ind_..."`).
+    - Services in `../../analytics/features/definitions` nutzen strikt das Präfix `srv_` (`plugin_id = "srv_..."`).
+    - Indikatoren in `../../chart/indicators` nutzen strikt das Präfix `ind_` (`indicator_id = "ind_..."`).
     - Füllwörter (`service`, `plugin`, `indicator`) entfallen im Dateinamen.
     - Das `parameter_schema` liegt direkt am Dateianfang unter dem Header-Docstring.
     - Jedes Service-Plugin deklariert `metadata["category"]` für die dynamische Kategorie-Ordner-Struktur im MasterTree.
@@ -83,7 +83,7 @@
 
 ## 🛠️ 3. Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### Schritt 1: Backend- & SQL-Filter-Fix (`analytics/engine/feature_store_reader.py`)
+### Schritt 1: Backend- & SQL-Filter-Fix (`../../analytics/engine/feature_store_reader.py`)
 
 > **Status: BEREITS UMGESETZT** in Phase 20 (Runde 16/16c, 11.08.2026) – keine neue Arbeit, nur Verifikation im 21.01-Test.
 
@@ -98,7 +98,7 @@ Der Guard greift nur noch bei Varianten MIT Hash (`if active_hashes and h_s and 
 Der alte Guard `if not active_hashes:` um den Standalone-Block ist entfernt. Runde 16 (11.08.2026): Standalone-Services (`h_s=""`) werden von einer aktiven Hash-Auswahl anderer Services nicht mehr verworfen und erscheinen korrekt als `(No Data)`, solange der feature_store keine Rows ihrer plugin_id besitzt.
 
 
-### Schritt 2: Colormap-Rendering Fix (`analytics/ui/heatmap_widget.py`)
+### Schritt 2: Colormap-Rendering Fix (`../../analytics/ui/heatmap_widget.py`)
 
 * **2.1 Werte-gebundene Farb-Lookup-Table (LUT) – Ist-API beachten:**
 Das `ImageItem` heißt im Widget **`self._image`** (nicht `self.image_item`) und nutzt **`setColorMap`** (nicht `lut=`) mit den bestehenden `_CONFLUENCE_LEVELS = (0.0, 5.0)`. Colormap streng an die min/max-Spannweite der Daten binden:
@@ -114,7 +114,7 @@ self._image.setColorMap(self._cmap_viridis)
 self._image.setImage(matrix, levels=(vmin, vmax))
 
 
-### Schritt 3: ViewModel-Erweiterung & Smart-Presets (`analytics/engine/analytics_view_model.py`)
+### Schritt 3: ViewModel-Erweiterung & Smart-Presets (`../../analytics/engine/analytics_view_model.py`)
 
 * **3.1 Preset-Methoden im ViewModel bereitstellen:**
 * Implementiere Helfer wie `apply_smart_preset_confluence()`, `apply_smart_preset_session()`, `apply_smart_preset_intensity()`, `apply_smart_preset_timeframe()`.
@@ -131,7 +131,7 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 #                  (z. B. "ALLE M1 - Confluence Zeitachse (3 Services)")
 
 
-### Schritt 4: UI-Layout & Header-Redesign (`analytics/ui/analytics_win.py` / `heatmap_page.py`)
+### Schritt 4: UI-Layout & Header-Redesign (`../../analytics/ui/analytics_win.py` / `heatmap_page.py`)
 
 * **4.1 Ergonomischer Profile-Header (Rechtsbündig) – E5:**
 * `combo_profile` auf `setSizePolicy(Expanding, Fixed)`, `setMinimumWidth(350)` und `setEditable(True)` setzen (breites, dehnbares Combo-/Eingabefeld).
@@ -148,7 +148,7 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 
 ---
 
-## 📊 4. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
+## 📊 4. Akzeptanzkriterien für die Headless-Validierung (`../../test/test.py`)
 
 1. **Mischfilter-Test:** Kombinierter Query aus Hash-Variante + Standalone-Service liefert beide Datensätze korrekt zurück.
 2. **NoData-Test:** Ein ungeflashtes Plugin erscheint trotz gecheckter Hashes anderer Services im NoData-Ergebnis.
@@ -189,15 +189,15 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 
 * **11.08.2026 – Doku-Update 21.01 (Korrektur & Entscheidungen):** Kapitel 21.01 präzisiert – Schritt 1.1/1.2 als bereits in Phase 20 (Runde 16/16c) umgesetzt markiert; Schritt 2.1 auf Ist-API (`self._image` / `setColorMap` / `_CONFLUENCE_LEVELS`) korrigiert; Schritt 3.1 auf E1 (`all_timeframes`), 3.2 auf E3 (deutscher Namensgenerator inkl. Fallbacks), Schritt 4 auf E4–E6 (Platzierung im `HeatmapWidget`, Standard-Ansicht generisch, Speicher-Dialog) korrigiert; Entscheidungen E1–E6 in Sektion 5 dokumentiert; Akzeptanzkriterien 5–7 ergänzt. Reine Doku – **kein Coding**.
 
-* **11.08.2026 – 21.01 Umsetzung (Coding, E1–E6):** Alle 7 Dateien umgesetzt und per `test/test.py` verifiziert (Sektion 39, 31 Checks AK1–AK7/Presets/Namensgenerator/Widget/Page – alle PASS; keine neuen Fehler gegenüber der 25er-Baseline aus Teil 1/25/32/35/36/37/20.03). Änderungen: `feature_store_reader.py` (`fetch_generic_heatmap` + `all_timeframes`, Guard ohne TF-Freigabe), `analytics_repository.py` / `analytics_worker.py` (Parameter-Durchreichung, QUERY ohne `LOWER(timeframe)=` bei `all_timeframes=True`), `analytics_view_model.py` (`heatmap_all_timeframes`, `apply_smart_preset_*`, `generate_profile_name_suggestion()` deutsch inkl. Fallbacks `(Alle Services)`/`ALLE`, Persistenz unter `charts.heatmap.all_timeframes`), `heatmap_widget.py` (Signal `preset_clicked` + 4 Preset-Buttons in `ctrl`), `heatmap_page.py` (generischer Modus als Standard-Ansicht), `analytics_win.py` (Header-Redesign E5: `combo_profile` dehnbar/editierbar, Namens-/Beschreibungs-Felder in separatem Speicher-Dialog, `_resolve_save_name`-Helfer gegen '?'-Verlust, Auto-Name im Neu-Dialog). Test 35 Z2b/Z2c an E5-Kontrakt angepasst (kein Header-Namensfeld mehr; `_resolve_save_name` direkt getestet).
+* **11.08.2026 – 21.01 Umsetzung (Coding, E1–E6):** Alle 7 Dateien umgesetzt und per `../../test/test.py` verifiziert (Sektion 39, 31 Checks AK1–AK7/Presets/Namensgenerator/Widget/Page – alle PASS; keine neuen Fehler gegenüber der 25er-Baseline aus Teil 1/25/32/35/36/37/20.03). Änderungen: `feature_store_reader.py` (`fetch_generic_heatmap` + `all_timeframes`, Guard ohne TF-Freigabe), `analytics_repository.py` / `analytics_worker.py` (Parameter-Durchreichung, QUERY ohne `LOWER(timeframe)=` bei `all_timeframes=True`), `analytics_view_model.py` (`heatmap_all_timeframes`, `apply_smart_preset_*`, `generate_profile_name_suggestion()` deutsch inkl. Fallbacks `(Alle Services)`/`ALLE`, Persistenz unter `charts.heatmap.all_timeframes`), `heatmap_widget.py` (Signal `preset_clicked` + 4 Preset-Buttons in `ctrl`), `heatmap_page.py` (generischer Modus als Standard-Ansicht), `analytics_win.py` (Header-Redesign E5: `combo_profile` dehnbar/editierbar, Namens-/Beschreibungs-Felder in separatem Speicher-Dialog, `_resolve_save_name`-Helfer gegen '?'-Verlust, Auto-Name im Neu-Dialog). Test 35 Z2b/Z2c an E5-Kontrakt angepasst (kein Header-Namensfeld mehr; `_resolve_save_name` direkt getestet).
 
 * **11.08.2026 – Bugfix-Runde 21.01 User-Meldungen 1–7 (Coding, Commit `28249a2`):** Meldung 1 (Profil-Neu-Dialog breit, QDialog min. 560 px, `combo_profile` min. 560 px), Meldung 2 (Ansicht-Dropdown = Generisch + 4 Presets, „Wochentag × Stunde“ entfernt, Legacy-`standard`→`generic`-Mapping), Meldung 3 (Bedien-Controls bleiben bei jedem Preset-Wechsel sichtbar, Stack immer Seite 1, `_apply_selected_preset()`), Meldung 4/6 (Stale-Combo-Fix: Preset-Handler synchronisieren Combos via `_sync_from_params()`/`_update_controls()`), Meldung 5 (Kerzen-Overlay nur bei X=date, Restore-Guard `heatmap_x_dim == "date"`), Meldung 7 (Confluence-Levels daten-gebunden `(vmin, vmax)` statt fest `(0, 5)`). Verifikation: `test/check_heatmap_2101.py` (10/10 OK, headless). **Noch nicht vom Anwender als funktionierend bestätigt** – die Screenshot-Kritik (E7–E10) schließt direkt an.
 * **11.08.2026 – Heatmap-Darstellung Screenshot-Kritik (Analyse, KEIN Coding):** Anweisung des Anwenders: „Bugfixing – 4 Preset-Buttons entfernen (jetzt im Dropdown) / Kritik prüfen + Fix erstellen / erst Meinung + Doku, dann warten auf Befehl“. Analyse-Ergebnisse: **(1)** Y-Streifen = reale Transposition (`axisOrder='col-major'`, empirisch via `test/check_orientation_2101.py`: `width()==2/height()==3` bei 2×3-Matrix) → Fix E8 `axisOrder='row-major'`. **(2)** Homogene X-Achse = Symptom der Transposition, kein SQL-Fehler (E9). **(3)** „Farbe = Y-Position“ = visuelle Täuschung, Farben daten-gebunden (E10). **Fixes E7 (Buttons entfernen) + E8 (`axisOrder='row-major'`) wurden vom Anwender freigegeben und umgesetzt – Umsetzung + Verifikation siehe nächster Log-Eintrag.**
-* **11.08.2026 – E7/E8 Umsetzung (Coding):** Anweisung „continue“ nach Freigabe. **E7:** Die 4 Preset-Buttons im `HeatmapWidget` (`_btn_preset_confluence/session/intensity/timeframe`) samt Handlern `_on_preset_*` und Signal-Verbindungen ENTFERNT – die Smart-Presets laufen ausschließlich über das „Ansicht“-Dropdown der `HeatmapPage` (`_apply_selected_preset`). Das Signal `preset_clicked` bleibt als Vertrag, wird aber nicht mehr emittiert; die Page konsumiert es nicht mehr (`attach_view_model`-Verbindung + `_on_preset_clicked` entfernt). **E8:** `self._image.setOpts(axisOrder='row-major')` – behebt die Transposition der `(rows=Services, cols=Zeiten)`-Matrix (pyqtgraph-Default `col-major` rendert transponiert → die N dünnen Y-Streifen der Kritik). Verifikation (headless, venv): `test/check_heatmap_2101.py` 12/12 OK (inkl. neuer E7/E8-Checks), `test/check_orientation_2101.py` `width()==3/height()==2` statt vorher `2/3`, `py_compile` aller geänderten Dateien OK, `test/test.py` Sektion 39 (j1/j2 E7/E8, k1 Page konsumiert Signal nicht mehr) angepasst. Offener Verifikationspunkt geklärt: kategoriale Y-Achsen-Ticks (Services) liegen nach row-major exakt auf den Zeilen-Mitten (0,1,2 ↔ Zellen [-0.5..2.5]). **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
-* **11.08.2026 – Bugfix-Runde 2 Heatmap-Darstellung (Coding, 5 Bugs, nur `analytics/ui/heatmap_widget.py`, +231/−57):** (1) Kategoriales Achsen-Clamping – Ticks außerhalb `0..n−1` entfallen (`_clamped_scale_bounds`, `_format` → leere Strings). (2) Schwellwert-Legende (`pg.LegendItem` oben rechts) + `0`-Confluence-Farbe Grau `#d9d9d9`. (3) Fadenkreuz (`_cross_x`/`_cross_y` als `pg.InfiniteLine`, zValue 20) + `_on_mouse_moved` + `_update_cell_info`. (4) Datumsformate 1:1 JS-Konvention (`TT.MM.JJ` / `HH:MM`). (5) Adaptives Overlay: `QUERY_OHLCV` statt Daily-Query, `_TF_SECONDS`-Map, `_bar_interval_seconds()`. Verifikation: `test/check_heatmap_2101.py` 20/20 + Smoke-Test 7/7 (headless, venv). **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
+* **11.08.2026 – E7/E8 Umsetzung (Coding):** Anweisung „continue“ nach Freigabe. **E7:** Die 4 Preset-Buttons im `HeatmapWidget` (`_btn_preset_confluence/session/intensity/timeframe`) samt Handlern `_on_preset_*` und Signal-Verbindungen ENTFERNT – die Smart-Presets laufen ausschließlich über das „Ansicht“-Dropdown der `HeatmapPage` (`_apply_selected_preset`). Das Signal `preset_clicked` bleibt als Vertrag, wird aber nicht mehr emittiert; die Page konsumiert es nicht mehr (`attach_view_model`-Verbindung + `_on_preset_clicked` entfernt). **E8:** `self._image.setOpts(axisOrder='row-major')` – behebt die Transposition der `(rows=Services, cols=Zeiten)`-Matrix (pyqtgraph-Default `col-major` rendert transponiert → die N dünnen Y-Streifen der Kritik). Verifikation (headless, venv): `test/check_heatmap_2101.py` 12/12 OK (inkl. neuer E7/E8-Checks), `test/check_orientation_2101.py` `width()==3/height()==2` statt vorher `2/3`, `py_compile` aller geänderten Dateien OK, `../../test/test.py` Sektion 39 (j1/j2 E7/E8, k1 Page konsumiert Signal nicht mehr) angepasst. Offener Verifikationspunkt geklärt: kategoriale Y-Achsen-Ticks (Services) liegen nach row-major exakt auf den Zeilen-Mitten (0,1,2 ↔ Zellen [-0.5..2.5]). **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
+* **11.08.2026 – Bugfix-Runde 2 Heatmap-Darstellung (Coding, 5 Bugs, nur `../../analytics/ui/heatmap_widget.py`, +231/−57):** (1) Kategoriales Achsen-Clamping – Ticks außerhalb `0..n−1` entfallen (`_clamped_scale_bounds`, `_format` → leere Strings). (2) Schwellwert-Legende (`pg.LegendItem` oben rechts) + `0`-Confluence-Farbe Grau `#d9d9d9`. (3) Fadenkreuz (`_cross_x`/`_cross_y` als `pg.InfiniteLine`, zValue 20) + `_on_mouse_moved` + `_update_cell_info`. (4) Datumsformate 1:1 JS-Konvention (`TT.MM.JJ` / `HH:MM`). (5) Adaptives Overlay: `QUERY_OHLCV` statt Daily-Query, `_TF_SECONDS`-Map, `_bar_interval_seconds()`. Verifikation: `test/check_heatmap_2101.py` 20/20 + Smoke-Test 7/7 (headless, venv). **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
 * **11.08.2026 – Bugfix-Runde 3 Heatmap-Darstellung (Coding, 4 Punkte, User „doku alles und setze deine Vorschläge um“):** E11 (Overlay batched: 3 `pg.BarGraphItem`, numpy), E12 (senkrechte Teiler je Dateneinheit, Variante a: `_grid_lines` als `PlotCurveItem(connect="pairs")` + `_update_grid_lines()`), E13 (Tages-Marken `Mo. 12.06.26`), E14 (Zelleninfo-Zeitzeile `Zeit: Mo. 12.06.26 14:00 · Zelle(row,col) = Wert`). Nachgereicht: `bar_sec = self._bar_interval_seconds()` im batched-Overlay-Block (der Runde-2-Patch hatte die Zeile zusammen mit dem alten Loop ersetzt). Verifikation: `test/check_heatmap_2101.py` 22/22 OK (headless, venv), `py_compile` von `heatmap_widget.py` + `test.py` OK. **Vom Anwender als funktionierend bestätigt** (Freigabe per Anweisung „doku“, 11.08.2026).
 
-* **11.08.2026 – Bugfix-/Spez-Analyse 21.01 + 21.01b (Analyse, KEIN Coding, Anweisung „bugfix mode – prüfe, Ergebnisse als Textblock, kein Coding“):** Vier User-Meldungen geprüft und headless verifiziert (Wegwerf-DB in `test/`, danach wieder entfernt): **(1) Fadenkreuz-Zelleninfo** funktioniert mechanisch (row/col-Mapping ohne Flip, Wanduhr-Konvertierung), hat aber einen echten off-by-one-day-Bug: Tageszellen sind mittags-zentriert (`_axis_bounds`: `lo−12 h … hi+12 h`) → Cursor 12:00–24:00 zeigt den Wert der Folgetag-Zelle; außerhalb des Datenbereichs bleibt das alte Label stehen. **(2) Mehrzeilen-Umbruch** am `/` ist machbar – pyqtgraph 0.14 misst/rendert `\n`-Tick-Labels korrekt. **(3) „Datum im Baum bleibt stehen“ auf neuem TF:** DB-Schicht korrekt (PK `(symbol, timeframe, bar_time, feature_id)` trennt TFs; `fetch_last_execution_dates` liefert sofort das neue Datum) – Root Cause in `run_worker.py`: `event_bus.service_set_changed` wird NUR bei vollem Erfolg emittiert; alle Fehlerpfade (`no_data_tfs`, `no_payload_tfs`, Exception im Single-TF-Zweig) überspringen den Refresh, obwohl Rows geschrieben wurden. **(4) Service-Picker** hat keinen TF-Selektor (nur `ServiceWindow.combo_tf`, U15-E); Heatmap-Preset „Service-Timeframe“ sortiert die TFs alphabetisch statt nach Dauer. Spez-Bausteine `fetch_service_tf_status`, `TfStatusBadgeBar`, `serviceui/common_widgets.py`, per-TF-Worker-Signale existieren nicht. Entscheidungen E15–E18 (§5) dokumentiert – **Umsetzung erst nach explizitem Befehl**.
+* **11.08.2026 – Bugfix-/Spez-Analyse 21.01 + 21.01b (Analyse, KEIN Coding, Anweisung „bugfix mode – prüfe, Ergebnisse als Textblock, kein Coding“):** Vier User-Meldungen geprüft und headless verifiziert (Wegwerf-DB in `../../test`, danach wieder entfernt): **(1) Fadenkreuz-Zelleninfo** funktioniert mechanisch (row/col-Mapping ohne Flip, Wanduhr-Konvertierung), hat aber einen echten off-by-one-day-Bug: Tageszellen sind mittags-zentriert (`_axis_bounds`: `lo−12 h … hi+12 h`) → Cursor 12:00–24:00 zeigt den Wert der Folgetag-Zelle; außerhalb des Datenbereichs bleibt das alte Label stehen. **(2) Mehrzeilen-Umbruch** am `/` ist machbar – pyqtgraph 0.14 misst/rendert `\n`-Tick-Labels korrekt. **(3) „Datum im Baum bleibt stehen“ auf neuem TF:** DB-Schicht korrekt (PK `(symbol, timeframe, bar_time, feature_id)` trennt TFs; `fetch_last_execution_dates` liefert sofort das neue Datum) – Root Cause in `run_worker.py`: `event_bus.service_set_changed` wird NUR bei vollem Erfolg emittiert; alle Fehlerpfade (`no_data_tfs`, `no_payload_tfs`, Exception im Single-TF-Zweig) überspringen den Refresh, obwohl Rows geschrieben wurden. **(4) Service-Picker** hat keinen TF-Selektor (nur `ServiceWindow.combo_tf`, U15-E); Heatmap-Preset „Service-Timeframe“ sortiert die TFs alphabetisch statt nach Dauer. Spez-Bausteine `fetch_service_tf_status`, `TfStatusBadgeBar`, `../../serviceui/common_widgets.py`, per-TF-Worker-Signale existieren nicht. Entscheidungen E15–E18 (§5) dokumentiert – **Umsetzung erst nach explizitem Befehl**.
 
 # 21.01b Analytics – Multi-TF Execution & Status Pill-Strip
 
@@ -226,7 +226,7 @@ Erstelle `generate_profile_name_suggestion() -> str` – **Sprache DEUTSCH**:
 
 ## 🛠️ 2. Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### Schritt 1: DB-Status-Methode (`analytics/engine/feature_store_reader.py`)
+### Schritt 1: DB-Status-Methode (`../../analytics/engine/feature_store_reader.py`)
 
 * **1.1 Aggregierten Status abfragen (`fetch_service_tf_status`):** Liefere in EINER leichten SQL-Abfrage Zeilenzahl und `created_at` aller TFs für ein `plugin_id`:
 
@@ -247,7 +247,7 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
 
 * **1.2 Verfügbare TFs (E18b/E18c):** Pill-Strip-Umfang (TFs mit feature_store-Daten) und Run-Umfang (TFs mit OHLCV-Kerzen) werden über die bestehenden Reader-/DbPool-Lesepfade ermittelt (kein neuer Schreibpfad).
 
-### Schritt 2: Mini-Pill-Strip Widget (`serviceui/common_widgets.py` – NEUE Datei)
+### Schritt 2: Mini-Pill-Strip Widget (`../../serviceui/common_widgets.py` – NEUE Datei)
 
 * **2.1 `TfStatusBadgeBar`-Klasse erstellen:**
 * `QWidget` mit `QHBoxLayout` (Spacing 2, Margins 0).
@@ -255,7 +255,7 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
 * `update_status(tf_status_map: Dict[str, Dict[str, Any]])`: färbt Badges grün/grau (E18b: dynamische TF-Liste aus dem Status-Map, sortiert nach `TF_SECONDS_MAP`) und setzt den `setToolTip()` (z. B. `M1: 10.000 Einträge\nZuletzt: 11.08.26 20:15`).
 * `set_running(tf)`/`set_error(tf)`: Blau-Blinken (QTimer) bzw. Rot (Schritt 3.2).
 
-### Schritt 3: Multi-TF-Ausführung Toolbar (`serviceui/service_win.py` / `service_selector_dialog.py`)
+### Schritt 3: Multi-TF-Ausführung Toolbar (`../../serviceui/service_win.py` / `service_selector_dialog.py`)
 
 * **3.1 ComboBox `combo_run_tf`:** `[ Aktueller TF ]` + `[ 🌐 Alle Timeframes ]`. Im `ServiceWindow` ist das bestehende `combo_tf` (U15-E, Index 0 = `ALL_TIMEFRAMES`) die Grundlage; der `ServiceSelectorDialog` erhält zusätzlich eine TF-Zeile (E18d).
 * **3.2 Per-TF-Fortschrittssignale im `ServiceRunWorker`:** neue Signale `tf_started(str)` / `tf_finished(str, int, bool)` – der Orchestrator setzt das jeweilige Badge auf „berechnet gerade“ (blau blinkend) bzw. grün (Rows geschrieben) / rot (Fehler).
@@ -267,7 +267,7 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
 
 ---
 
-## 📊 3. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
+## 📊 3. Akzeptanzkriterien für die Headless-Validierung (`../../test/test.py`)
 
 1. **DB-Status-Query-Test:** `fetch_service_tf_status("srv_proximity")` liefert korrektes Dict für alle TFs mit `count` und `last_run`.
 2. **Badge-Mapping-Test:** `TfStatusBadgeBar.update_status()` setzt für vorhandene TFs korrekte Tooltip-Texte und Stylesheet-Farben.
@@ -285,14 +285,14 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
   * **E16 (heatmap_widget.py, `_HeatmapAxis._format`):** Kategoriale Labels (service_id/timeframe/symbol) werden an JEDEM `/` mit `
 ` umgebrochen (keine Kappung), gilt für X- und Y-Achse.
   * **21.01b Schritt 1 (`feature_store_reader.py`):** Neue Methode `fetch_service_tf_status(plugin_id)` – SQL `SELECT LOWER(TRIM(timeframe)), COUNT(*), MAX(created_at) … GROUP BY LOWER(TRIM(timeframe))`, case-insensitiv/whitespace-tolerant, Rückgabe `Dict TF(upper) -> {'count': int, 'last_run': 'DD.MM.JJ HH:MM'}`.
-  * **21.01b Schritt 2 (NEUE Datei `serviceui/common_widgets.py`):** Widget `TfStatusBadgeBar` (QHBoxLayout, Spacing 2, QLabel je TF 28×16 px, 9 pt bold, Radius 3 px; `update_status(map)`, `set_running(tf|None)`, `set_error(tf)`, `clear_error`, `clear`; Tooltip `M1: 99.063 Eintraege\nZuletzt: 11.08.26 20:15`; Farben: idle/running/error/hint).
+  * **21.01b Schritt 2 (NEUE Datei `../../serviceui/common_widgets.py`):** Widget `TfStatusBadgeBar` (QHBoxLayout, Spacing 2, QLabel je TF 28×16 px, 9 pt bold, Radius 3 px; `update_status(map)`, `set_running(tf|None)`, `set_error(tf)`, `clear_error`, `clear`; Tooltip `M1: 99.063 Eintraege\nZuletzt: 11.08.26 20:15`; Farben: idle/running/error/hint).
   * **21.01b Schritt 3+4 (Einbettung + Kopplung):**
     * `service_win.py`: `TfStatusBadgeBar` am Kopf der Parameter-/Status-Spalte; Worker-Signale `tf_started`/`tf_finished` gekoppelt (`_on_tf_started`/`_on_tf_finished`), nach `run_finished`/`run_failed` Refresh via `_refresh_badge_bar()`; `_on_master_selection_details` lädt die Pills für die geklickte Zeile (`_resolve_badge_plugin`). Run nutzt weiterhin das bestehende `combo_tf` (Index 0 = `ALL_TIMEFRAMES`).
     * `service_selector_dialog.py`: NEUE TF-Zeile `combo_run_tf` (Sentinel `ALL_TIMEFRAMES` + TFs aufsteigend) + `TfStatusBadgeBar` im Parameter-Panel; MasterTree-Run-Aktionen (`run_service/set/plugin/category_requested`) verdrahtet (User-Entscheid: Run im Picker voll funktional) – Bestätigungsdialog, `_plugin_config` (17.01.04-Muster), `ServiceRunWorker` mit `_run_symbol()` (Parent `combo_symbol`) und `_run_timeframe()`; Pill-Strip-Kopplung identisch zum ServiceWindow.
     * `analytics_win.py`: `TfStatusBadgeBar` NEBEN der Datenquellen-Combo (Filter-Zeile); `_refresh_badge_bar()` zeigt die TFs der ERSTEN aktiven Datenquelle (`feature_ids[0]`), Sync über `_sync_service_filter_button`.
   * **Verifikation (headless, KEIN UI-/Regressionstest):** `py_compile` auf allen 7 geänderten Dateien (OK); `test/check_2101b.py` 18/18 PASS (DB-Status-Query, Badge-Mapping inkl. Tooltip/running/error/laufender TF ohne DB-Eintrag, Multi-TF-Loop sortiert nach `TF_SECONDS_MAP`, Sentinel, Worker-Signale, E17-Code-Inspection, Modul-Import-Smoke).
 * **11.08.2026 – Bugfix Varianten-Kollision Runde 4 + 5 (Coding, Commits `6910b46` + `3d67539`):** User-Meldung „Kontextmenü auf eine Variante → wird bei allen Varianten ausgeführt/angezeigt" + „Data only löschen muss das letzte Ausführungsdatum im Baum wieder auf null reseten (wie frisch angelegt)".
-  * **Runde 4 (`6910b46`, Root Cause: Hash-Kollision):** `generate_instance_hash(plugin_id, params, preset_name)` – Preset-Hashes jetzt INKL. `preset_name` (Backward-Compat ohne). Presets mit identischen Params aber unterschiedlichen Namen (z. B. `srv_trend_breakout`: `ffffffff`/`ggsegerttt`, vorher beide `3399e1bc`; `srv_trend_hma_pivot`: 3× `2d9f343a`) erhalten UNTERSCHIEDLICHE Hashes → der Kontextmenü-Run-Filter matcht GENAU EINE Variante. feature_store-PK idempotent migriert auf `(symbol, timeframe, bar_time, feature_id, instance_hash)` (Table-Rewrite + `ALTER ADD PRIMARY KEY`, `COALESCE(NULL→'')`, auf `data/analytics.duckdb` ausgeführt, 2,33 Mio. Rows erhalten); Writer nutzen adaptiven `_feature_store_conflict_target(con)` (5-/4-Spalten je PK); Reader `_apply_feature_filter`: `instance_hash=''` bleibt bei Varianten-Filtern immer enthalten. MasterTree-Label-Kosmetik (`srv_`-Präfix abgeschnitten, Fallback `(nie)`).
+  * **Runde 4 (`6910b46`, Root Cause: Hash-Kollision):** `generate_instance_hash(plugin_id, params, preset_name)` – Preset-Hashes jetzt INKL. `preset_name` (Backward-Compat ohne). Presets mit identischen Params aber unterschiedlichen Namen (z. B. `srv_trend_breakout`: `ffffffff`/`ggsegerttt`, vorher beide `3399e1bc`; `srv_trend_hma_pivot`: 3× `2d9f343a`) erhalten UNTERSCHIEDLICHE Hashes → der Kontextmenü-Run-Filter matcht GENAU EINE Variante. feature_store-PK idempotent migriert auf `(symbol, timeframe, bar_time, feature_id, instance_hash)` (Table-Rewrite + `ALTER ADD PRIMARY KEY`, `COALESCE(NULL→'')`, auf `../../data/analytics.duckdb` ausgeführt, 2,33 Mio. Rows erhalten); Writer nutzen adaptiven `_feature_store_conflict_target(con)` (5-/4-Spalten je PK); Reader `_apply_feature_filter`: `instance_hash=''` bleibt bei Varianten-Filtern immer enthalten. MasterTree-Label-Kosmetik (`srv_`-Präfix abgeschnitten, Fallback `(nie)`).
   * **Runde 5 (`3d67539`, die zwei verbliebenen User-Punkte):**
     * **Bug 1 („bei allen Varianten ANGEZEIGT"):** Der Run-Filter matchte seit Runde 4 korrekt genau 1 Variante – der Anzeige-Leak war der **Legacy-Fallback im `ServiceSelectorModel`** (`per_hash.get(new) or per_hash.get(legacy)`): Alt-Rows unter dem kollidierenden Params-only-Hash (Pool) wurden an ALLEN Varianten als Ausführungsdatum angezeigt. Fix: Fallback + `_preset_hash_aliases` VOLLSTÄNDIG entfernt – `_load_plugin_presets`, `last_execution_date_for_hash`, `last_execution_datetime_for_hash` lesen NUR den EIGENEN Preset-Hash; nie gelaufene Varianten zeigen `--.--.--` („nie" wie frisch angelegt).
     * **Bug 2 („Data only löschen resetet das Datum nicht"):** `purge_instance_data(instance_hash)` löschte nur Rows unter dem NEUEN Hash; die Alt-Daten (z. B. 676 689 Rows von `srv_swing_volume_profile` unter dem Legacy-Hash) blieben liegen und das Datum blieb über den Fallback stehen. Fix: Signatur erweitert auf `purge_instance_data(instance_hash, plugin_id="", params=None)` – löscht zusätzlich die LEGACY-Pool-Rows der Variante (`feature_id = plugin_id AND instance_hash = generate_instance_hash(plugin_id, params)`); alle 6 Call-Sites erweitert (`service_win.py`: `_on_data_only_purge`/`_delete_complete_set_instance`/`_delete_complete_preset`; `service_selector_dialog.py`: `_on_data_only_purge`/`_on_delete_complete` ×2 – jeweils mit params-Lookup via Set-Config bzw. `_find_preset_for_hash`).
@@ -305,7 +305,7 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
 ## 🎯 1. Kern-Anforderungen
 
 1. **Bloat-Analyse:** Startup-Anzeige auf `MainWindow` unter Optionen-Button via `PRAGMA database_size`.
-2. **DB-Pflege beim App-Exit:** `main.py` `closeEvent` führt für jede DB-Datei `CHECKPOINT;` **gefolgt von** `VACUUM;` aus (WAL-Flush, konsistenter Zustand – keine Datei-Verkleinerung).
+2. **DB-Pflege beim App-Exit:** `../../main.py` `closeEvent` führt für jede DB-Datei `CHECKPOINT;` **gefolgt von** `VACUUM;` aus (WAL-Flush, konsistenter Zustand – keine Datei-Verkleinerung).
 3. **Kompaktierung (Button):** Button `[ 🧹 DB Service ]` in `PropertiesWindow` führt die **`COPY FROM DATABASE`-Kompaktierung** aus (echte Verkleinerung, Bloat entfernen). **Nicht** `VACUUM`-Button.
 4. **Concurrency-Guard:** Kompaktierung sperren, solange `_sync_pause_count > 0` (laufende Scans/Worker) – Zugriff über **EventBus-Zähler** (konsistent zu Phase 16, nicht `self.parent()`).
 
@@ -313,9 +313,9 @@ def fetch_service_tf_status(self, plugin_id: str) -> Dict[str, Dict[str, Any]]:
 
 ## 🛠️ 2. Schritt-für-Schritt Umsetzungsanleitung
 
-### Schritt 1: Core Engine (`db/db_utils.py`)
+### Schritt 1: Core Engine (`../../db/db_utils.py`)
 
-Füge folgende Funktionen in `db/db_utils.py` ein (**korrigierte Fassung, Stand 12.08.2026** – F1: `res[2]/res[4]`, F2: CHECKPOINT+VACUUM, `copy_database`-Helper):
+Füge folgende Funktionen in `../../db/db_utils.py` ein (**korrigierte Fassung, Stand 12.08.2026** – F1: `res[2]/res[4]`, F2: CHECKPOINT+VACUUM, `copy_database`-Helper):
 
 # db/db_utils.py
 import os
@@ -367,8 +367,8 @@ def copy_database(src_db_path: str, dst_db_path: str) -> None:
 
 ---
 
-### Schritt 2: Startup Status (`main.py`)
-Beim App-Start in `main.py` aufrufen und UI-Label unter Optionen-Button befüllen (absoluter Pfad via `BASE_DIR`):
+### Schritt 2: Startup Status (`../../main.py`)
+Beim App-Start in `../../main.py` aufrufen und UI-Label unter Optionen-Button befüllen (absoluter Pfad via `BASE_DIR`):
 
 # main.py
 from db.db_utils import get_db_fragmentation_info
@@ -379,7 +379,7 @@ self.label_db_status.setText(f"DB Status: {info['pct']}% fragmentiert ({info['bl
 
 ---
 
-### Schritt 3: UI, Concurrency-Guard & Kompaktierung (`properties_win.py`)
+### Schritt 3: UI, Concurrency-Guard & Kompaktierung (`../../properties_win.py`)
 Button `[ 🧹 DB Service ]` in `PropertiesWindow` für die **Kompaktierung** (COPY FROM DATABASE) einbauen. Guard über den **EventBus-Zähler** (konsistent zu Phase 16; NICHT `self.parent()`, da `PersistentWindow` kein Qt-Parent hat):
 
 # properties_win.py
@@ -408,7 +408,7 @@ def _on_btn_vacuum_clicked(self) -> None:
 
 ---
 
-## 📊 3. Akzeptanzkriterien (`test/test.py`)
+## 📊 3. Akzeptanzkriterien (`../../test/test.py`)
 1. `get_db_fragmentation_info()` liefert Prozent-, Bloat- und Größen-MB-Werte ohne Exception zurück.
 2. `execute_db_vacuum()` (CHECKPOINT + VACUUM) schließt fehlerfrei ab und erzeugt eine konsistente Datei (kein WAL-Replay beim nächsten Öffnen).
 3. `copy_database(src, dst)`-Helper (Kompaktierung): Kopie ist kleiner als die Bloat-Datei und enthält Schema + Daten vollständig (headless-Test wie `test/check_copy_database.py`).
@@ -426,16 +426,16 @@ def _on_btn_vacuum_clicked(self) -> None:
 ### 4.2 Vollständigkeit (Code-Befund)
 | Schritt | Doku-Vorgabe | Stand |
 |---|---|---|
-| Schritt 1 | `get_db_fragmentation_info()` / `execute_db_vacuum()` in `db/db_utils.py` | ❌ nicht vorhanden (`db_utils.py`: nur `_ensure_epoch`/`_parse_json_field`) |
-| Schritt 2 | Startup-Aufruf `main.py` + `label_db_status` | ❌ nicht vorhanden; Label existiert auch nicht in `ui/main_win.ui` |
-| Schritt 3 | VACUUM-Button in `properties_win.py` + Guard | ❌ nicht vorhanden |
+| Schritt 1 | `get_db_fragmentation_info()` / `execute_db_vacuum()` in `../../db/db_utils.py` | ❌ nicht vorhanden (`db_utils.py`: nur `_ensure_epoch`/`_parse_json_field`) |
+| Schritt 2 | Startup-Aufruf `../../main.py` + `label_db_status` | ❌ nicht vorhanden; Label existiert auch nicht in `../../ui/main_win.ui` |
+| Schritt 3 | VACUUM-Button in `../../properties_win.py` + Guard | ❌ nicht vorhanden |
 | AK 1–2 | Headless-Tests | ❌ nicht verifizierbar (Code fehlt) |
 
 ✅ Vorhanden als Grundlage: `_sync_pause_count` in `main.py:166` (Phase-16-EventBus-Guard, Signale `service_run_started`/`service_run_finished`).
 
 ### 4.3 Befunde der Konsistenz-/Korrektheits-Prüfung
 - **K1 (Guard wirkungslos):** `PersistentWindow.__init__` übergibt **kein Qt-Parent** (`super().__init__()` ohne parent, Logik-Parent nur für `state_manager`) → `self.parent()` ist `None` → `getattr(self.parent(), "_sync_pause_count", 0)` greift **nie** (immer Default 0).
-- **K2 (Label fehlt):** `label_db_status` existiert nicht in `ui/main_win.ui` (dort nur `status_label`); kein dedizierter Platz „unter dem Optionen-Button".
+- **K2 (Label fehlt):** `label_db_status` existiert nicht in `../../ui/main_win.ui` (dort nur `status_label`); kein dedizierter Platz „unter dem Optionen-Button".
 - **F1 (falscher PRAGMA-Spalten-Index):** `PRAGMA database_size` (DuckDB 1.5.5) liefert: `0 database_name, 1 database_size (VARCHAR), 2 block_size, 3 total_blocks, 4 used_blocks, 5 free_blocks, 6 wal_size, 7 memory_usage, 8 memory_limit`. Der Snippet nutzt `res[1], res[3]` = **`database_size` (String!)** + **`total_blocks`** → falsch.
 - **F2 (VACUUM wirkungslos, empirisch belegt):** `INSERT 500k → DELETE → VACUUM;` sowie `CHECKPOINT;` ändern die Dateigröße **nicht** (0 % Reduktion); `PRAGMA database_size` vor/nach identisch. DuckDB 1.5.5 besitzt **kein echtes VACUUM** wie SQLite – das Ziel „Bloat reduzieren" ist mit `VACUUM;` nicht erreichbar. AK2 („verringert/konsolidiert Blöcke") ist damit nicht erfüllbar.
 
@@ -444,12 +444,12 @@ def _on_btn_vacuum_clicked(self) -> None:
 |---|---|
 | **F1** (PRAGMA-Index) | ✅ **Bestätigt:** Korrektur auf `block_size, used_blocks = res[2], res[4]` |
 | **K1** (Concurrency-Guard) | ✅ **Bestätigt:** Guard über `EventBus`-Zähler (konsistent zu Phase 16) statt `self.parent()` |
-| **K2** (Status-Label) | ✅ **Bestätigt:** `label_db_status` wird ergänzt (in `ui/main_win.ui` oder per Code – Detail bei Umsetzung) |
+| **K2** (Status-Label) | ✅ **Bestätigt:** `label_db_status` wird ergänzt (in `../../ui/main_win.ui` oder per Code – Detail bei Umsetzung) |
 | **F2** (VACUUM-Ziel) | ✅ **Entschieden:** Zweistufige Lösung – **CHECKPOINT + VACUUM beim App-Exit** (reguläre Pflege) + **COPY FROM DATABASE-Methode** (echte Kompaktierung). Siehe 4.6 |
 | Umsetzung allgemein | ⏸️ **Zurückgestellt:** Kein Coding jetzt |
 
 ### 4.5 Ergänzungen (bei späterer Umsetzung zu beachten)
-- `db/db_utils.py`: `import os` (für `get_db_fragmentation_info`) und `from pathlib import Path` (für `copy_database`) im Snippet ergänzt; `DbPool`-Import ist innerhalb des `db`-Pakets zulässig (Basis-Schicht E4 bleibt sonst ohne Projekt-Import).
+- `../../db/db_utils.py`: `import os` (für `get_db_fragmentation_info`) und `from pathlib import Path` (für `copy_database`) im Snippet ergänzt; `DbPool`-Import ist innerhalb des `db`-Pakets zulässig (Basis-Schicht E4 bleibt sonst ohne Projekt-Import).
 - ✅ **Markdown-Artefakte `[cite: 1]` im Kapitel bereinigt** (12.08.2026, Abschnitte 2/3).
 - ✅ **Umsetzungsplan nachgezogen** (12.08.2026): Schritt 1–3 + AK entsprechen jetzt der F2-Lösung (CHECKPOINT+VACUUM, COPY FROM DATABASE, EventBus-Guard, `res[2]/res[4]`).
 - AK2-Formulierung folgt der F2-Lösung (siehe 4.6): `CHECKPOINT`/`VACUUM` allein verkleinern die Datei nicht – die **Kompaktierung** leistet `COPY FROM DATABASE`.
@@ -458,14 +458,14 @@ def _on_btn_vacuum_clicked(self) -> None:
 
 **Beschluss (12.08.2026):** Die DB-Pflege wird zweistufig umgesetzt. Empirisch belegt (DuckDB 1.5.5): `VACUUM;` und `CHECKPOINT;` verkleinern die Datei **nicht** (0 % Reduktion, `PRAGMA database_size` unverändert). Die tatsächliche Kompaktierung leistet die **`COPY FROM DATABASE`-Methode**.
 
-#### Stufe 1 – Beim Verlassen der App (regulär, `main.py` `closeEvent`)
+#### Stufe 1 – Beim Verlassen der App (regulär, `../../main.py` `closeEvent`)
 Beim App-Exit wird für jede DuckDB-Datei ausgeführt:
 ```sql
 CHECKPOINT;   -- WAL in Hauptdatei flushen (konsistenter Zustand)
 VACUUM;       -- formale Defragmentierung (in DuckDB 1.5.5 ohne Dateigrößen-Effekt)
 ```
 * Zweck: WAL wird aufgeräumt, die Datei in einen sauberen Zustand versetzt (kein WAL-Replay beim nächsten Start).
-* Aufruf über `execute_db_vacuum(db_path)`-Erweiterung in `db/db_utils.py` (führt `CHECKPOINT;` **gefolgt von** `VACUUM;` aus).
+* Aufruf über `execute_db_vacuum(db_path)`-Erweiterung in `../../db/db_utils.py` (führt `CHECKPOINT;` **gefolgt von** `VACUUM;` aus).
 * Gilt für `analytics.duckdb` und `market_data.duckdb` (bei Bedarf auch `app_data.duckdb`).
 * **Keine UI-Blockade:** App-Exit läuft, wenn keine Scans/Worker mehr aktiv sind (Referenzzähler `_sync_pause_count == 0`).
 
@@ -486,7 +486,7 @@ DETACH new_db;
 
 * Danach wird im Dateisystem die alte `analytics.duckdb` durch die kompakte `analytics_compacted.duckdb` ersetzt (Löschen/Umbenennen).
 * **Katalogname:** entspricht dem Datei-Basename ohne `.duckdb` (z. B. `analytics` für `analytics.duckdb`, `market_data` für `market_data.duckdb`). Bei Sonderzeichen (führender Unterstrich o. Ä.) ist der Katalogname in doppelte Anführungszeichen zu setzen: `COPY FROM DATABASE "_copy_src" TO new_db`.
-* **⚠️ Windows File-Locking:** Der Datei-Ersatz (alte Datei löschen/umbenennen) funktioniert **nur**, wenn **alle offenen DbPool-Verbindungen** zu dieser DB geschlossen sind – sonst wirft Windows `PermissionError` (Datei in Verwendung). Ablauf: (1) `copy_database()` ausführen, (2) **DbPool-Verbindung schliessen/leeren** (Methode in `db/db_pool.py`), (3) alte Datei löschen, (4) kompakte Datei umbenennen, (5) DB neu öffnen. Kein laufender Scan/Worker darf zugreifen (Guard `_sync_pause_count == 0`).
+* **⚠️ Windows File-Locking:** Der Datei-Ersatz (alte Datei löschen/umbenennen) funktioniert **nur**, wenn **alle offenen DbPool-Verbindungen** zu dieser DB geschlossen sind – sonst wirft Windows `PermissionError` (Datei in Verwendung). Ablauf: (1) `copy_database()` ausführen, (2) **DbPool-Verbindung schliessen/leeren** (Methode in `../../db/db_pool.py`), (3) alte Datei löschen, (4) kompakte Datei umbenennen, (5) DB neu öffnen. Kein laufender Scan/Worker darf zugreifen (Guard `_sync_pause_count == 0`).
 * **⚠️ Absoluter Pfad:** `ATTACH`/`copy_database` immer mit **absolutem Pfad** (`BASE_DIR / "data" / ...`) aufrufen – relative Pfade hängen vom CWD ab (Desktop-Start vs. IDE unterscheidet sich).
 * **Empirisch verifiziert** (headless, `test/check_copy_database.py`, nur Test-Dateien): Reduktion **85,4 %** gegen Bloat (Testfall mit vollständig gelöschten Daten); Schema, Tabellen, Constraints und Daten werden **vollständig** übertragen (PASS). Die reale Reduktion hängt vom tatsächlichen Bloat ab.
 * **Guard:** Kompaktierung nur bei `_sync_pause_count == 0` (keine laufenden Scans/Worker); sinnvoller Einstieg: der `[ 🧹 DB Service ]`-Button in `PropertiesWindow` (nur Kompaktierung; App-Exit macht CHECKPOINT+VACUUM).
@@ -515,7 +515,7 @@ DETACH new_db;
 **Meldung:** `ValueError: could not broadcast input array from shape (4,) into shape (0,)`
 bei `SILVER/M1` im LiveAnalyzer (`df_short = df_plugin.tail(2)` -> 1-2 Bars).
 
-**Ursache:** `chart/indicators/utils/ma_template.py`: `_sma_values`, `_wma_values`,
+**Ursache:** `../../chart/indicators/utils/ma_template.py`: `_sma_values`, `_wma_values`,
 `_alma_values`, `_vwma_values` nutzen `np.convolve(..., "valid")` + Zuweisung
 `result[period-1:] = conv`. Ist die Serie kuerzer als `period`, liefert convolve
 ein Array der Laenge `period-n+1` (z. B. 4), waehrend `result[period-1:]` leer
@@ -607,15 +607,15 @@ bestimmt.
 
 | Datei | Aenderung |
 |---|---|
-| `chart/indicators/utils/ma_template.py` | 4x Warmup-Guard (Serie < period -> NaN) |
-| `analytics/features/feature_builder.py` | `purge_instance_data(..., purge_legacy=False)` |
-| `serviceui/service_win.py` | `_purge_legacy_allowed` + purge_legacy + Progress-Reset |
-| `serviceui/service_selector_dialog.py` | `_purge_legacy_allowed` + Progress-Bar + Reset |
-| `analytics/ui/heatmap_widget.py` | `_format_heatmap_value` (2 NK), `_bar_interval_seconds(data_tf)`, Overlay-TF-Label |
-| `test/` | `check_hma_pivot_bug.py`, `check_purge_legacy.py`, `check_heatmap_format.py`, `check_overlay_tf_precedence.py` |
+| `../../chart/indicators/utils/ma_template.py` | 4x Warmup-Guard (Serie < period -> NaN) |
+| `../../analytics/features/feature_builder.py` | `purge_instance_data(..., purge_legacy=False)` |
+| `../../serviceui/service_win.py` | `_purge_legacy_allowed` + purge_legacy + Progress-Reset |
+| `../../serviceui/service_selector_dialog.py` | `_purge_legacy_allowed` + Progress-Bar + Reset |
+| `../../analytics/ui/heatmap_widget.py` | `_format_heatmap_value` (2 NK), `_bar_interval_seconds(data_tf)`, Overlay-TF-Label |
+| `../../test` | `check_hma_pivot_bug.py`, `check_purge_legacy.py`, `check_heatmap_format.py`, `check_overlay_tf_precedence.py` |
 
-**Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
-`config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
+**Nicht angefasst:** 21.02-Working-Tree-Dateien (`../../db/db_utils.py`, `../../db/db_pool.py`,
+`../../config/event_bus.py`, `../../main.py`, `../../properties_win.py`, `../../ui/main_win.ui`).
 
 ---
 
@@ -702,12 +702,12 @@ sofort; die Pills der uebrigen Varianten zeigen nur noch deren eigene Daten.
 
 | Datei | Aenderung |
 |---|---|
-| `analytics/engine/feature_store_reader.py` | `fetch_service_tf_status(plugin_id, instance_hash=None)` - Varianten-Filter |
-| `serviceui/service_win.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
-| `serviceui/service_selector_dialog.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
+| `../../analytics/engine/feature_store_reader.py` | `fetch_service_tf_status(plugin_id, instance_hash=None)` - Varianten-Filter |
+| `../../serviceui/service_win.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
+| `../../serviceui/service_selector_dialog.py` | Progress-Bar determinate (Init + Reset); `_resolve_badge_scope` + `_refresh_badge_bar(pid, hash)` |
 
-**Nicht angefasst:** 21.02-Working-Tree-Dateien (`db/db_utils.py`, `db/db_pool.py`,
-`config/event_bus.py`, `main.py`, `properties_win.py`, `ui/main_win.ui`).
+**Nicht angefasst:** 21.02-Working-Tree-Dateien (`../../db/db_utils.py`, `../../db/db_pool.py`,
+`../../config/event_bus.py`, `../../main.py`, `../../properties_win.py`, `../../ui/main_win.ui`).
 
 ---
 
@@ -797,7 +797,7 @@ Trifft die Steuerung auf widersprüchliche Eingaben oder Beschränkungen, entsch
 
 * **Range-Picker:** Presets (`24h`, `7d`, `30d`, `YTD`) & Benutzerdefiniert.
 
-* **View-Templates (Presets):** Speichern und Laden von kompletten Filter-Konfigurationen. Das `MtfFilterBarWidget` nutzt den bestehenden `SchemaMigrator` (`analytics/engine/schema_migrator.py`), um gespeicherte Preset-JSONs in-memory zu validieren und abwärtskompatibel um neue TFs/Session-Keys zu erweitern (Payload-Key `mtf_fc_schema_version = "1.0.0"`).
+* **View-Templates (Presets):** Speichern und Laden von kompletten Filter-Konfigurationen. Das `MtfFilterBarWidget` nutzt den bestehenden `SchemaMigrator` (`../../analytics/engine/schema_migrator.py`), um gespeicherte Preset-JSONs in-memory zu validieren und abwärtskompatibel um neue TFs/Session-Keys zu erweitern (Payload-Key `mtf_fc_schema_version = "1.0.0"`).
 * **Tabellen-Sortierung:** Dropdown für `[ Datum 🠇 ]`, `[ Signal-Stärke 🠇 ]`, `[ TF 🠅 ]`.
 
 2. **Session-Filter & DST-Normalisierung:**
@@ -929,9 +929,9 @@ Das System differenziert strikt zwischen fünf Fehlerklassen und verknüpft sie 
 
 ---
 
-## 📊 7. Headless-Validierung (`test/test.py`)
+## 📊 7. Headless-Validierung (`../../test/test.py`)
 
-Folgende Tests verifizieren das System in `test/test.py` ohne GUI-Ausführung:
+Folgende Tests verifizieren das System in `../../test/test.py` ohne GUI-Ausführung:
 
 1. **Hysterese-Boundary-Test:**
 * Testet exakt die Schwellwerte: $1.99\text{ d} \to M1$, $2.01\text{ d} \to$ kein Wechsel, $3.49\text{ d} \to$ kein Wechsel, $3.51\text{ d} \to H1$.
@@ -986,7 +986,7 @@ Der Umsetzungsplan folgt der Schichten-Architektur **bottom-up** (Schicht 2 → 
 3. **21.03.07:** Das Control-Panel konsumiert State, Boundary und SchemaMigrator (kein SQL in UI, MVVM-Grundsatz 4).
 4. **21.03.08:** Die Kaskaden-Anbindung an PyLWC braucht die Engine (21.03.03) und das Panel (21.03.07).
 5. **21.03.09:** Badges/Geister-Marker brauchen die State-Machine (21.03.05) und das Chart-Rendering (21.03.08).
-6. **21.03.10:** Integrationstests laufen erst, wenn alle Bausteine stehen; danach Cleanup von `test/` (Grundsatz 10).
+6. **21.03.10:** Integrationstests laufen erst, wenn alle Bausteine stehen; danach Cleanup von `../../test` (Grundsatz 10).
 
 ---
 
@@ -998,8 +998,8 @@ Bereitstellung des dedizierten, isolierten Namespace `PluginContext.shared_state
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_state.py` – Default-Factory/Struktur des `shared_state["mtf_fc"]`-Namespaces.
-- **Neu:** `analytics/engine/mtf_fc_provider.py` – Cache-Versionierung `(symbol, timeframe, partition)` + `source_max_timestamp`, `get_earliest_timestamp(symbol, timeframe)`, gekapselte Reads über `fetch_daily_ohlc` / `fetch_ohlcv_snapshot` (read-only, DbPool).
+- **Neu:** `../../analytics/engine/mtf_fc_state.py` – Default-Factory/Struktur des `shared_state["mtf_fc"]`-Namespaces.
+- **Neu:** `../../analytics/engine/mtf_fc_provider.py` – Cache-Versionierung `(symbol, timeframe, partition)` + `source_max_timestamp`, `get_earliest_timestamp(symbol, timeframe)`, gekapselte Reads über `fetch_daily_ohlc` / `fetch_ohlcv_snapshot` (read-only, DbPool).
 - **Geändert:** keine Bestands-Kernklassen (Grundsatz 11).
 
 ## 🛠️ Umsetzungsschritte
@@ -1016,7 +1016,7 @@ Bereitstellung des dedizierten, isolierten Namespace `PluginContext.shared_state
 
 ## ✅ Headless-Verifikation
 
-- `test/test.py`: Namespace-Default-Struktur (alle Keys aus §5 vorhanden), `get_earliest_timestamp("SILVER", "M1")` ≈ 2013-06-05 (reale DB), Cache-Eintrag bildet `(symbol, timeframe, partition)` korrekt ab, stale-Erkennung bei veraltetem `source_max_timestamp`.
+- `../../test/test.py`: Namespace-Default-Struktur (alle Keys aus §5 vorhanden), `get_earliest_timestamp("SILVER", "M1")` ≈ 2013-06-05 (reale DB), Cache-Eintrag bildet `(symbol, timeframe, partition)` korrekt ab, stale-Erkennung bei veraltetem `source_max_timestamp`.
 
 ---
 
@@ -1028,8 +1028,8 @@ Präzise Ermittlung der M1-Verfügbarkeitsgrenze und Umsetzung der Boundary Poli
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_boundary.py` – Boundary-Evaluierung (reine Logik, kein UI-Import).
-- **Geändert:** `test/test.py` (Test 3).
+- **Neu:** `../../analytics/engine/mtf_fc_boundary.py` – Boundary-Evaluierung (reine Logik, kein UI-Import).
+- **Geändert:** `../../test/test.py` (Test 3).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1054,8 +1054,8 @@ Zoom-Kaskade mit Haupt-Stufen M1 → M5 → H1 → H4 → D1, Zoom-Bändern, Hys
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_cascade.py` – reine Logik, keinerlei UI-Import (Grundsatz 4/11).
-- **Geändert:** `test/test.py` (Test 1 + 2).
+- **Neu:** `../../analytics/engine/mtf_fc_cascade.py` – reine Logik, keinerlei UI-Import (Grundsatz 4/11).
+- **Geändert:** `../../test/test.py` (Test 1 + 2).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1087,8 +1087,8 @@ Gewichtete Confluence-Scores mit vollständigem Gewichtungs-Schema, Min-Max-Norm
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_confluence.py` – Score-Berechnung (reine Logik).
-- **Geändert:** `test/test.py` (Test 5).
+- **Neu:** `../../analytics/engine/mtf_fc_confluence.py` – Score-Berechnung (reine Logik).
+- **Geändert:** `../../test/test.py` (Test 5).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1111,8 +1111,8 @@ Umsetzung der Zustandstabelle (§3.1) und der Prioritäts-Kette (§3.2): Hard Da
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_guards.py` – Prioritaäts-Kette (reine Logik).
-- **Geändert:** `test/test.py` (Test 4).
+- **Neu:** `../../analytics/engine/mtf_fc_guards.py` – Prioritaäts-Kette (reine Logik).
+- **Geändert:** `../../test/test.py` (Test 4).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1140,8 +1140,8 @@ Partitionierte RAM-Cache-Invalidierung: $affected\_partition = partition(symbol,
 
 ## 📁 Dateien
 
-- **Neu:** `analytics/engine/mtf_fc_partition.py` – Partitionierung + Invalidierung (reine Logik).
-- **Geändert:** `test/test.py` (Test 6).
+- **Neu:** `../../analytics/engine/mtf_fc_partition.py` – Partitionierung + Invalidierung (reine Logik).
+- **Geändert:** `../../test/test.py` (Test 6).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1163,9 +1163,9 @@ Filterleiste mit Source-Data-TF, Chart-Overlay-TF, Range-Picker, View-Templates 
 
 ## 📁 Dateien
 
-- **Neu:** `chart/widgets/mtf_filter_bar.py` – `MtfFilterBarWidget` (QWidget, reines Event-Handling/Rendering).
-- **Neu:** `analytics/engine/mtf_fc_templates.py` – View-Template-Persistenz via `SchemaMigrator` (Payload-Key `mtf_fc_schema_version = "1.0.0"`, in-memory, abwärtskompatibel).
-- **Geändert:** `chart/chart_win.py` (Integration der Filterleiste), `analytics/ui/analytics_win.py` (Tabellen-Sortierung, falls betroffen).
+- **Neu:** `../../chart/widgets/mtf_filter_bar.py` – `MtfFilterBarWidget` (QWidget, reines Event-Handling/Rendering).
+- **Neu:** `../../analytics/engine/mtf_fc_templates.py` – View-Template-Persistenz via `SchemaMigrator` (Payload-Key `mtf_fc_schema_version = "1.0.0"`, in-memory, abwärtskompatibel).
+- **Geändert:** `../../chart/chart_win.py` (Integration der Filterleiste), `../../analytics/ui/analytics_win.py` (Tabellen-Sortierung, falls betroffen).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1194,7 +1194,7 @@ Anbindung der Kaskaden-Engine an die PyLWC-Zoom-Interaktion, Puls-Breadcrumb und
 ## 📁 Dateien
 
 - **Neu:** `chart/js/07_mtf_fc.js` – Zoom-Hook auf `visibleRangeChanged`, Kaskaden-Trigger, Puls-Breadcrumb, Boundary-UI.
-- **Geändert:** `chart/js/04_live_updates.js` (optionaler Hook-Aufruf, Muster `06_two_tier.js`), `chart/chart_win.py` (Kaskaden-Umschaltung + `tf_combo`-Sync), `chart/chart_basics.py` (`JS_FILES`-Liste erweitern).
+- **Geändert:** `../../chart/js/04_live_updates.js` (optionaler Hook-Aufruf, Muster `06_two_tier.js`), `../../chart/chart_win.py` (Kaskaden-Umschaltung + `tf_combo`-Sync), `../../chart/chart_basics.py` (`JS_FILES`-Liste erweitern).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1219,7 +1219,7 @@ Interaktive TF-Badges (Klick = Filter, Strg+Klick = Multi-Select) und Geister-Ma
 ## 📁 Dateien
 
 - **Neu:** `chart/js/08_mtf_layers.js` – Badges, Geister-Marker, sanfte Viewport-Animation.
-- **Geändert:** `chart/chart_win.py` (Guard-Override-Trigger über 21.03.05), `chart/js/03_chart_rendering.js` (Ghost-Pfeil am Viewport-Rand), `chart/chart_basics.py` (`JS_FILES`).
+- **Geändert:** `../../chart/chart_win.py` (Guard-Override-Trigger über 21.03.05), `../../chart/js/03_chart_rendering.js` (Ghost-Pfeil am Viewport-Rand), `../../chart/chart_basics.py` (`JS_FILES`).
 
 ## 🛠️ Umsetzungsschritte
 
@@ -1238,22 +1238,22 @@ Interaktive TF-Badges (Klick = Filter, Strg+Klick = Multi-Select) und Geister-Ma
 
 ## 🎯 Ziel
 
-Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller Tests und Cleanup von `test/` (Grundsatz 10).
+Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller Tests und Cleanup von `../../test` (Grundsatz 10).
 
 ## 📁 Dateien
 
-- **Geändert:** `test/test.py` (Test 7).
+- **Geändert:** `../../test/test.py` (Test 7).
 
 ## 🛠️ Umsetzungsschritte
 
 1. Test 7 (Service-Failure-Degradation): drei aufeinanderfolgende Fehler von Service A → RAM-Quarantäne; Service B läuft weiter; Service C meldet `dependency_failed`; der alte `shared_state` bleibt erhalten; `reset()` hebt die Quarantäne auf. Basis: bestehendes `execute_set_resilient()` in `set_evaluator.py` – kein Umbau der Engine nötig.
-2. Alle 7 Tests aus §7 in `test/test.py` ausführen (headless, kein `QApplication.exec()`, Grundsatz 2).
-3. Cleanup: temporäre Test-Skripte und `*.duckdb`-Dateien aus `test/` entfernen – es verbleibt nur der Harness `test/test.py` (Grundsatz 10).
-4. Implementierungs-Log: Einträge je 21.03.xx in `docs/AKTUELLE_UMSETZUNG.md` nach Bestätigung des Anwenders (Taxonomie 21.03, Format MD).
+2. Alle 7 Tests aus §7 in `../../test/test.py` ausführen (headless, kein `QApplication.exec()`, Grundsatz 2).
+3. Cleanup: temporäre Test-Skripte und `*.duckdb`-Dateien aus `../../test` entfernen – es verbleibt nur der Harness `../../test/test.py` (Grundsatz 10).
+4. Implementierungs-Log: Einträge je 21.03.xx in `../AKTUELLE_UMSETZUNG.md` nach Bestätigung des Anwenders (Taxonomie 21.03, Format MD).
 
 ## ✅ Headless-Verifikation
 
-- Gesamtlauf `test/test.py` (alle Checks PASS); `test/`-Inhalt = nur `test.py`.
+- Gesamtlauf `../../test/test.py` (alle Checks PASS); `../../test`-Inhalt = nur `test.py`.
 
 ---
 
@@ -1266,7 +1266,7 @@ Service-Failure-Degradation-Integrationstest (§7 Test 7) sowie Gesamtlauf aller
 ## 📋 Bug 1 – Heatmap-Legende: korrekte Operator-Beschriftung
 
 **Meldung:** Legende muss korrekt mit `=`, `>`, `<`, `>=` oder `<=` beschriftet sein.
-**Klarstellung:** Die **Heatmap-Legende** (`analytics/ui/heatmap_widget.py`, `_update_legend`).
+**Klarstellung:** Die **Heatmap-Legende** (`../../analytics/ui/heatmap_widget.py`, `_update_legend`).
 
 **Befund (Code):** Die diskrete Confluence-Legende beschriftet die Farbfelder aktuell
 nur mit Zahlen (`0`, `1`, …, `4`, `5+`); die kontinuierliche Viridis-Legende mit
@@ -1281,7 +1281,7 @@ Rohwerten. Keine Operator-Semantik.
 
 **Meldung:** Bei H1-Auswahl wird beim Zoom-In nicht in kleinere TFs gebohrt, obwohl sie vorhanden sind.
 
-**Befund (Code):** `analytics/engine/mtf_fc_cascade.py` (Band 2): `range_days < 2.0 d`
+**Befund (Code):** `../../analytics/engine/mtf_fc_cascade.py` (Band 2): `range_days < 2.0 d`
 → Kandidat `M5` (Zoom-In), darunter M1. Die Hysterese hält zwischen 2.0 d und 3.5 d
 stabil. Zusätzlich greift der Transition Guard (`CROSSFADE_DURATION_MS = 250`), nach
 einer Schaltung ist 250 ms lang keine weitere erlaubt. Logik headless verifiziert
@@ -1295,10 +1295,10 @@ Flow nachziehen (kein Kaskaden-Logik-Fix nötig, da Engine headless grün).
 ## 📋 Bug 3 – „Alle TF ausführen" aktualisiert das Analytics-Hauptfenster nicht
 
 **Meldung:** Wenn im Service „alle TF ausgeführt" wird, wird das Focus Widget nicht aktualisiert.
-**Klarstellung:** **Analytics-Hauptfenster** (`analytics/ui/analytics_win.py`, Heatmap/Tabelle).
+**Klarstellung:** **Analytics-Hauptfenster** (`../../analytics/ui/analytics_win.py`, Heatmap/Tabelle).
 
 **Befund (Code):** `ServiceRunWorker` emittiert `event_bus.service_set_changed` genau
-**einmal** nach Abschluss des Runs (`serviceui/run_worker.py`, `_emit_service_changed`).
+**einmal** nach Abschluss des Runs (`../../serviceui/run_worker.py`, `_emit_service_changed`).
 Das `AnalyticsWindow` verbindet sich jedoch **nicht** auf `service_set_changed` (nur auf
 `profile_changed`, `favorites_changed`). Das `ServiceSelectorModel` refreshed sich, die
 Analytics-Queries aber nicht.
@@ -1311,7 +1311,7 @@ Heatmap/Tabelle nach jedem abgeschlossenen Service-Run automatisch neu geladen.
 
 **Meldung:** Bei M15 (statt H1) ist je Block auf der Achse immer noch 12-Stunden-x-teiler; sollte angepasst werden.
 
-**Befund (Code):** `chart/js/04_live_updates.js` (`tickMarkFormatter`) ist **TF-unabhängig**
+**Befund (Code):** `../../chart/js/04_live_updates.js` (`tickMarkFormatter`) ist **TF-unabhängig**
 – er formatiert nur (`TT.MM.JJ` vs. `HH:MM`). Die Tick-Dichte bestimmt LWC v5 aus der
 Viewport-Breite, nicht aus dem gewählten TF. Es gibt keine TF-spezifische Achsen-Granularität.
 
@@ -1324,7 +1324,7 @@ in `04_live_updates.js` (Additiv, kein Kern-Umbau).
 
 **Meldung:** Die Zoom-Slider an der Heatmap (einer für X, einer für Y) sollten mit dem Maus-Zoom korrelieren und verbunden sein.
 
-**Befund (Code):** `analytics/ui/heatmap_widget.py` hat X/Y-Slider
+**Befund (Code):** `../../analytics/ui/heatmap_widget.py` hat X/Y-Slider
 (`_slider_zoom_x`/`_slider_zoom_y`, 5..100). Die Verdrahtung ist **einseitig**:
 Slider-Änderung → `_on_zoom_x/y_changed` → `_set_zoom_range` → `_apply_x/y_range`
 (`setXRange`/`setYRange`). Es gibt **keinen** `sigRangeChanged`-Hook der Plot-ViewBox
@@ -1342,7 +1342,7 @@ sichtbar; weitere Elemente vermutlich ebenfalls nicht nutzbar. Der Range-Picker 
 (nicht immer alle Jahre sehen).
 
 **Befund (Code + headless Strukturcheck):** Die `MtfFilterBarWidget` wird in
-`chart/chart_win.py` (Zeile ~486-490) an `verticalLayout_toolbar` angehängt – Strukturcheck
+`../../chart/chart_win.py` (Zeile ~486-490) an `verticalLayout_toolbar` angehängt – Strukturcheck
 offscreen bestätigt: Layout gefunden, 2→3 Items, Einfügen OK. **Ursache der Nicht-Sichtbarkeit:**
 `sizeHint` der Leiste = **w 2248 px** (bei 1200 px Fensterbreite) → die Zeile läuft über,
 wird abgeschnitten/geclippt, die Controls sind nicht erreichbar.
@@ -1369,67 +1369,67 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 
 ## 21.03.01 – Data Provider & `shared_state`-Namespace (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_state.py` (Namespace-Factory `default_mtf_fc_state()`, `ensure_mtf_fc_namespace()` – alle Keys aus §5), `analytics/engine/mtf_fc_provider.py` (`MtfFcProvider` mit `get_earliest_timestamp`/`get_latest_timestamp` via MIN/MAX `"time"`, Cache-Key `(symbol, timeframe, partition)`, `is_cache_valid`, `read_namespace`/`write_namespace`, `clear_partition`).
-- **Verifikation:** Namespace-Default-Struktur (alle §5-Keys), `get_earliest_timestamp("SILVER", "M1")` ≈ 2013-06-05 (reale DB, Wanduhr), Cache-Stale-Erkennung bei veraltetem `source_max_timestamp` – Test 1-Teilblock in `test/test.py` PASS.
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_state.py` (Namespace-Factory `default_mtf_fc_state()`, `ensure_mtf_fc_namespace()` – alle Keys aus §5), `../../analytics/engine/mtf_fc_provider.py` (`MtfFcProvider` mit `get_earliest_timestamp`/`get_latest_timestamp` via MIN/MAX `"time"`, Cache-Key `(symbol, timeframe, partition)`, `is_cache_valid`, `read_namespace`/`write_namespace`, `clear_partition`).
+- **Verifikation:** Namespace-Default-Struktur (alle §5-Keys), `get_earliest_timestamp("SILVER", "M1")` ≈ 2013-06-05 (reale DB, Wanduhr), Cache-Stale-Erkennung bei veraltetem `source_max_timestamp` – Test 1-Teilblock in `../../test/test.py` PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.02 – Boundary Policy & Historien-Detection (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_boundary.py` (`MtfFcBoundary` mit `resolve_boundary`, `evaluate_coverage` native/fallback, `format_available_date` als `DD.MM.JJJJ`, Wanduhr-Formatierung ohne Berlin-Offset, Fallback-Kandidaten M5/M15/H1/H4/D1). Regel: höhere Aggregationsstufe wird nie als M1 deklariert.
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_boundary.py` (`MtfFcBoundary` mit `resolve_boundary`, `evaluate_coverage` native/fallback, `format_available_date` als `DD.MM.JJJJ`, Wanduhr-Formatierung ohne Berlin-Offset, Fallback-Kandidaten M5/M15/H1/H4/D1). Regel: höhere Aggregationsstufe wird nie als M1 deklariert.
 - **Verifikation:** Test 3 (Daten vor M1-Grenze → `fallback`/`source_tf = "H1"`, nach Grenze → `"native"`) PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.03 – Hysterese-Kaskaden-Engine (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_cascade.py` – Schwellwerte (M1/M5→H1 bei 3.5 d, H1→M5 bei <2.0 d, H1→H4 bei >10 d, H4→D1 bei >35 d, D1→H4 bei <28 d), `CROSSFADE_DURATION_MS = 250`, `evaluate_cascade`, `transition_guard_ok`, `apply_transition`, Telemetrie `(trigger, from_tf, to_tf, range_days)`.
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_cascade.py` – Schwellwerte (M1/M5→H1 bei 3.5 d, H1→M5 bei <2.0 d, H1→H4 bei >10 d, H4→D1 bei >35 d, D1→H4 bei <28 d), `CROSSFADE_DURATION_MS = 250`, `evaluate_cascade`, `transition_guard_ok`, `apply_transition`, Telemetrie `(trigger, from_tf, to_tf, range_days)`.
 - **Verifikation:** Test 1 (Hysterese-Boundary 1.99/2.01/3.49/3.51 d) + Test 2 (20-fach Anti-Oszillation im Fenster [1.9 d, 3.6 d]) PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.04 – Confluence-Gewichtung & Normalisierung (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_confluence.py` – Gewichte (D1=3.0, H4=2.5, H1=2.0, M15/M30=1.5, M5=1.2, M1=1.0), `min_max_normalize` mit Constant-Matrix-Policy (flache Matrix → 0.5, keine Division durch Null), `volatility_ratio` mit Clamp 0.2–5.0 und Deaktivierung bei ATR ≤ 1e-6.
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_confluence.py` – Gewichte (D1=3.0, H4=2.5, H1=2.0, M15/M30=1.5, M5=1.2, M1=1.0), `min_max_normalize` mit Constant-Matrix-Policy (flache Matrix → 0.5, keine Division durch Null), `volatility_ratio` mit Clamp 0.2–5.0 und Deaktivierung bei ATR ≤ 1e-6.
 - **Verifikation:** Test 5 (flache Matrix → 0.5; W-D1-Übermacht vor Min-Max) PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.05 – State-Machine & Prioritäts-Kette (Guards & Override) (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_guards.py` – `apply_priority_chain` (Ebene 1 Hard Data Availability Guard → Ebene 2 Temporary User Override → Ebene 3 Fixed Data-TF Guard → Ebene 4 Auto Cascade → Ebene 5 Visual Preference), `start_override`/`reset_override` mit Transaktions-Semantik (`previous_data_tf`, `target_tf`, `reason`), `override_badge_text`, Inkongruenz-Warnung `WARNING_INCONGRUENT`.
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_guards.py` – `apply_priority_chain` (Ebene 1 Hard Data Availability Guard → Ebene 2 Temporary User Override → Ebene 3 Fixed Data-TF Guard → Ebene 4 Auto Cascade → Ebene 5 Visual Preference), `start_override`/`reset_override` mit Transaktions-Semantik (`previous_data_tf`, `target_tf`, `reason`), `override_badge_text`, Inkongruenz-Warnung `WARNING_INCONGRUENT`.
 - **Verifikation:** Test 4 (M15-Fix + D1-Geister-Marker-Klick → `previous_data_tf = "M15"`, Reset stellt exakt wieder her) PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.06 – Event-Partitionierung & Cache-Invalidierung (12.08.2026 17:11)
 
-- **Umgesetzt:** `analytics/engine/mtf_fc_partition.py` – `partition`, `invalidate_partition` (+ `cache_generation`-Inkrement), `invalidate_partition_via_provider`; Integration mit Provider-Cache-Versionierung (21.03.01).
+- **Umgesetzt:** `../../analytics/engine/mtf_fc_partition.py` – `partition`, `invalidate_partition` (+ `cache_generation`-Inkrement), `invalidate_partition_via_provider`; Integration mit Provider-Cache-Versionierung (21.03.01).
 - **Verifikation:** Test 6 (historischer Tick t = vor 5 Tagen → exakt die betroffene Zeit-Partition wird invalidiert, alle übrigen bleiben) PASS.
 - **Commit:** `4217e71`
 
 ## 21.03.07 – MtfFilterBarWidget & Control-Panel (UI) (12.08.2026 17:16)
 
-- **Umgesetzt:** `chart/widgets/mtf_filter_bar.py` (`MtfFilterBarWidget`, MVVM – keine SQL/DB in UI): Source-Data-TF (`multi`/Fixiert), Chart-Overlay-TF (Auto/Manuell), Range-Picker (24h/7d/30d/YTD/benutzerdefiniert), Sortierung, Sessions (London/NY/Tokio), Presets; Signale für Data-TF/Range/TF-Wechsel. `analytics/engine/mtf_fc_templates.py` (`create_template`, `migrate_template` mit SchemaMigrator-Semantik, Payload-Key `mtf_fc_schema_version = "1.0.0"`, `MtfFcTemplateStore` in-memory).
+- **Umgesetzt:** `../../chart/widgets/mtf_filter_bar.py` (`MtfFilterBarWidget`, MVVM – keine SQL/DB in UI): Source-Data-TF (`multi`/Fixiert), Chart-Overlay-TF (Auto/Manuell), Range-Picker (24h/7d/30d/YTD/benutzerdefiniert), Sortierung, Sessions (London/NY/Tokio), Presets; Signale für Data-TF/Range/TF-Wechsel. `../../analytics/engine/mtf_fc_templates.py` (`create_template`, `migrate_template` mit SchemaMigrator-Semantik, Payload-Key `mtf_fc_schema_version = "1.0.0"`, `MtfFcTemplateStore` in-memory).
 - **Verifikation:** `py_compile` aller Dateien; Code-Inspektion (kein SQL in UI, EventBus-Entkopplung); Template-Migration headless (T7v1/v2) PASS.
 - **Commit:** `4425bc9`
 
 ## 21.03.08 – Chart-Integration: Kaskade, Puls-Breadcrumb & Historien-Anzeige (12.08.2026 17:16)
 
-- **Umgesetzt:** `chart/js/07_mtf_fc.js` (Zoom-Hook `pyBridge.onViewportChanged`, `_mtfFcApplyRange`, Puls-Breadcrumb, Boundary-UI), `chart/js/04_live_updates.js` (optionale Hooks `_onMtfFcFullUpdate`/`_onMtfFcVisibleRangeChanged`), `chart/chart_basics.py` (`JS_FILES` erweitert), `chart/chart_win.py` (`ChartBridge.viewportChanged`, MTF-FC-Init, `_on_mtf_fc_viewport_changed`, `_on_mtf_fc_range_changed`, `_mtf_fc_switch_tf`, `mtfFcState` im Update-Payload).
+- **Umgesetzt:** `chart/js/07_mtf_fc.js` (Zoom-Hook `pyBridge.onViewportChanged`, `_mtfFcApplyRange`, Puls-Breadcrumb, Boundary-UI), `../../chart/js/04_live_updates.js` (optionale Hooks `_onMtfFcFullUpdate`/`_onMtfFcVisibleRangeChanged`), `../../chart/chart_basics.py` (`JS_FILES` erweitert), `../../chart/chart_win.py` (`ChartBridge.viewportChanged`, MTF-FC-Init, `_on_mtf_fc_viewport_changed`, `_on_mtf_fc_range_changed`, `_mtf_fc_switch_tf`, `mtfFcState` im Update-Payload).
 - **Verifikation:** `node --check` auf allen JS-Dateien; `py_compile`; Code-Inspektion.
 - **Commit:** `4425bc9`
 
 ## 21.03.09 – Interaktives Layering: TF-Badges & Geister-Marker (12.08.2026 17:16)
 
-- **Umgesetzt:** `chart/js/08_mtf_layers.js` (TF-Badges `onBadgeClick`, Geister-Marker `onGhostMarkerClick`, Reset-Badge, `animateToGhostLevel`), `chart/chart_win.py` (`badgeClicked`, `ghostMarkerClicked`, `guardOverrideReset`, `_push_mtf_fc_override_ui`, Handler `_on_mtf_fc_badge_clicked`, `_on_mtf_fc_ghost_marker_clicked`, `_on_mtf_fc_guard_reset`).
+- **Umgesetzt:** `chart/js/08_mtf_layers.js` (TF-Badges `onBadgeClick`, Geister-Marker `onGhostMarkerClick`, Reset-Badge, `animateToGhostLevel`), `../../chart/chart_win.py` (`badgeClicked`, `ghostMarkerClicked`, `guardOverrideReset`, `_push_mtf_fc_override_ui`, Handler `_on_mtf_fc_badge_clicked`, `_on_mtf_fc_ghost_marker_clicked`, `_on_mtf_fc_guard_reset`).
 - **Verifikation:** `node --check`; `py_compile`; Code-Inspektion (Guard-Override-Trigger über 21.03.05, Reset stellt `previous_data_tf` wieder her).
 - **Commit:** `4425bc9`
 
 ## 21.03.10 – Abschluss: Integrationstest & Cleanup (12.08.2026 17:20)
 
-- **Umgesetzt:** Test 7 (Service-Failure-Degradation) standalone verifiziert und als Tests 1–7 (inkl. T7v1/v2 Template-Migration) in `test/test.py` integriert; Gesamtlauf ausgeführt; Cleanup temporärer Skripte (`check_mtf_fc.py`, `check_mtf_fc_test7.py`, `check_mtf_fc_ui.py`, `test_output_stderr.txt`) – verbleibt nur der Harness `test/test.py` (Grundsatz 10).
-- **Verifikation:** `py_compile test/test.py` EXIT 0; Gesamtlauf: **alle 21.03 MTF-FC-Checks PASS** (T1a–T7.7, T7v1/v2). 26 vorbestehende FAILs (Fenster-/Reflow-, JSON-Feld-Auflösung, `instance_hash`-Binder in den 20.03-Analytics-Tests) sind Bestandszustand und nicht durch MTF-FC verursacht – der 21.03-Block ist vollständig grün. Keine neuen Quell-Commits nötig (Code bereits in `4217e71`/`4425bc9`, `test/` gitignored).
+- **Umgesetzt:** Test 7 (Service-Failure-Degradation) standalone verifiziert und als Tests 1–7 (inkl. T7v1/v2 Template-Migration) in `../../test/test.py` integriert; Gesamtlauf ausgeführt; Cleanup temporärer Skripte (`check_mtf_fc.py`, `check_mtf_fc_test7.py`, `check_mtf_fc_ui.py`, `test_output_stderr.txt`) – verbleibt nur der Harness `../../test/test.py` (Grundsatz 10).
+- **Verifikation:** `py_compile test/test.py` EXIT 0; Gesamtlauf: **alle 21.03 MTF-FC-Checks PASS** (T1a–T7.7, T7v1/v2). 26 vorbestehende FAILs (Fenster-/Reflow-, JSON-Feld-Auflösung, `instance_hash`-Binder in den 20.03-Analytics-Tests) sind Bestandszustand und nicht durch MTF-FC verursacht – der 21.03-Block ist vollständig grün. Keine neuen Quell-Commits nötig (Code bereits in `4217e71`/`4425bc9`, `../../test` gitignored).
 - **Commit:** – (nur Doku)
 
 ## 21.03.11 – Buglist-Auswertung & Fix-Plan (12.08.2026, Analyse)
 
-- **Umgesetzt:** **Nur Doku/Analyse (kein Coding).** Die vom Anwender gemeldete Buglist (6 Punkte) wurde gegen den Code ausgewertet; Fix-Pläne in `docs/AKTUELLE_UMSETZUNG.md` (Kapitel 21.03.11) dokumentiert. Zusätzlich eine beschädigte Zeile in der Doku (Zeile 107, „Steuerungselemente:6) definiti") bereinigt.
+- **Umgesetzt:** **Nur Doku/Analyse (kein Coding).** Die vom Anwender gemeldete Buglist (6 Punkte) wurde gegen den Code ausgewertet; Fix-Pläne in `../AKTUELLE_UMSETZUNG.md` (Kapitel 21.03.11) dokumentiert. Zusätzlich eine beschädigte Zeile in der Doku (Zeile 107, „Steuerungselemente:6) definiti") bereinigt.
 - **Befunde (Kurzfassung):**
   - **Bug 1:** Heatmap-Legende (`_update_legend`) ohne Operator-Labels (`0..5+`) → Fix: `= 0..= 4`, `≥ 5`; Viridis-Intervall-Labels.
   - **Bug 2:** Kaskaden-Logik headless grün (Zoom-In < 2.0 d → M5); UI-Nachprüfung nötig (Flow-Race vermutet).
@@ -1453,14 +1453,14 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   `MTF_AXIS_MIN_LABEL_PX = 90`, nur Intraday (TF < 86400 s), Tagesgrenzen (00:00) an LWC;
   API `mtfAxisSetTf`/`mtfAxisClear`; Hooks `_onMtfAxisFullUpdate`/`_onMtfAxisVisibleRangeChanged`;
   `window._mtfAxisActive`-Flag.
-- **Geändert:** `chart/js/04_live_updates.js` (`tickMarkFormatter` gibt bei aktivem Overlay
-  Intraday-Labels ab, 2 optionale Hooks), `chart/chart_basics.py` (`JS_FILES` um `09_mtf_axis.js`).
-- **Verifikation:** `test/check_mtf_axis.js` (permanent, 14/14 PASS); `node --check` alle 9 JS;
+- **Geändert:** `../../chart/js/04_live_updates.js` (`tickMarkFormatter` gibt bei aktivem Overlay
+  Intraday-Labels ab, 2 optionale Hooks), `../../chart/chart_basics.py` (`JS_FILES` um `09_mtf_axis.js`).
+- **Verifikation:** `../../test/check_mtf_axis.js` (permanent, 14/14 PASS); `node --check` alle 9 JS;
   HTML-Template-Checks PASS. Wichtig: `window.TF_SECONDS_MAP` ist `const` (kein window-Property).
 
 ### Bug 2 - H1 + Zoom-In: kein Wechsel in kleinere TFs - FERTIG
 
-- **Geändert:** `chart/chart_win.py` - Viewport-Transfer-Bug behoben: Bei pending
+- **Geändert:** `../../chart/chart_win.py` - Viewport-Transfer-Bug behoben: Bei pending
   MTF-FC-Epochs wird `_resolve_epoch_logical_range` statt alter Bar-Offsets verwendet
   (Binärsuche auf `_time_cont_to_real`, geklemmt). `chart_tf_mode == "fix"` unterbindet
   die Auto-Kaskade (`_on_mtf_fc_viewport_changed`-Guard). Neuer State
@@ -1470,13 +1470,13 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 
 ### Bug 3 - "Alle TF ausführen" aktualisiert Analytics-Fenster nicht - FERTIG
 
-- **Geändert:** `analytics/ui/analytics_win.py` -
+- **Geändert:** `../../analytics/ui/analytics_win.py` -
   `event_bus.service_set_changed.connect(self._on_service_set_changed)` + debounced `refresh_all()`.
 - **Verifikation:** `py_compile`; Code-Inspektion (EventBus-Entkopplung, Grundsatz 2/5).
 
 ### Bug 1 + Bug 5 - Heatmap-Legende & Zoom-Slider-Sync - FERTIG
 
-- **Geändert:** `analytics/ui/heatmap_widget.py` - `sigXRangeChanged`/`sigYRangeChanged`
+- **Geändert:** `../../analytics/ui/heatmap_widget.py` - `sigXRangeChanged`/`sigYRangeChanged`
   → `_sync_slider_from_range()` mit `_syncing`-Guard (Bug 5, Zwei-Wege-Sync);
   Confluence-Legende mit `=`/`>=`-Operatoren (Bug 1).
 - **Verifikation:** `py_compile`; Code-Inspektion.
@@ -1487,21 +1487,21 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   aufgezwungen, Range (x 837+) und Sortierung (x 1173+, Ende > Fenster) rechts abgeschnitten;
   (2) `sort_mode_changed` speicherte nur im Namespace - die Analytics-Tabelle hatte keinerlei
   Verbindung (Konzept-Lücke).
-- **Geändert:** `chart/widgets/mtf_filter_bar.py` - ZWEI-ZEILEN-Layout (row1: Data-TF/
+- **Geändert:** `../../chart/widgets/mtf_filter_bar.py` - ZWEI-ZEILEN-Layout (row1: Data-TF/
   Chart-TF/Range/Sort, row2: Sessions/Templates) → sizeHint 699 px, alle Controls sichtbar
-  bei `resize(1000,700)`. `config/event_bus.py` - neues Signal `mtf_fc_sort_changed(str)`.
-  `chart/chart_win.py` - `_on_mtf_fc_sort_mode_changed` emittiert zusätzlich auf dem
-  EventBus (Entkopplung, kein Fenster-Know-how). `analytics/ui/analytics_win.py` - Slot
-  `_on_mtf_fc_sort_changed` → `table_page.set_external_sort_mode()`. `analytics/ui/table_page.py` -
+  bei `resize(1000,700)`. `../../config/event_bus.py` - neues Signal `mtf_fc_sort_changed(str)`.
+  `../../chart/chart_win.py` - `_on_mtf_fc_sort_mode_changed` emittiert zusätzlich auf dem
+  EventBus (Entkopplung, kein Fenster-Know-how). `../../analytics/ui/analytics_win.py` - Slot
+  `_on_mtf_fc_sort_changed` → `table_page.set_external_sort_mode()`. `../../analytics/ui/table_page.py` -
   `set_external_sort_mode()`/`_apply_external_sort()`/`_find_dynamic_header()`,
   `_SortableValueItem` (numerische JSON-Union-Sortierung: 10.2 > 9.5 korrekt statt lexikografisch),
   Anwendung nach jedem Befüllen (Vorrang vor Profil-Sortierung, kein User-Setting/Dirty-Flag).
 - **Sortier-Semantik:** `Datum 🠇` → Zeit absteigend (UserRole-Epoch);
   `Signal 🠇` → Header-Substring (signal/stärke/score/conf/wert) numerisch
   absteigend; `TF 🠅` → timeframe aufsteigend; Fallback (keine Spalte) → Zeit.
-- **Verifikation:** `test/check_mtf_sort_binding.py` (permanent, 21/21 PASS: EventBus, alle 3
+- **Verifikation:** `../../test/check_mtf_sort_binding.py` (permanent, 21/21 PASS: EventBus, alle 3
   Modi, Numerik, Fallback, Refresh-Persistenz, kein User-Setting, Row-Mapping intakt);
-  `test/check_filterbar_visible.py` (permanent): sizeHint 699 px, Range/Sort sichtbar innerhalb
+  `../../test/check_filterbar_visible.py` (permanent): sizeHint 699 px, Range/Sort sichtbar innerhalb
   990 px fb bei 1000 px Fenster; `py_compile` aller geänderten Dateien PASS.
   DPI-Artefakt geklärt: `devicePixelRatio` = 1.0, aber `mapTo`-global-x ≈ 2× intern
   (offscreen-Render-Artefakt) - logische Koordinaten maßgeblich.
@@ -1516,7 +1516,7 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 > `AnalyticsWindow` (`analytics_win.py`) gedacht und macht zusaetzlich im `ServiceWindow`
 > (`service_win.py`) Sinn - **niemals im Chart-Fenster**, das bereits vollstaendig und perfekt
 > implementiert ist. Die bisherige Umsetzung (Commits `4425bc9`, `5194107`) hat das Widget
-> fehlerhaft in `chart/chart_win.py` verbaut.
+> fehlerhaft in `../../chart/chart_win.py` verbaut.
 >
 > **Stand:** Nur Doku/Analyse (kein Coding). Wartet auf den expliziten Startschuss des Anwenders.
 
@@ -1525,17 +1525,17 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 1. **21.03 ist umgesetzt, aber im falschen Fenster:** Das `MtfFilterBarWidget`, die Engine-Module
    (`mtf_fc_*`) und die JS-Layer (`07_mtf_fc.js`, `08_mtf_layers.js`, `09_mtf_axis.js`) wurden in
    das Chart-Fenster integriert statt in das Analytics-Fenster.
-2. **Fehlende Imports in `chart/chart_win.py`:** Die MTF-FC-Klassen werden ohne Import referenziert
+2. **Fehlende Imports in `../../chart/chart_win.py`:** Die MTF-FC-Klassen werden ohne Import referenziert
    (`MtfFcProvider`, `MtfFcBoundary`, `default_mtf_fc_state`, `MtfFilterBarWidget`,
    `evaluate_cascade`, `apply_transition`) - `NameError` beim Oeffnen eines Chart-Fensters
    (Z. 337/338/340/495/1800/1812). `import chart.chart_win` bestaetigt: alle Namen fehlen im Modul.
-3. **Revert-Ziel verifiziert:** `chart/chart_win.py` ist zwischen `4217e71` (Stand vor 21.03) und
+3. **Revert-Ziel verifiziert:** `../../chart/chart_win.py` ist zwischen `4217e71` (Stand vor 21.03) und
    HEAD **+416/-2** - ausschliesslich 21.03-Adds + Bug-2-Refactor (Cascade-Viewport). Ein Revert
    auf `4217e71` ist verlustfrei (kein Nicht-21.03-Verlust).
-4. **JS-Hooks additiv:** `chart/js/04_live_updates.js` enthaelt nur optionale, guarded Hooks
+4. **JS-Hooks additiv:** `../../chart/js/04_live_updates.js` enthaelt nur optionale, guarded Hooks
    (`try { if (window._onMtfFc... ) }`) - ausschliesslich 21.03, sauber zuruecknehmbar.
-5. **Widget ist chart-frei:** `chart/widgets/mtf_filter_bar.py` importiert nur `analytics.engine.*` -
-   architektonisch problemlos nach `analytics_win` verschiebbar. Die Ablage unter `chart/widgets/`
+5. **Widget ist chart-frei:** `../../chart/widgets/mtf_filter_bar.py` importiert nur `analytics.engine.*` -
+   architektonisch problemlos nach `analytics_win` verschiebbar. Die Ablage unter `../../chart/widgets`
    war der einzige Fehlgriff.
 
 ## ?? 2. Entscheidung 6(a) - Semantik-Vertrag fuer Analytics (fixiert)
@@ -1577,12 +1577,12 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
    `from_ts`/`to_ts`, Aggregations-TF-Dropdown fuer `Fix` (6a).
 3. **[-] service_win (eigener Schritt, reduziert):** (entfaellt - `service_win.py` enthaelt keine MTF-FC-Integration) nur `data_tf` (Multi <-> `ALLE Timeframes`-Sentinel,
    U15-E) + optional Range; keine Sort/Sessions/Templates.
-4. **[x] Doku:** (dieses Kapitel) 21.03-Kapitel in `docs/AKTUELLE_UMSETZUNG.md` auf Analytics-Ziel ausrichten.
+4. **[x] Doku:** (dieses Kapitel) 21.03-Kapitel in `../AKTUELLE_UMSETZUNG.md` auf Analytics-Ziel ausrichten.
 
 ## ?? 4. Verifikation (headless, Grundsatz 2)
 
 - `py_compile` aller geaenderten Dateien; `import chart.chart_win` (kein GUI-Start);
-  `node --check` fuer die JS-Ruecknahme; Logik-/DB-Tests in `test/test.py`.
+  `node --check` fuer die JS-Ruecknahme; Logik-/DB-Tests in `../../test/test.py`.
 - Keine UI-/Regressionstests (harte Regel).
 
 ## ?? 5. Umsetzung durchgefuehrt (12.08.2026, abgeschlossen)
@@ -1591,8 +1591,8 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 > Kapitel 21.03 ist vollstaendig auf das Analytics-Ziel ausgerichtet (der
 > Chart-Revert lief in 21.03.11-Fix als Commit `85a0c7c`).
 
-1. **Chart-Revert (Commit `85a0c7c`):** `chart/chart_win.py`, `chart/chart_basics.py`
-   und `chart/js/04_live_updates.js` wurden auf `4217e71` zurueckgesetzt; die JS-Layer
+1. **Chart-Revert (Commit `85a0c7c`):** `../../chart/chart_win.py`, `../../chart/chart_basics.py`
+   und `../../chart/js/04_live_updates.js` wurden auf `4217e71` zurueckgesetzt; die JS-Layer
    `07_mtf_fc.js`/`08_mtf_layers.js`/`09_mtf_axis.js` wurden entfernt (`git rm`). Damit
    sind die fehlenden Imports (NameError beim Chart-Oeffnen) und alle 21.03-Hooks aus
    dem Chart entfernt.
@@ -1622,7 +1622,7 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   `default_mtf_fc_state`, `MtfFilterBarWidget`, `evaluate_cascade`, `apply_transition`)
   und alle 21.03-JS-Hooks vollstaendig aus dem Chart entfernt (Revert-Ziel `4217e71`,
   fuer die 3 Ziel-Dateien identisch mit `69ae3a6`).
-- **Verifikation:** Code-Suche in `chart/chart_win.py`/`chart/chart_basics.py`:
+- **Verifikation:** Code-Suche in `../../chart/chart_win.py`/`../../chart/chart_basics.py`:
   keine `MtfFilterBarWidget`-/`mtf_fc`-Referenzen und keine Verweise auf die entfernten
   JS-Dateien mehr; `git status` zeigt die geloeschten JS-Dateien.
 - **Commit:** `85a0c7c`
@@ -1630,32 +1630,32 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 ## 21.03.13 - Analytics-Integration: Filterleiste + Zeitfilter + Aggregations-TF (12.08.2026 20:06)
 
 - **Umgesetzt:** Vollstaendige Umsetzung der Entscheidung 6a im Analytics-Fenster:
-  * `chart/widgets/mtf_filter_bar.py`: eigenes Aggregations-TF-Dropdown (`agg_tf`,
+  * `../../chart/widgets/mtf_filter_bar.py`: eigenes Aggregations-TF-Dropdown (`agg_tf`,
     unabhaengig von `data_tf`), konfigurierbare TF-Listen (`data_tf_options`/
     `agg_tf_options`), injizierbarer `now_provider`, `apply_external_state()` und
     `set_chart_mode()` fuer den Profil-/Workspace-Restore, `_on_range_changed` nutzt
     den `now_provider` (Fallback `time.time()`).
-  * `analytics/engine/analytics_view_model.py`: MTF-FC-Parameter `data_tf`/`agg_tf`/
+  * `../../analytics/engine/analytics_view_model.py`: MTF-FC-Parameter `data_tf`/`agg_tf`/
     `range_preset`/`range_from`/`range_to`/`all_timeframes`; `set_data_tf` (multi ->
     `all_timeframes=True`, fixiert -> `timeframe`-Uebernahme), `set_agg_tf` -> `bucket_tf`
     in `_current_params`, `set_range`/`clear_range`, `latest_data_epoch` (MAX(bar_time));
     Persistenz ueber `_current_payload` (Sektion `sources`).
-  * `analytics/engine/feature_store_reader.py`: `from_ts`/`to_ts`-Zeitfilter
+  * `../../analytics/engine/feature_store_reader.py`: `from_ts`/`to_ts`-Zeitfilter
     (`bar_time BETWEEN`, Wanduhr-Epochs) in fetch_rows/fetch_columns/fetch_heatmap/
     fetch_generic_heatmap; `bucket_tf`-date-Bucketing (FLOOR(EXTRACT(epoch)/secs)*secs)
     fuer die generische Heatmap; `_axis_coords`-/`_format_dim_value`-tz-Fixes.
-  * `analytics/engine/analytics_repository.py` + `analytics_worker.py`: `from_ts`/
+  * `../../analytics/engine/analytics_repository.py` + `analytics_worker.py`: `from_ts`/
     `to_ts`/`bucket_tf` an alle Methoden durchgereicht.
-  * `analytics/ui/analytics_win.py`: `mtf_bar` in `_build_ui`, Signal-Verdrahtung
+  * `../../analytics/ui/analytics_win.py`: `mtf_bar` in `_build_ui`, Signal-Verdrahtung
     (data_tf/agg_tf/range/sort -> VM/EventBus), `_sync_mtf_bar_from_params` nach
     Profil-/Workspace-Restore, TF-Listen `MTF_DATA_TF_OPTIONS`/`MTF_AGG_TF_OPTIONS`
     (11 TFs M1..MN1).
-  * `analytics/engine/mtf_fc_templates.py`: `agg_tf` in `_TEMPLATE_KNOWN_KEYS` +
+  * `../../analytics/engine/mtf_fc_templates.py`: `agg_tf` in `_TEMPLATE_KNOWN_KEYS` +
     `_TEMPLATE_DEFAULTS` ergaenzt (View-Templates in-memory, wie im Chart).
 - **Verifikation:** `py_compile` aller 7 geaenderten Dateien EXIT 0;
-  `test/check_analytics_mtffc.py` (13 Checks: Zeitfilter, Bucketing, VM-Durchreichung)
-  13/13 PASS; `test/check_analytics_mtffc_win.py` (22 Checks: Widget-VM-Integration,
-  apply_external_state, Payload-Persistenz, Restore) 22/22 PASS; `test/test.py`
+  `../../test/check_analytics_mtffc.py` (13 Checks: Zeitfilter, Bucketing, VM-Durchreichung)
+  13/13 PASS; `../../test/check_analytics_mtffc_win.py` (22 Checks: Widget-VM-Integration,
+  apply_external_state, Payload-Persistenz, Restore) 22/22 PASS; `../../test/test.py`
   Teil 21.03.12 T1-T10 PASS (26 vorbestehende FAILs in Test-32/36/37/20.03/Geometrie
   sind Bestandszustand: Test-DB-Fixtures ohne `instance_hash`-Spalte bzw. Qt-offscreen-
   Geometrie - nicht durch MTF-FC verursacht).
@@ -1704,7 +1704,7 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 - **Sessions:** Die Session-Checkboxen (London/New York/Tokio) werden NICHT entfernt -
   sie koennen zukuenftig wieder wichtig werden (bleiben im Analytics zunaechst
   unverdrahtet/angezeigt).
-- **Hinweis:** `analytics/engine/mtf_fc_templates.py` wird nach dem Rueckbau toter
+- **Hinweis:** `../../analytics/engine/mtf_fc_templates.py` wird nach dem Rueckbau toter
   Code (bleibt gemaess Code-Preserving-Regel erhalten, wird aber nicht mehr aufgerufen).
 
 ### Wunsch 3 - Durchgehende Kerzen- & Signalchart ohne Kursluecken (NICHT UMZUSETZEN)
@@ -1733,7 +1733,7 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 
 ## Umsetzung Wunsch 1 - Benutzerdefinierter Range mit Von-/Bis-Date/Time-Pickern (FERTIG)
 
-- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - In Zeile 2 (Session-Filter-Zeile)
+- **Geaendert:** `../../chart/widgets/mtf_filter_bar.py` - In Zeile 2 (Session-Filter-Zeile)
   ersetzt ein `_custom_panel` (QWidget) die rueckgebauten View-Template-Controls:
   * Zwei `QDateTimeEdit`-Picker "Von:" / "Bis:" mit `setCalendarPopup(True)` und
     Anzeigeformat `dd.MM.yyyy HH:mm` (max. 150 px breit, platzsparend, sizeHint
@@ -1757,18 +1757,18 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 
 ## Umsetzung Wunsch 2 - Preset-Buttons rueckgebaut + `sort_mode` im Profil (FERTIG)
 
-- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - View-Template-Steuerelemente
+- **Geaendert:** `../../chart/widgets/mtf_filter_bar.py` - View-Template-Steuerelemente
   entfernt (Namens-`QLineEdit`, 💾/📂-Buttons, Template-`QComboBox`, Signal
   `template_applied`, Methoden `refresh_templates`/`_save_template`/`_load_template`/
   `_on_template_selected`/`_apply_template`); `template_store`-Parameter aus
   `__init__` entfernt; ungenutzter `QPushButton`-Import entfernt.
-  `analytics/engine/mtf_fc_templates.py` bleibt gemaess Code-Preserving-Regel
+  `../../analytics/engine/mtf_fc_templates.py` bleibt gemaess Code-Preserving-Regel
   erhalten, wird aber nicht mehr aufgerufen (toter Code).
-- **Geaendert:** `analytics/engine/analytics_view_model.py` - Default-Param
+- **Geaendert:** `../../analytics/engine/analytics_view_model.py` - Default-Param
   `"sort_mode": "date"`; neue Methode `set_sort_mode(mode)` ('date'|'signal'|'tf',
   validiert, nur Dirty-Markierung - reiner UI-Zustand ohne Query-Refresh);
   `_current_payload` persistiert `sort_mode` additiv in der Sektion `sources`.
-- **Geaendert:** `analytics/ui/analytics_win.py` - `_wire_controls` verbindet
+- **Geaendert:** `../../analytics/ui/analytics_win.py` - `_wire_controls` verbindet
   `mtf_bar.sort_mode_changed` zusaetzlich mit `_vm.set_sort_mode` (Profil-Persistenz;
   die EventBus-Kette zur TablePage bleibt); `_sync_mtf_bar_from_params` reicht
   `range_from`/`range_to`/`sort_mode` an `apply_external_state` weiter.
@@ -1777,7 +1777,7 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
 ## Verifikation (headless, Grundsatz 2 - keine UI-/Regressionstests)
 
 - `py_compile` aller 3 geaenderten Dateien EXIT 0.
-- **Neu:** `test/check_custom_range_sortmode.py` (permanent, 42/42 PASS):
+- **Neu:** `../../test/check_custom_range_sortmode.py` (permanent, 42/42 PASS):
   * Teil A: Wanduhr-Konvertierung - QDateTime-Felder = UTC-Darstellung der Epoch,
     12:00-Epoch zeigt Stunde 12 (kein +2h-Shift), Round-Trip exakt.
   * Teil B: Custom-Panel - Combo-Wechsel blendet Picker ein, Vorbelegung aus
@@ -1795,10 +1795,10 @@ Zusätzlich fehlen in `chart_win.py` die Signal-Verdrahtungen:
   * Teil G: AnalyticsWindow-Quelltext-Inspektion - sort_mode-Verdrahtung,
     EventBus-Kette, `_sync_mtf_bar_from_params` reicht range_from/to/sort_mode,
     keine View-Template-Reste im Widget.
-- `test/check_analytics_mtffc_win.py` 22/22 PASS, `test/check_analytics_mtffc.py`
-  13/13 PASS, `test/check_mtf_sort_binding.py` 21/21 PASS,
-  `test/check_filterbar_visible.py` (sizeHint/sizeHint-Layout) PASS.
-- `test/test.py`: Baseline-Vergleich per `git stash` - dieselben 26 vorbestehenden
+- `../../test/check_analytics_mtffc_win.py` 22/22 PASS, `../../test/check_analytics_mtffc.py`
+  13/13 PASS, `../../test/check_mtf_sort_binding.py` 21/21 PASS,
+  `../../test/check_filterbar_visible.py` (sizeHint/sizeHint-Layout) PASS.
+- `../../test/test.py`: Baseline-Vergleich per `git stash` - dieselben 26 vorbestehenden
   FAILs (Fenster-/Reflow-Geometrie, JSON-Feld-Aufloesung, instance_hash-Binder der
   20.03-Tests, Qt-offscreen-Artefakte) mit und ohne die Aenderung; die 21.03.14-
   Aenderung fuegt KEINE neuen FAILs hinzu.
@@ -1812,7 +1812,7 @@ Bug 3 -> 'Year' (365-Tage-Fenster) statt 'YTD' + neues Preset '90d'; Bug 4 ->
 Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 
 ### Bug 1 - Heatmap 'Feld'-Dropdown schreibt wieder feature_ids (FIX)
-- **Geaendert:** `analytics/ui/heatmap_widget.py` - die seit 10.08.2026
+- **Geaendert:** `../../analytics/ui/heatmap_widget.py` - die seit 10.08.2026
   (Runde 7) auskommentierte Verbindung `_combo_field.selection_changed ->
   _on_field_selection_changed` ist WIEDER AKTIV. Check/Uncheck im
   'Feld'-Dropdown schreibt `feature_ids` ueber den bestehenden
@@ -1821,7 +1821,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   konsistent bleiben. Docstring von `_on_field_selection_changed` aktualisiert.
 
 ### Bug 2 - Feld-Dropdown: bei leerem Filter NUR erster Parameter (FIX)
-- **Geaendert:** `analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`
+- **Geaendert:** `../../analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`
   haengte bei leerem `feature_ids`-Filter JEDE Checkbox an (`no_filter=True`).
   Neu: lokaler Helper `_chk(match)` - im `no_filter`-Modus wird genau der
   ERSTE Parameter (erster Checkable-Eintrag) angehakt, alle weiteren leer
@@ -1829,7 +1829,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   aktivem Filter unveraendert (nur passende Haken).
 
 ### Bug 3 - Range-Presets: 'YTD' -> 'Year' (365 Tage) + '90d' (FIX)
-- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - `RANGE_PRESETS` =
+- **Geaendert:** `../../chart/widgets/mtf_filter_bar.py` - `RANGE_PRESETS` =
   `["24h", "7d", "30d", "90d", "Year"]`; `_on_range_changed` rechnet
   `90d = 90*86400` und `Year = 365*86400` (kein Jahresbeginn-Fenster mehr,
   wie entschieden). `_ytd_epoch_offset` entfernt, ToolTip aktualisiert.
@@ -1840,7 +1840,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   gespeicherte Profile den Preset-Umbau.
 
 ### Bug 4 - Custom-Panel entfernt, Sessions in Zeile 1 (FIX)
-- **Geaendert:** `chart/widgets/mtf_filter_bar.py` - das benutzerdefinierte
+- **Geaendert:** `../../chart/widgets/mtf_filter_bar.py` - das benutzerdefinierte
   Von-/Bis-Panel (QDateTimeEdit-Picker, Zeile 2) ist KOMPLETT entfernt:
   Imports (`QDateTime`/`QDateTimeEdit`), State-Vars (`_last_range`,
   `_custom_from`, `_custom_to`), Methoden (`_apply_custom_range_state`,
@@ -1850,18 +1850,18 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   `range_from`/`range_to` und der `"Benutzerdefiniert"`-Zweig. Die
   Session-Checkboxen stehen jetzt in ZEILE 1 rechts neben der Sortierung
   (eine Zeile, sizeHint 1152x26).
-- **Geaendert:** `analytics/ui/analytics_win.py` - `_sync_mtf_bar_from_params`
+- **Geaendert:** `../../analytics/ui/analytics_win.py` - `_sync_mtf_bar_from_params`
   ruft `apply_external_state` ohne `range_from`/`range_to`.
-- **Geaendert:** `analytics/engine/analytics_view_model.py` - Docstring von
+- **Geaendert:** `../../analytics/engine/analytics_view_model.py` - Docstring von
   `set_range` aktualisiert ('7d'/'90d'/'Year'); `range_from`/`range_to`
   bleiben als effektiver Zeitfilter in den Params/Payload erhalten.
-- **Geaendert:** `analytics/engine/mtf_fc_templates.py` - `custom_range` aus
+- **Geaendert:** `../../analytics/engine/mtf_fc_templates.py` - `custom_range` aus
   `_TEMPLATE_KNOWN_KEYS`/`_TEMPLATE_DEFAULTS` entfernt; neue Helper-Funktion
   `_normalize_obsolete` entfernt `custom_range` auch aus Alt-Templates mit
   bereits aktueller Schema-Version und mappt `YTD`/`Benutzerdefiniert`.
 
 ### Bug 5 - Viridis-Legende: Intervalle ohne ueberlappende Kanten (FIX)
-- **Geaendert:** `analytics/ui/heatmap_widget.py` - `_update_legend`
+- **Geaendert:** `../../analytics/ui/heatmap_widget.py` - `_update_legend`
   (Viridis-Zweig): die alten Labels `<= v25 / v25-v50 / v50-v75 / v75-vmax /
   >= v75` ueberlappten an v50/v75/vmax. Neu halboffene Intervalle [a,b):
   `< v25`, `v25-v50`, `v50-v75`, `v75-vmax`, `>= vmax` - jede Schwelle
@@ -1871,7 +1871,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 - `py_compile` aller geaenderten Dateien EXIT 0 (mtf_filter_bar.py,
   analytics_win.py, analytics_view_model.py, heatmap_widget.py,
   mtf_fc_templates.py).
-- **Neu/umgebaut:** `test/check_custom_range_sortmode.py` (permanent,
+- **Neu/umgebaut:** `../../test/check_custom_range_sortmode.py` (permanent,
   47/47 PASS):
   * Teil A: Preset-Satz 24h/7d/30d/90d/Year, Sekunden exakt (90d/Year),
     'YTD'/'Benutzerdefiniert' entfallen, kein `_custom_panel`/`_dt_from`.
@@ -1883,15 +1883,15 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   * Teil E-H: sort_mode-Persistenz (21.03.14 erhalten), Integrationspfad,
     AnalyticsWindow-Quelltext-Inspektion (kein range_from/to mehr, kein
     Custom-Picker-Code).
-- **Neu:** `test/check_heatmap_field_checks.py` (permanent, 4/4 PASS):
+- **Neu:** `../../test/check_heatmap_field_checks.py` (permanent, 4/4 PASS):
   * Bug 1: `selection_changed` -> `set_feature_ids` (Verbindung aktiv).
   * Bug 2: no_filter -> genau EIN Haken (erster Parameter); aktiver Filter
     -> passende Haken.
-- Unveraendert gruen: `test/check_analytics_mtffc_win.py` 22/22,
-  `test/check_analytics_mtffc.py` 13/13, `test/check_mtf_sort_binding.py`
-  21/21; `test/check_filterbar_visible.py` (Diagnose) zeigt die neue
+- Unveraendert gruen: `../../test/check_analytics_mtffc_win.py` 22/22,
+  `../../test/check_analytics_mtffc.py` 13/13, `../../test/check_mtf_sort_binding.py`
+  21/21; `../../test/check_filterbar_visible.py` (Diagnose) zeigt die neue
   EIN-Zeilen-Leiste (sizeHint 1152x26, alle Controls sichtbar).
-- `test/test.py` referenziert keine entfernten APIs (kein Custom-Panel/
+- `../../test/test.py` referenziert keine entfernten APIs (kein Custom-Panel/
   YTD-Code); die MTF-FC-Kette bleibt unveraendert.
 
 - **Commit:** 22e2b66
@@ -1928,12 +1928,12 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   VARCHAR-Spalten stabil.
 
 ### Bug 1 - Feld-Dropdown: An/Abw?hlen wirkt auf Grafik + wird restored (FIX)
-- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - `_on_field_selection_changed`
+- **Ge?ndert:** `../../analytics/ui/heatmap_widget.py` - `_on_field_selection_changed`
   ruft jetzt `set_field_selection(pairs)` (statt nur `set_feature_ids(ids)`).
   Neue Helfer `_checked_field_pairs()` (ALL|key-Expansion ?ber
   `_field_sources`) und `_sync_field_selection_to_vm()` (materialisiert die
   effektive Paar-Auswahl am Ende jedes Rebuilds).
-- **Ge?ndert:** `analytics/engine/analytics_view_model.py` - neue Methode
+- **Ge?ndert:** `../../analytics/engine/analytics_view_model.py` - neue Methode
   `set_field_selection(field_pairs, update_ids=True)`:
   * `update_ids=True` (User-Interaktion): `feature_ids` werden aus den
     Paaren abgeleitet (Dropdown/Picker konsistent; Abw?hlen des letzten
@@ -1946,13 +1946,13 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 - **Persistenz:** `field_selection` wird in `_current_payload`/Restore-Pfaden
   via `_normalize_field_pairs` normalisiert (Alt-Payloads ohne Key = leer =
   kein Paar-Filter, Verhalten wie bisher).
-- **Ge?ndert:** `analytics/engine/analytics_worker.py` /
-  `analytics/engine/analytics_repository.py` /
-  `analytics/engine/feature_store_reader.py` - `field_pairs`-Param
+- **Ge?ndert:** `../../analytics/engine/analytics_worker.py` /
+  `../../analytics/engine/analytics_repository.py` /
+  `../../analytics/engine/feature_store_reader.py` - `field_pairs`-Param
   durchgereicht bis `fetch_generic_heatmap` + Filter-Anwendung.
 
 ### Bug 2 - Aggregations-Wechsel: EXAKTE Vorbelegung statt 'alle Parameter' (FIX)
-- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`:
+- **Ge?ndert:** `../../analytics/ui/heatmap_widget.py` - `_rebuild_field_dropdown`:
   EXPLIZITE `field_selection` gewinnt (sel_map; Rebuild stellt die
   gew?hlten Paare exakt wieder her). Ohne explizite Auswahl greift die
   DEFAULT-Vorbelegung: je AKTIVEM Service genau der ERSTE Parameter
@@ -1963,7 +1963,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
   werden nicht angehakt und beim Sync beschnitten.
 
 ### Bug 5 - Viridis-Legende: Operator-Labels + adaptive Genauigkeit (FIX)
-- **Ge?ndert:** `analytics/ui/heatmap_widget.py` - neuer Helper
+- **Ge?ndert:** `../../analytics/ui/heatmap_widget.py` - neuer Helper
   `_format_legend_value(val, span)`: Nachkommastellen-Zahl wird aus der
   Spanne abgeleitet (25-%-Schritte `span/4` GARANTIERT unterscheidbar;
   kleine Spannen vmin=0.01/vmax=0.02 -> 0.0125/0.015/0.0175/0.02 statt
@@ -1975,19 +1975,19 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 - `py_compile` aller 5 ge?nderten Dateien EXIT 0 (analytics_view_model.py,
   analytics_worker.py, analytics_repository.py, feature_store_reader.py,
   heatmap_widget.py).
-- **Neu:** `test/check_field_selection.py` (permanent, 19/19 PASS):
+- **Neu:** `../../test/check_field_selection.py` (permanent, 19/19 PASS):
   Default-Vorbelegung (leerer Filter / erster Parameter je aktivem
   Service), EXPLIZITE Restaurierung nach Aggregations-Wechsel, ALL-
   Expansion in `_checked_field_pairs`, `set_field_selection`-Pfade
   (update_ids=True/False), Sync-Guards (inaktive Paare, Services ohne
   Keys bleiben in feature_ids), `_format_legend_value`.
-- **Neu:** `test/check_field_pairs_db.py` (permanent, 5/5 PASS, temp.
+- **Neu:** `../../test/check_field_pairs_db.py` (permanent, 5/5 PASS, temp.
   duckdb in test/ und danach gel?scht): Paar-Filter greift in echter
   DuckDB-Query (COUNT/AVG, feature_ids orthogonal, unsichere Keys
   defensiv).
-- Bestehende Tests unver?ndert gr?n (Spot-Check): `test/check_heatmap_field_checks.py`
+- Bestehende Tests unver?ndert gr?n (Spot-Check): `../../test/check_heatmap_field_checks.py`
   (4/4, Service-Pfad bleibt ?ber den Fallback `hasattr(set_field_selection)`
-  kompatibel), `test/check_custom_range_sortmode.py` (47/47).
+  kompatibel), `../../test/check_custom_range_sortmode.py` (47/47).
 
 - **Commit:** `33c33ce`
 
@@ -2004,7 +2004,7 @@ Custom-Panel komplett entfernt (Sessions in Zeile 1 rechts neben Sort).
 | **Vermischung unterschiedlicher Berechnungsverfahren** | Services wie `srv_swing_structure` oder `srv_swing_momentum` besitzen einen `mode`-Parameter mit völlig unterschiedlichen Logiken und Messskalen (z. B. `Williams_Fractal` vs. `ZigZag_ATR` oder `MA_Peak_Hysteresis` vs. `Chande_Kroll_Ratchet`). In `analytics_win.py` / `heatmap_widget.py` fehlte bisher ein Filter-Dropdown für `source_mode`. Dadurch wurden die Ergebnisse verschiedener Modi desselben Services in einer Heatmap-Matrix/Tabelle vermischt und verfälscht. |
 
 **Prämisse (Code-verifiziert, 13.08.2026):** Das Feld `source_mode` wird top-level in **jedes** `feature_data`-JSON-Record geschrieben – verifiziert in 6 Services:
-`analytics/features/definitions/srv_swing_structure.py` (Z. 631, Modi u. a. `Williams_Fractal`, `Standard_Pivot`, `Gann_Mechanical`, `ZigZag_ATR`, `ZigZag_Pct`, `Period_Extrema`), `srv_swing_momentum.py` (Z. 541/564, Modi u. a. `MA_Peak_Hysteresis`, `MA_Slope_Change`, `Chande_Kroll_Ratchet`), sowie `srv_swing_volume_profile.py`, `srv_trend_breakout.py`, `srv_trend_hma_pivot.py`, `srv_trend_regime.py`. Der `mode`-Parameter liegt in `parameter_schema["mode"]["options"]` der jeweiligen Service-Definition.
+`../../analytics/features/definitions/srv_swing_structure.py` (Z. 631, Modi u. a. `Williams_Fractal`, `Standard_Pivot`, `Gann_Mechanical`, `ZigZag_ATR`, `ZigZag_Pct`, `Period_Extrema`), `srv_swing_momentum.py` (Z. 541/564, Modi u. a. `MA_Peak_Hysteresis`, `MA_Slope_Change`, `Chande_Kroll_Ratchet`), sowie `srv_swing_volume_profile.py`, `srv_trend_breakout.py`, `srv_trend_hma_pivot.py`, `srv_trend_regime.py`. Der `mode`-Parameter liegt in `parameter_schema["mode"]["options"]` der jeweiligen Service-Definition.
 
 ---
 
@@ -2057,7 +2057,7 @@ Der gewählte `service_mode` wird im `AnalyticsViewModel` (`_params`, Default `"
 
 ## 🛠️ 4. Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### Schritt 1: ViewModel-Erweiterung (`analytics/engine/analytics_view_model.py`)
+### Schritt 1: ViewModel-Erweiterung (`../../analytics/engine/analytics_view_model.py`)
 
 1. **Parameter `service_mode` hinzufügen:** In `_params` den Default `"all"` hinterlegen:
 
@@ -2096,7 +2096,7 @@ base["service_mode"] = p.get("service_mode", "all")
 
    (Restore läuft automatisch über `_restore_params_from_payload`, sobald der Key im Payload steht – kein Sonderfall.)
 
-### Schritt 2: Reader-SQL-Filterung (`analytics/engine/feature_store_reader.py`)
+### Schritt 2: Reader-SQL-Filterung (`../../analytics/engine/feature_store_reader.py`)
 
 1. **SQL-Helper für `source_mode` hinzufügen:**
 
@@ -2136,11 +2136,11 @@ def fetch_available_source_modes(self, symbol, timeframe, feature_ids=None,
 
 ### Schritt 3: Worker- & Repository-Durchreichung (Threading-Kette, Entscheidung 5)
 
-1. **`analytics/engine/analytics_worker.py` (`_execute`):** `service_mode = p.get("service_mode")` einmalig lesen und an **alle 5** Repo-Methoden übergeben:
+1. **`../../analytics/engine/analytics_worker.py` (`_execute`):** `service_mode = p.get("service_mode")` einmalig lesen und an **alle 5** Repo-Methoden übergeben:
    `get_table(..., service_mode=service_mode)`, `get_heatmap(...)`, `get_generic_heatmap(...)`, `get_scatter(...)`, `get_distribution(...)`.
-2. **`analytics/engine/analytics_repository.py`:** Alle 5 Methoden erhalten `service_mode: Optional[str] = None` und reichen ihn an den Reader durch. Der `QUERY_FEATURES`-Pfad liefert zusätzlich `source_modes`/`has_source_mode_services` aus Schritt 2.3.
+2. **`../../analytics/engine/analytics_repository.py`:** Alle 5 Methoden erhalten `service_mode: Optional[str] = None` und reichen ihn an den Reader durch. Der `QUERY_FEATURES`-Pfad liefert zusätzlich `source_modes`/`has_source_mode_services` aus Schritt 2.3.
 
-### Schritt 4: UI-Integration (`analytics/ui/heatmap_widget.py`)
+### Schritt 4: UI-Integration (`../../analytics/ui/heatmap_widget.py`)
 
 1. **Dropdown in `__init__` anlegen und im Layout platzieren:**
 
@@ -2175,11 +2175,11 @@ def _on_mode_filter_changed(self) -> None:
 ### Schritt 5: Keine Änderungen (bewusst)
 
 * **Keine Kaskadierung auf `_rebuild_field_dropdown`** (Entscheidung 3 – nur SQL-Filterung).
-* **`analytics/ui/analytics_win.py`:** nur falls der Profil-/Workspace-Restore den Combo-Zustand außerhalb der VM-Params synchronisieren muss (Muster `_sync_mtf_bar_from_params`) – voraussichtlich nicht nötig, da das HeatmapWidget die Combo direkt aus `vm.params` restauriert.
+* **`../../analytics/ui/analytics_win.py`:** nur falls der Profil-/Workspace-Restore den Combo-Zustand außerhalb der VM-Params synchronisieren muss (Muster `_sync_mtf_bar_from_params`) – voraussichtlich nicht nötig, da das HeatmapWidget die Combo direkt aus `vm.params` restauriert.
 
 ---
 
-## 📊 5. Akzeptanzkriterien für die Validierung (`test/test.py`)
+## 📊 5. Akzeptanzkriterien für die Validierung (`../../test/test.py`)
 
 1. **Modus-Filter-SQL-Test (global):** `fetch_generic_heatmap(..., service_mode="MA_Peak_Hysteresis")` UND `fetch_rows`/`fetch_columns`/`fetch_heatmap` erzeugen in der SQL-WHERE-Klausel den Ausdruck `LOWER(json_extract_string(feature_data, '$.source_mode')) = LOWER(?)` mit Parameter `'MA_Peak_Hysteresis'` und filtern abweichende Modi aus (`"all"`/None/leer = kein Filter).
 2. **ViewModel-State-Test:** `set_service_mode("ZigZag_ATR")` setzt das Dirty-Flag, aktualisiert `_params["service_mode"]` und stößt die Datenabfragen neu an – Refresh-Liste enthält `QUERY_FEATURES`, `QUERY_TABLE`, `QUERY_HEATMAP`, `QUERY_HEATMAP_GENERIC`, `QUERY_SCATTER`, `QUERY_DISTRIBUTION` (global, Entscheidung 1).
@@ -2193,18 +2193,18 @@ def _on_mode_filter_changed(self) -> None:
 
 | Datei | Art | Inhalt |
 | --- | --- | --- |
-| `analytics/engine/analytics_view_model.py` | geändert | `service_mode`-Param + Setter (globaler Refresh) + `_current_params` + `_current_payload` (sources) |
-| `analytics/engine/analytics_worker.py` | geändert | Durchreichung `service_mode` an alle 5 Repo-Methoden |
-| `analytics/engine/analytics_repository.py` | geändert | `service_mode`-Parameter an 5 Methoden; `source_modes`/`has_source_mode_services` im QUERY_FEATURES-Pfad |
-| `analytics/engine/feature_store_reader.py` | geändert | `_apply_mode_filter` + `service_mode`-Param an 4 Reader-Pfade + `fetch_available_source_modes` |
-| `analytics/ui/heatmap_widget.py` | geändert | `_combo_mode_filter` (Layout, Signal, Payload-Befüllung, Deaktivierung, Restore) |
-| `analytics/ui/analytics_win.py` | ggf. geändert | nur falls Restore den Combo außerhalb der VM-Params braucht (voraussichtlich nicht) |
+| `../../analytics/engine/analytics_view_model.py` | geändert | `service_mode`-Param + Setter (globaler Refresh) + `_current_params` + `_current_payload` (sources) |
+| `../../analytics/engine/analytics_worker.py` | geändert | Durchreichung `service_mode` an alle 5 Repo-Methoden |
+| `../../analytics/engine/analytics_repository.py` | geändert | `service_mode`-Parameter an 5 Methoden; `source_modes`/`has_source_mode_services` im QUERY_FEATURES-Pfad |
+| `../../analytics/engine/feature_store_reader.py` | geändert | `_apply_mode_filter` + `service_mode`-Param an 4 Reader-Pfade + `fetch_available_source_modes` |
+| `../../analytics/ui/heatmap_widget.py` | geändert | `_combo_mode_filter` (Layout, Signal, Payload-Befüllung, Deaktivierung, Restore) |
+| `../../analytics/ui/analytics_win.py` | ggf. geändert | nur falls Restore den Combo außerhalb der VM-Params braucht (voraussichtlich nicht) |
 
 ## ✅ Verifikations-Rahmen (Grundsatz 2)
 
-- Headless: `py_compile` aller geänderten Dateien; Logik-/DB-Tests in `test/` (temporäre `*.duckdb` nur in `test/`, danach Cleanup).
+- Headless: `py_compile` aller geänderten Dateien; Logik-/DB-Tests in `../../test` (temporäre `*.duckdb` nur in `../../test`, danach Cleanup).
 - Keine UI-/Regressionstests (harte Regel). UI-Verhalten (Dropdown-Sichtbarkeit/Deaktivierung) per Code-Inspektion + manueller Anwender-Prüfung.
-- Implementierungs-Log: Eintrag 21.03.20 in `docs/AKTUELLE_UMSETZUNG.md` nach Anwender-Bestätigung.
+- Implementierungs-Log: Eintrag 21.03.20 in `../AKTUELLE_UMSETZUNG.md` nach Anwender-Bestätigung.
 
 
 
@@ -2213,48 +2213,48 @@ def _on_mode_filter_changed(self) -> None:
 # Implementierungs-Log 21.03.20 - Analytics Modus-Filter (13.08.2026 10:41)
 
 - **Umgesetzt (Entscheidungen 1-5):**
-  - `analytics/engine/analytics_view_model.py`: `_params["service_mode"] = "all"` Default, `set_service_mode(mode)` mit globalem Refresh (QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_SCATTER, QUERY_DISTRIBUTION; idempotent), `_current_params` Basis-Dict `service_mode` fuer ALLE Query-Kinds, `_current_payload` sources-Sektion `service_mode` (Restore ueber generische Key-Schleife).
-  - `analytics/engine/feature_store_reader.py`: `_apply_mode_filter` (json_extract_string + LOWER, `"all"`/None/leer = kein Filter) an allen 4 Daten-Pfaden (`fetch_rows`/`fetch_columns`/`fetch_heatmap`/`fetch_generic_heatmap`); `service_mode`-Parameter an alle 4 Signaturen; `_feature_meta_base` sammelt additiv `source_modes_by_service` (gleicher gecachter Basis-Scan, kein Extra-Roundtrip); neue Methode `fetch_available_source_modes(symbol, timeframe, feature_id, feature_ids, instance_hashes) -> (source_modes, has_source_mode_services)` mit feature_ids-/Hash-Filter (Muster `feature_keys_by_service`).
-  - `analytics/engine/analytics_worker.py`: `service_mode = p.get("service_mode")` einmalig lesen, Durchreichung an alle 5 Repo-Methoden (`get_table`/`get_heatmap`/`get_generic_heatmap`/`get_scatter`/`get_distribution`).
-  - `analytics/engine/analytics_repository.py`: `service_mode`-Parameter an alle 5 Methoden + Reader-Durchreichung; `get_available_features` liefert im QUERY_FEATURES-Leichtpfad `source_modes` + `has_source_mode_services` (defensiv leere Liste/False bei Fehler).
-  - `analytics/ui/heatmap_widget.py`: `_combo_mode_filter` (QComboBox, `[ Alle Modi ]` = data "all", min 150 px) in ctrl2 zwischen Aggregation und Feld; Signal `currentIndexChanged` -> `_on_mode_filter_changed` -> `vm.set_service_mode`; `_sync_mode_filter_from_payload` (blockSignals/_syncing, Stale-Guard via restore_generation) befuellt die Items aus `source_modes` (case-original), deaktiviert + resettet auf `"all"` bei `has_source_mode_services == False`, Restore aus `vm.params["service_mode"]`; `_sync_from_params` restauriert die Auswahl.
+  - `../../analytics/engine/analytics_view_model.py`: `_params["service_mode"] = "all"` Default, `set_service_mode(mode)` mit globalem Refresh (QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_SCATTER, QUERY_DISTRIBUTION; idempotent), `_current_params` Basis-Dict `service_mode` fuer ALLE Query-Kinds, `_current_payload` sources-Sektion `service_mode` (Restore ueber generische Key-Schleife).
+  - `../../analytics/engine/feature_store_reader.py`: `_apply_mode_filter` (json_extract_string + LOWER, `"all"`/None/leer = kein Filter) an allen 4 Daten-Pfaden (`fetch_rows`/`fetch_columns`/`fetch_heatmap`/`fetch_generic_heatmap`); `service_mode`-Parameter an alle 4 Signaturen; `_feature_meta_base` sammelt additiv `source_modes_by_service` (gleicher gecachter Basis-Scan, kein Extra-Roundtrip); neue Methode `fetch_available_source_modes(symbol, timeframe, feature_id, feature_ids, instance_hashes) -> (source_modes, has_source_mode_services)` mit feature_ids-/Hash-Filter (Muster `feature_keys_by_service`).
+  - `../../analytics/engine/analytics_worker.py`: `service_mode = p.get("service_mode")` einmalig lesen, Durchreichung an alle 5 Repo-Methoden (`get_table`/`get_heatmap`/`get_generic_heatmap`/`get_scatter`/`get_distribution`).
+  - `../../analytics/engine/analytics_repository.py`: `service_mode`-Parameter an alle 5 Methoden + Reader-Durchreichung; `get_available_features` liefert im QUERY_FEATURES-Leichtpfad `source_modes` + `has_source_mode_services` (defensiv leere Liste/False bei Fehler).
+  - `../../analytics/ui/heatmap_widget.py`: `_combo_mode_filter` (QComboBox, `[ Alle Modi ]` = data "all", min 150 px) in ctrl2 zwischen Aggregation und Feld; Signal `currentIndexChanged` -> `_on_mode_filter_changed` -> `vm.set_service_mode`; `_sync_mode_filter_from_payload` (blockSignals/_syncing, Stale-Guard via restore_generation) befuellt die Items aus `source_modes` (case-original), deaktiviert + resettet auf `"all"` bei `has_source_mode_services == False`, Restore aus `vm.params["service_mode"]`; `_sync_from_params` restauriert die Auswahl.
 - **Verifikation (headless, keine UI):**
   - `py_compile` aller 5 geaenderten Quelldateien + 4 neuen Testdateien OK.
-  - `test/check_mode_filter_db.py` (26 Checks): `fetch_available_source_modes` (distinct/sortiert, feature_ids-Filter, has-Flag), alle 4 Reader-Filter-Pfade (rows/columns/heatmap/generic), Repo-Payload (`source_modes`/`has_source_mode_services`), `get_table`/`get_heatmap`/`get_scatter`/`get_distribution`-Durchreichung - ALLE PASS.
-  - `test/check_mode_filter_worker.py` (6 Checks): Dispatch-Kette _execute -> alle 5 Repo-Methoden - PASS.
-  - `test/check_mode_filter_vm.py` (11 Checks): Default, Idempotenz, globaler Refresh, Dirty-Flag, `_current_params` fuer 6 Kinds, `_current_payload` sources - PASS.
-  - `test/check_mode_filter_widget.py` (10 Checks): Items, enabled/disabled (Entscheidung 4), Reset auf all, `_on_mode_filter_changed`, Stale-Guard - PASS.
+  - `../../test/check_mode_filter_db.py` (26 Checks): `fetch_available_source_modes` (distinct/sortiert, feature_ids-Filter, has-Flag), alle 4 Reader-Filter-Pfade (rows/columns/heatmap/generic), Repo-Payload (`source_modes`/`has_source_mode_services`), `get_table`/`get_heatmap`/`get_scatter`/`get_distribution`-Durchreichung - ALLE PASS.
+  - `../../test/check_mode_filter_worker.py` (6 Checks): Dispatch-Kette _execute -> alle 5 Repo-Methoden - PASS.
+  - `../../test/check_mode_filter_vm.py` (11 Checks): Default, Idempotenz, globaler Refresh, Dirty-Flag, `_current_params` fuer 6 Kinds, `_current_payload` sources - PASS.
+  - `../../test/check_mode_filter_widget.py` (10 Checks): Items, enabled/disabled (Entscheidung 4), Reset auf all, `_on_mode_filter_changed`, Stale-Guard - PASS.
   - Bestehende Tests gruen: `check_analytics_mtffc.py` (13), `check_analytics_mtffc_win.py` (22), `check_field_pairs_db.py` (5), `check_field_selection.py` (19), `check_heatmap_field_checks.py`, `check_mtf_sort_binding.py` (21). `check_custom_range_sortmode.py` NICHT lauffaehig (externe DB-Sperre data/app_data.duckdb durch laufende App - unabhaengig von dieser Umsetzung).
 - **Commit:** ceb2351
 # Implementierungs-Log 21.03.20 - Bugfixing Runde: Layout / Modus-Dropdown / Service-Achse (13.08.2026)
 
-- **Bug 1 (Layout, Mauszeiger-Werteanzeige):** `analytics/ui/heatmap_widget.py` - `_label_info` (Werteanzeige) liegt jetzt VOR `_combo_field` in ctrl2 (Spacing 6), `_combo_field` behaelt Stretch 1 (wachst bis Canvas-Ende). Verifiziert: `test/check_bugfix_2132_layout.py` PASS (info=15, field=17, stretch=1).
-- **Bug 2 (Modus-Dropdown zeigte nur DB-geschriebene Modi):** `analytics/engine/analytics_repository.py` - neue `_registry_source_modes()` (classmethod) liest `parameter_schema["mode"]["options"]` der aktiven Services (PluginRegistry-Singleton, in-Memory) und merged per `dict.fromkeys`-UNION in `source_modes` (DB-Modi zuerst, dann Registry-Modi sortiert); `has_source_mode_services = bool(has_sm or registry_modes)`; `Set`-Import ergaenzt.
+- **Bug 1 (Layout, Mauszeiger-Werteanzeige):** `../../analytics/ui/heatmap_widget.py` - `_label_info` (Werteanzeige) liegt jetzt VOR `_combo_field` in ctrl2 (Spacing 6), `_combo_field` behaelt Stretch 1 (wachst bis Canvas-Ende). Verifiziert: `../../test/check_bugfix_2132_layout.py` PASS (info=15, field=17, stretch=1).
+- **Bug 2 (Modus-Dropdown zeigte nur DB-geschriebene Modi):** `../../analytics/engine/analytics_repository.py` - neue `_registry_source_modes()` (classmethod) liest `parameter_schema["mode"]["options"]` der aktiven Services (PluginRegistry-Singleton, in-Memory) und merged per `dict.fromkeys`-UNION in `source_modes` (DB-Modi zuerst, dann Registry-Modi sortiert); `has_source_mode_services = bool(has_sm or registry_modes)`; `Set`-Import ergaenzt.
 - **Bug 3 (Service-Achse mit Modus-Suffix):**
-  - `analytics/engine/feature_store_reader.py`: `DIM_MAPPINGS["service_id"]` = `LOWER(feature_id) || '::' || COALESCE(json_extract_string(feature_data, '$.source_mode'), '')` (source_mode case-original); `fetch_generic_heatmap` neuer Parameter `extra_service_modes: Optional[List[str]] = None` ergaenzt fehlende `{feature_id}::{mode}`-Kombinationen als Achsenpunkte (nur service_id-Dimension, leere Zellen = fill).
-  - `analytics/engine/analytics_repository.py`: neue `_registry_service_mode_pairs()` (liefert `{plugin_id_lower}::{mode}`), `_registry_source_modes` darauf refactored; `get_generic_heatmap` reicht `extra_service_modes` durch NUR bei `service_mode` in ("", "all", "alle").
-  - `analytics/engine/analytics_view_model.py`: `resolve_service_label` parst `::`-Suffix, haengt `' / {Modus}'` nur bei nicht-leerem Modus an (auch im Exception-Fallback).
-  - Verifiziert: `test/check_bugfix_2132.py` (8 PASS: 3 Achsenpunkte, grid leerer Suffix, 4 Matrix-Spalten, Modus-Filter begrenzt auf 1), `test/check_bugfix_2132_label.py` (5 PASS).
+  - `../../analytics/engine/feature_store_reader.py`: `DIM_MAPPINGS["service_id"]` = `LOWER(feature_id) || '::' || COALESCE(json_extract_string(feature_data, '$.source_mode'), '')` (source_mode case-original); `fetch_generic_heatmap` neuer Parameter `extra_service_modes: Optional[List[str]] = None` ergaenzt fehlende `{feature_id}::{mode}`-Kombinationen als Achsenpunkte (nur service_id-Dimension, leere Zellen = fill).
+  - `../../analytics/engine/analytics_repository.py`: neue `_registry_service_mode_pairs()` (liefert `{plugin_id_lower}::{mode}`), `_registry_source_modes` darauf refactored; `get_generic_heatmap` reicht `extra_service_modes` durch NUR bei `service_mode` in ("", "all", "alle").
+  - `../../analytics/engine/analytics_view_model.py`: `resolve_service_label` parst `::`-Suffix, haengt `' / {Modus}'` nur bei nicht-leerem Modus an (auch im Exception-Fallback).
+  - Verifiziert: `../../test/check_bugfix_2132.py` (8 PASS: 3 Achsenpunkte, grid leerer Suffix, 4 Matrix-Spalten, Modus-Filter begrenzt auf 1), `../../test/check_bugfix_2132_label.py` (5 PASS).
 - **Verifikation (headless, keine UI):**
   - `py_compile` aller 4 geaenderten Quelldateien + Testdatei OK.
-  - `test/check_mode_filter_db.py` (25 Checks, inkl. 3 neuer Registry-Payload-Checks), `test/check_bugfix_2132.py` (8), `test/check_bugfix_2132_label.py` (5), `test/check_bugfix_2132_layout.py`, `test/check_mode_filter_worker.py` (6), `test/check_mode_filter_vm.py` (11), `test/check_mode_filter_widget.py` (10) - ALLE PASS.
-  - `test/check_mode_filter_db.py`: Payload-Erwartung von exakt auf "enthaelt" umgestellt (Bugfix 2 liefert zusaetzlich Registry-Modi der realen Plugins).
+  - `../../test/check_mode_filter_db.py` (25 Checks, inkl. 3 neuer Registry-Payload-Checks), `../../test/check_bugfix_2132.py` (8), `../../test/check_bugfix_2132_label.py` (5), `../../test/check_bugfix_2132_layout.py`, `../../test/check_mode_filter_worker.py` (6), `../../test/check_mode_filter_vm.py` (11), `../../test/check_mode_filter_widget.py` (10) - ALLE PASS.
+  - `../../test/check_mode_filter_db.py`: Payload-Erwartung von exakt auf "enthaelt" umgestellt (Bugfix 2 liefert zusaetzlich Registry-Modi der realen Plugins).
   - Temporaere Patch-Skripte (`test/_fix_bug*.py`) nach Verifikation geloescht.
 - **Commit:** ce534c5
 # Implementierungs-Log 21.03.20 - Bugfixing Runde 2: Layout / Modus-Parameter / Achsen / OSError (13.08.2026)
 
-- **Bug 1 (Layout, Werteanzeige ueber dem Feld-Dropdown):** `analytics/ui/heatmap_widget.py` - `ctrl2` ist jetzt ein 2-zeiliges QGridLayout: Zeile 0 traegt `_label_info` EINE ZEILE UEBER der Steuerleiste, linksbuendig in derselben Spalte wie `_combo_field` (Spalte des 'Feld:'-Labels). `_combo_field` (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
-- **Bug 2 (Layout, Dropdown-Tausch):** Modus-Dropdown (`_combo_mode_filter`) steht jetzt VOR der Aggregation (`_combo_agg`). Verifiziert: `test/check_bugfix_2132_layout.py` (8 PASS, Grid-Semantik: info=(0,12) field=(1,12) gleiche Spalte, mode=(1,8) agg=(1,10)).
+- **Bug 1 (Layout, Werteanzeige ueber dem Feld-Dropdown):** `../../analytics/ui/heatmap_widget.py` - `ctrl2` ist jetzt ein 2-zeiliges QGridLayout: Zeile 0 traegt `_label_info` EINE ZEILE UEBER der Steuerleiste, linksbuendig in derselben Spalte wie `_combo_field` (Spalte des 'Feld:'-Labels). `_combo_field` (Stretch 1) waechst weiterhin bis zum Canvas-Ende.
+- **Bug 2 (Layout, Dropdown-Tausch):** Modus-Dropdown (`_combo_mode_filter`) steht jetzt VOR der Aggregation (`_combo_agg`). Verifiziert: `../../test/check_bugfix_2132_layout.py` (8 PASS, Grid-Semantik: info=(0,12) field=(1,12) gleiche Spalte, mode=(1,8) agg=(1,10)).
 - **Bug 3 (Modus-spezifische Ergebnis-Parameter im Feld-Dropdown):**
-  - `analytics/engine/feature_store_reader.py`: `_feature_meta_base` sammelt zusaetzlich `keys_by_service_mode` (JSON-Keys je (Service, source_mode), ROW-GENAU statt bucket-weit - bucket aggregiert ueber alle Modi); `feature_keys_by_service` erhaelt `service_mode`-Parameter und liefert nur die Keys der Rows mit diesem Modus (numeric_only weiter aktiv).
-  - `analytics/engine/analytics_repository.py`: `_field_metadata` erhaelt `service_mode` + reicht ihn an `feature_keys_by_service` durch; bei gewaehltem, aber noch nicht berechnetem Modus (leere modus-gefilterte Keys) Fallback auf die nicht-technischen `output_schema`-Keys der selektierten Services (neuer Helper `_registry_output_keys`, Muster `_registry_service_mode_pairs`); `get_available_features` erhaelt `service_mode` und reicht ihn in die Feld-Metadaten.
-  - `analytics/engine/analytics_worker.py`: QUERY_FEATURES reicht `service_mode` an `get_available_features`.
+  - `../../analytics/engine/feature_store_reader.py`: `_feature_meta_base` sammelt zusaetzlich `keys_by_service_mode` (JSON-Keys je (Service, source_mode), ROW-GENAU statt bucket-weit - bucket aggregiert ueber alle Modi); `feature_keys_by_service` erhaelt `service_mode`-Parameter und liefert nur die Keys der Rows mit diesem Modus (numeric_only weiter aktiv).
+  - `../../analytics/engine/analytics_repository.py`: `_field_metadata` erhaelt `service_mode` + reicht ihn an `feature_keys_by_service` durch; bei gewaehltem, aber noch nicht berechnetem Modus (leere modus-gefilterte Keys) Fallback auf die nicht-technischen `output_schema`-Keys der selektierten Services (neuer Helper `_registry_output_keys`, Muster `_registry_service_mode_pairs`); `get_available_features` erhaelt `service_mode` und reicht ihn in die Feld-Metadaten.
+  - `../../analytics/engine/analytics_worker.py`: QUERY_FEATURES reicht `service_mode` an `get_available_features`.
 - **Bug 4 (MA_Slope_Change / 'Keine Daten vorhanden'):** Achsen-Labels (`resolve_service_label` inkl. ' / {Modus}') werden in `_render_generic` jetzt VOR dem Leer-Check konfiguriert - Beschriftung + Achseneintrag aktualisieren sich auch bei leerer Matrix (vorher blieb der alte Zustand stehen). 'Keine Daten'-Meldung nennt den gewaehlten Modus ('Keine Daten fuer Modus 'X''). DB-Abgleich (read-only): `source_mode LIKE %MA_Slope_Change%` = 0 Zeilen im gesamten Store - das Dropdown zeigt Registry-Modi (alle moeglichen), obwohl tatsaechlich nur MA_Peak_Hysteresis (hash 489c5ece) berechnet wurde. Die 'Keine Daten'-Meldung ist fachlich korrekt; die Ursache liegt in der Ausfuehrung/Persistenz des Modus, nicht in der Anzeige.
 - **Bug 5 (OSError 22 beim Mausfahren):** `_lwc_date_ticks` clampt `lo`/`hi` auf >= 0 (Date-Epochs sind Wanduhr-Sekunden seit 1970; negative Werte aus dem zusammengefallenen Auto-Range nach 'Keine Daten' [-0.5, 0.5] wuerden `fromtimestamp(-86400)` ausloesen); `_date_marks` umschliesst `datetime.fromtimestamp` mit `(OSError, ValueError, OverflowError)` und ueberspringt ungueltige Marken; `_update_cell_info` faengt zusaetzlich `OSError` ab.
 - **Verifikation (headless, keine UI):**
   - `py_compile` aller 4 geaenderten Quelldateien OK.
-  - `test/check_bugfix_2132b.py` (17 Checks): keys_by_service_mode row-genau (Peak/Slope getrennt), feature_keys_by_service mit service_mode (numeric_only), _field_metadata modus-gefiltert, output_schema-Fallback fuer unbekannten Modus, get_available_features-Durchreichung, _date_marks ohne OSError bei negativen Epochs - ALLE PASS.
-  - `test/check_bugfix_2132_layout.py` (8 Checks, umgestellt auf QGridLayout-Semantik), `test/check_bugfix_2132.py` (8), `test/check_bugfix_2132_label.py` (5), `test/check_mode_filter_db.py` (25), `test/check_mode_filter_worker.py` (6), `test/check_mode_filter_vm.py` (11), `test/check_mode_filter_widget.py` (10) - ALLE PASS.
+  - `../../test/check_bugfix_2132b.py` (17 Checks): keys_by_service_mode row-genau (Peak/Slope getrennt), feature_keys_by_service mit service_mode (numeric_only), _field_metadata modus-gefiltert, output_schema-Fallback fuer unbekannten Modus, get_available_features-Durchreichung, _date_marks ohne OSError bei negativen Epochs - ALLE PASS.
+  - `../../test/check_bugfix_2132_layout.py` (8 Checks, umgestellt auf QGridLayout-Semantik), `../../test/check_bugfix_2132.py` (8), `../../test/check_bugfix_2132_label.py` (5), `../../test/check_mode_filter_db.py` (25), `../../test/check_mode_filter_worker.py` (6), `../../test/check_mode_filter_vm.py` (11), `../../test/check_mode_filter_widget.py` (10) - ALLE PASS.
 - **Commit:** f71690f
 
 # Implementierungs-Log 21.03.20 - Analyse & Entscheidungen Punkte 1-8 (F1-F8) (13.08.2026)
@@ -2319,14 +2319,14 @@ def _on_mode_filter_changed(self) -> None:
 - **Stand:** Umgesetzt nach Anwender-Startschuss; Analyse & Entscheidungen siehe voriger Eintrag (F1-F8).
 
 - **Punkt 1 - MA_Slope_Change: a) Achse, b) Parameter-Dropdown (F1):**
-  - `analytics/engine/analytics_repository.py` `get_generic_heatmap`: `extra_service_modes` wird jetzt AUCH bei konkretem Modus-Filter ergaenzt - die Registry-Paare werden auf den gewaehlten Modus gefiltert (`p.rsplit("::",1)[1].lower() == mode_key`). Vorher blieb die service_id-Achse bei konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt (MA_Slope_Change erzeugte keinen Achsenpunkt).
+  - `../../analytics/engine/analytics_repository.py` `get_generic_heatmap`: `extra_service_modes` wird jetzt AUCH bei konkretem Modus-Filter ergaenzt - die Registry-Paare werden auf den gewaehlten Modus gefiltert (`p.rsplit("::",1)[1].lower() == mode_key`). Vorher blieb die service_id-Achse bei konkretem Modus auf die DB-geschriebenen Kombinationen begrenzt (MA_Slope_Change erzeugte keinen Achsenpunkt).
   - **P1b+P8:** `service_mode` wird jetzt an `_field_metadata` DURCHgereicht - vorher fehlte er im QUERY_HEATMAP_GENERIC-Payload und ueberschrieb damit die modus-gefilterte Feld-Liste aus QUERY_FEATURES (Parameter-Box zeigte die falschen/ungefilterten Keys). Identischer Root Cause wie Punkt 8.
 
 - **Punkt 2 - Legende (F2):** `_update_legend` (analytics/ui/heatmap_widget.py): Viridis-Labels auf `<= v25`, `>= v25`, `>= v50`, `>= v75`, `>= vmax` umgestellt (Operator VOR der Zahl, kein `x`). Confluence bleibt `= 0`...`= 4`, `>= 5` (unveraendert).
 
 - **Punkt 3 - Timeframes sortiert fein->grob (F3):**
-  - `analytics/engine/feature_store_reader.py`: neue Konstante `CANONICAL_TIMEFRAME_ORDER` (M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1) + Helfer `canonical_tf_sort()` (unbekannte TFs deterministisch am Ende, None/leer defensiv). `fetch_service_tf_status` UND `get_available_timeframes` liefern kanonisch sortiert statt `ORDER BY timeframe` (alphabetisch: D1,H1,H4,M1,...).
-  - `serviceui/common_widgets.py` (`TfStatusBadgeBar`): zusaetzliche DEFENSIVE kanonische Sortierung in `update_status`/`_rebuild` (`_sort_tfs_canonical`) - deckt die Pill-Strips aller drei Fenster (AnalyticsWindow, ServicePicker, ServiceWindow) ab.
+  - `../../analytics/engine/feature_store_reader.py`: neue Konstante `CANONICAL_TIMEFRAME_ORDER` (M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1) + Helfer `canonical_tf_sort()` (unbekannte TFs deterministisch am Ende, None/leer defensiv). `fetch_service_tf_status` UND `get_available_timeframes` liefern kanonisch sortiert statt `ORDER BY timeframe` (alphabetisch: D1,H1,H4,M1,...).
+  - `../../serviceui/common_widgets.py` (`TfStatusBadgeBar`): zusaetzliche DEFENSIVE kanonische Sortierung in `update_status`/`_rebuild` (`_sort_tfs_canonical`) - deckt die Pill-Strips aller drei Fenster (AnalyticsWindow, ServicePicker, ServiceWindow) ab.
 
 - **Punkt 4 - Feld-Dropdown genau ein angehaktes Feld (F4):** `_on_field_selection_changed` (heatmap_widget.py): das AKTIVE Feld wird vor der XOR-Reconciliation gemerkt; wird es abgehakt, zieht `_sync_field_current_after_checks` die Auswahl auf das naechste angehakte Feld nach und `_apply_config()` wird explizit nachgezogen (Refresh der Aggregations-/Anzeige-Auswahl).
 
@@ -2342,7 +2342,7 @@ def _on_mode_filter_changed(self) -> None:
 
 - **Verifikation (headless, keine UI):**
   - `py_compile` aller 6 geaenderten Quelldateien + Testdatei OK.
-  - `test/check_punkte_1_8.py` (9 Checks): canonical_tf_sort, _sort_tfs_canonical, _is_price_like_key, Repo extra_service_modes konkret/all/None + service_mode-Durchreichung an _field_metadata (Mock-Reader), _mode_suffix (3-Modi/Default/Ein-Modus/unbekannt), P7-Merge in allen 3 Run-Pfaden, P4-/P2-Source-Checks - ALLE PASS.
+  - `../../test/check_punkte_1_8.py` (9 Checks): canonical_tf_sort, _sort_tfs_canonical, _is_price_like_key, Repo extra_service_modes konkret/all/None + service_mode-Durchreichung an _field_metadata (Mock-Reader), _mode_suffix (3-Modi/Default/Ein-Modus/unbekannt), P7-Merge in allen 3 Run-Pfaden, P4-/P2-Source-Checks - ALLE PASS.
   - Bestehende Tests gruen: `check_bugfix_2132.py` (8), `check_bugfix_2132b.py` (17), `check_bugfix_2132_label.py` (5), `check_bugfix_2132_layout.py` (8), `check_mode_filter_worker.py` (6), `check_mode_filter_vm.py` (11), `check_mode_filter_widget.py` (10), `check_mode_filter_db.py` (25).
   - P3 gegen echte DB (read-only): `fetch_service_tf_status('srv_swing_momentum')` liefert M1,M2,M5,M10,M15,M30,H1,H4,D1,W1,MN1 (kanonisch); `get_available_timeframes('SILVER')` ebenfalls.
 - **Commit:** 9214f00
@@ -2360,9 +2360,9 @@ def _on_mode_filter_changed(self) -> None:
 
 - **Verifikation (headless, keine UI):**
   - `py_compile analytics/ui/heatmap_page.py` OK; CRLF-Zeilenenden erhalten (Datei ist 100 % CRLF, Fix per CRLF-erhaltendem Skript angewendet).
-  - `test/check_heatmap_page_stack.py` (10 Checks, neu): Initial-Stack zeigt Generisch (Index 1), nach attach ebenfalls, Overlay bleibt auf Content (Index 0) auch bei leerem QUERY_HEATMAP-Payload, generisches Payload rendert - ALLE PASS.
-  - `test/check_heatmap_e2e.py` (8 Checks, neu): echte temp-DuckDB + echter AnalyticsViewModel + echter Async-Worker - Stack Index 1 vor und nach Request, generisches Image (2x3), currentWidget = HeatmapWidget, Page-Overlay 0 - ALLE PASS.
-  - Regression gruen: `test/check_heatmap_render.py` (12), `test/check_punkte_1_8.py` (9).
+  - `../../test/check_heatmap_page_stack.py` (10 Checks, neu): Initial-Stack zeigt Generisch (Index 1), nach attach ebenfalls, Overlay bleibt auf Content (Index 0) auch bei leerem QUERY_HEATMAP-Payload, generisches Payload rendert - ALLE PASS.
+  - `../../test/check_heatmap_e2e.py` (8 Checks, neu): echte temp-DuckDB + echter AnalyticsViewModel + echter Async-Worker - Stack Index 1 vor und nach Request, generisches Image (2x3), currentWidget = HeatmapWidget, Page-Overlay 0 - ALLE PASS.
+  - Regression gruen: `../../test/check_heatmap_render.py` (12), `../../test/check_punkte_1_8.py` (9).
 - **Commit:** 529ef6b
 
 # Implementierungs-Log 13.08.2026 - Bugfixing Runde 1-3: Profile / Heatmap-Layout / MasterTree-Modus-Labels (13.08.2026)
@@ -2370,29 +2370,29 @@ def _on_mode_filter_changed(self) -> None:
 ## Runde 1 - 5 Punkte (Bugfixing-Modus)
 
 - **1. Custom-Range:** entfaellt bewusst (bereits am 21.03.15 entfernt) - keine Aenderung.
-- **2. Modus-Dropdown:** `analytics/engine/analytics_repository.py` `_registry_service_mode_pairs` zunaechst mit Guard bei leerer Auswahl. KORRIGIERT in Runde 3 (Guard an die richtige Stelle verschoben, s. u.).
-- **3. Profile kaputt:** `analytics/ui/analytics_win.py` - `_wire_controls()` verdrahtet `combo_profile.currentIndexChanged -> _on_profile_selected` und `btn_profile_save.clicked -> _on_profile_save`; `_on_profile_save()` synchronisiert die Filterleiste defensiv (data_tf/agg_tf/sort_mode/range via `mtf_bar.current_range_*()`). `chart/widgets/mtf_filter_bar.py`: neue Methoden `current_range_preset()`/`current_range_epochs()`, `_on_range_changed` nutzt die Extraktion.
+- **2. Modus-Dropdown:** `../../analytics/engine/analytics_repository.py` `_registry_service_mode_pairs` zunaechst mit Guard bei leerer Auswahl. KORRIGIERT in Runde 3 (Guard an die richtige Stelle verschoben, s. u.).
+- **3. Profile kaputt:** `../../analytics/ui/analytics_win.py` - `_wire_controls()` verdrahtet `combo_profile.currentIndexChanged -> _on_profile_selected` und `btn_profile_save.clicked -> _on_profile_save`; `_on_profile_save()` synchronisiert die Filterleiste defensiv (data_tf/agg_tf/sort_mode/range via `mtf_bar.current_range_*()`). `../../chart/widgets/mtf_filter_bar.py`: neue Methoden `current_range_preset()`/`current_range_epochs()`, `_on_range_changed` nutzt die Extraktion.
 - **4. W1/MN1:** DB-Check zeigt Daten vorhanden (SILVER: W1=1377, MN1=318) - kein Code-Bug.
-- **5. Heatmap-Layout:** `analytics/ui/heatmap_widget.py` - 2-zeiliges Layout (row1: Kerzen-Overlay/X/Y/ZoomX/ZoomY/Modus/Aggregation; row2: 'Ergebnisparameter:' + `_combo_field` stretch).
+- **5. Heatmap-Layout:** `../../analytics/ui/heatmap_widget.py` - 2-zeiliges Layout (row1: Kerzen-Overlay/X/Y/ZoomX/ZoomY/Modus/Aggregation; row2: 'Ergebnisparameter:' + `_combo_field` stretch).
 
 ## Runde 2 - Kosmetik (13.08.2026)
 
 - **Heatmap-Breiten:** `_combo_x`/`_combo_y` `setMinimumWidth(160->110)`; Zoom-Slider `setMinimumWidth(70)` + `Expanding`-Policy (sichtbar).
-- **MasterTree Plugin-Parents:** `serviceui/master_tree.py` `_build_plugin_item` - `mode_sfx` jetzt auch an Plugin-Parents MIT Clones (`f"{display_pid}{mode_sfx}"`).
+- **MasterTree Plugin-Parents:** `../../serviceui/master_tree.py` `_build_plugin_item` - `mode_sfx` jetzt auch an Plugin-Parents MIT Clones (`f"{display_pid}{mode_sfx}"`).
 
 ## Runde 3 - MasterTree: aktueller Modus in eckiger Klammer + dahinter (13.08.2026, final)
 
 - **User-Anforderung:** In eckigen Klammern steht bei den Clones der Servicename (richtig), aber dahinter muss auch der Name des AKTUELLEN Modus stehen - zusaetzlich Live-Update im Tree bei Modus-Aenderung (Services + Clones).
 - **Format-Entscheidung (final):** Die Klammer bleibt (Schema-Default/params-Modus = 'Servicename'-Bezug). Der aktuelle Modus haengt IMMER dahinter: `[Default] AktuellerModus`. Aufloesungs-Kette: `params.mode` -> `source_mode_for_hash` (Feature-Store, letzte Ausfuehrung je instance_hash) -> `source_mode_for_plugin` (flache Standalone-Plugins) -> Schema-Default (nie gelaufene Variante). Ein-Modus-Services bleiben ohne Suffix.
 - **Aenderungen:**
-  - `analytics/engine/feature_store_reader.py`: neue Methode `fetch_source_modes_by_hash()` -> `Dict[feature_id_lower, {instance_hash: source_mode}]` (arg_max(json_extract_string(feature_data, '$.source_mode'), bar_time) ueber alle Symbole/TFs, SENTINEL_NATIVE-Filter).
-  - `analytics/engine/service_selector_model.py`: `_load_source_modes_by_hash()` in `refresh()`; neue Methoden `source_mode_for_hash(plugin_id, hash)` + `source_mode_for_plugin(plugin_id)`.
-  - `serviceui/master_tree.py`: `_mode_suffix_resolved()` haengt den aktuellen Modus IMMER hinter der Klammer an; `update_mode_label(instance_id, plugin_id, mode, instance_hash)` live ohne Baum-Neuaufbau (Scope: Clone per Hash, Set-Service per instance_id, flaches Plugin per plugin_id; Template-Parents MIT Clones bleiben unveraendert); `_set_label_mode()` robustes Label-Rewrite (Preset-Klammern wie 'Default (Kopie)', '*'/Datum bleiben erhalten); `_build_set_item()` berechnet den Hash VOR dem Suffix (Store-Aufloesung); `_build_plugin_item()` nutzt fuer flache Plugins `_mode_suffix_resolved`.
-  - `serviceui/param_columns.py`: `_update_tree_mode_label()` reicht den instance_hash des bearbeiteten Presets (`_current_preset_editing`) an `tree.update_mode_label` durch.
-  - `analytics/engine/analytics_repository.py` (Guard-Korrektur Runde 1): Der 'kein Registry-Fallback bei leerer Auswahl'-Guard gehoert NICHT in `_registry_service_mode_pairs` (Heatmap-Achse braucht den Fallback fuer F1) - er sitzt jetzt korrekt in `_registry_source_modes` (Modus-Dropdown wird bei leerer Auswahl leer; die Achse behaelt den vollen Registry-Satz).
+  - `../../analytics/engine/feature_store_reader.py`: neue Methode `fetch_source_modes_by_hash()` -> `Dict[feature_id_lower, {instance_hash: source_mode}]` (arg_max(json_extract_string(feature_data, '$.source_mode'), bar_time) ueber alle Symbole/TFs, SENTINEL_NATIVE-Filter).
+  - `../../analytics/engine/service_selector_model.py`: `_load_source_modes_by_hash()` in `refresh()`; neue Methoden `source_mode_for_hash(plugin_id, hash)` + `source_mode_for_plugin(plugin_id)`.
+  - `../../serviceui/master_tree.py`: `_mode_suffix_resolved()` haengt den aktuellen Modus IMMER hinter der Klammer an; `update_mode_label(instance_id, plugin_id, mode, instance_hash)` live ohne Baum-Neuaufbau (Scope: Clone per Hash, Set-Service per instance_id, flaches Plugin per plugin_id; Template-Parents MIT Clones bleiben unveraendert); `_set_label_mode()` robustes Label-Rewrite (Preset-Klammern wie 'Default (Kopie)', '*'/Datum bleiben erhalten); `_build_set_item()` berechnet den Hash VOR dem Suffix (Store-Aufloesung); `_build_plugin_item()` nutzt fuer flache Plugins `_mode_suffix_resolved`.
+  - `../../serviceui/param_columns.py`: `_update_tree_mode_label()` reicht den instance_hash des bearbeiteten Presets (`_current_preset_editing`) an `tree.update_mode_label` durch.
+  - `../../analytics/engine/analytics_repository.py` (Guard-Korrektur Runde 1): Der 'kein Registry-Fallback bei leerer Auswahl'-Guard gehoert NICHT in `_registry_service_mode_pairs` (Heatmap-Achse braucht den Fallback fuer F1) - er sitzt jetzt korrekt in `_registry_source_modes` (Modus-Dropdown wird bei leerer Auswahl leer; die Achse behaelt den vollen Registry-Satz).
 - **Verifikation (headless, keine UI):**
-  - `test/check_tree_mode_fix2.py` (neu, 38 Checks): reale Clone-Labels (Klammer + aktueller Modus dahinter), Abweichungs-Fall (Fake-Model: `[Supertrend_ATR] Donchian_Keltner_Breakout`), `_set_label_mode` (6 Label-Varianten inkl. Dirty/Datum/Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/alle-Clones-Fallback/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
-  - `test/check_punkte_1_8.py` (9 Checks): ALLE PASS (F1-Achse wieder gruen nach Guard-Korrektur).
+  - `../../test/check_tree_mode_fix2.py` (neu, 38 Checks): reale Clone-Labels (Klammer + aktueller Modus dahinter), Abweichungs-Fall (Fake-Model: `[Supertrend_ATR] Donchian_Keltner_Breakout`), `_set_label_mode` (6 Label-Varianten inkl. Dirty/Datum/Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/alle-Clones-Fallback/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
+  - `../../test/check_punkte_1_8.py` (9 Checks): ALLE PASS (F1-Achse wieder gruen nach Guard-Korrektur).
   - `py_compile` aller 5 geaenderten Quelldateien OK.
   - Datenlage (read-only): 5 Multi-Modus-Services; alle aktuellen Store-Modi == Schema-Default (z. B. srv_trend_breakout -> Supertrend_ATR) - die Abweichungs-Anzeige greift, sobald eine Variante mit anderem Modus laeuft.
 - **Commit:** 3797734 (Code + Doku Runde 1-3 gemeinsam committet)
@@ -2422,7 +2422,7 @@ def _on_mode_filter_changed(self) -> None:
 
 ### Aenderungen (Runde 3 final)
 
-- `serviceui/master_tree.py`:
+- `../../serviceui/master_tree.py`:
   - `_mode_suffix_resolved()` ersetzt durch `_current_mode(plugin_id, params, instance_hash)` (liefert nur den aufgeloesten Modus; Formatierung uebernimmt der Aufrufer). Aufloesungs-Kette unveraendert: params.mode -> source_mode_for_hash -> source_mode_for_plugin -> Schema-Default.
   - Neuer Normalisierer `_fmt_last_exec(value)`: akzeptiert `DD.MM.JJ` (Alt-Bestand) und `DD.MM.JJ HH:MM` (neu); Fallbacks `--.--.--`/`--.--.-- --:--` -> `nie`.
   - `_build_set_item()`: Set-Service-Label `{instance_id} - {Modus} ({last_exec})` (dash).
@@ -2430,16 +2430,16 @@ def _on_mode_filter_changed(self) -> None:
   - `_build_clone_item()`: `{prefix} {preset_name} [{display_pid}] {Modus} ({last_exec})` (bracket, Klammer = Servicename ohne srv_).
   - `_set_label_mode(item, mode, style)`: style `dash`/`bracket` - Live-Update-Rewrite ersetzt nur den Modus hinter Minuszeichen bzw. hinter der Klammer (Klammerwert = Servicename bleibt erhalten); `(Datum)`/`*` bleiben erhalten.
   - `update_mode_label()`: reicht den Knotentyp als style durch (Clone -> bracket, sonst dash).
-- `serviceui/param_columns.py`: `_update_tree_mode_label` - selector-Fallback fuer den Dialog-Host (Bugfix 1c).
-- `analytics/engine/service_selector_model.py`:
+- `../../serviceui/param_columns.py`: `_update_tree_mode_label` - selector-Fallback fuer den Dialog-Host (Bugfix 1c).
+- `../../analytics/engine/service_selector_model.py`:
   - `_load_plugin_presets()`: `last_execution` der Clones jetzt aus `_last_execution_datetimes_by_hash` (`DD.MM.JJ HH:MM`, Fallback `--.--.-- --:--`) statt nur Datum.
   - `build_tree()`: `last_execution_datetime(pid)` (`DD.MM.JJ HH:MM`) statt `last_execution_date(pid)` fuer alle Baum-Zeilen.
 
 ### Verifikation (headless, keine UI - Grundsatz 2)
 
-- `test/check_tree_mode_fix2.py` (46 Checks): reale Clone-Labels (Klammer = Servicename ohne srv_, Modus dahinter), `_current_mode` (Store-Modus gewinnt/params-Vorrang/Ein-Modus leer), `_set_label_mode` (dash/bracket, Dirty *, Datum, Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
-- `test/check_all_labels.py` / `check_clone_labels.py` / `check_tree_mode_fix.py`: rendern das neue Format auf echten Baum-Daten (z. B. `swing_momentum - MA_Peak_Hysteresis (13.08.26 10:48)`, `srv_swing 34566 [swing_volume_profile] Volume_Profile (12.08.26 12:17)`, Parents nur Servicename).
-- `test/check_punkte_1_8.py` (9 Checks): ALLE PASS (keine Regression).
+- `../../test/check_tree_mode_fix2.py` (46 Checks): reale Clone-Labels (Klammer = Servicename ohne srv_, Modus dahinter), `_current_mode` (Store-Modus gewinnt/params-Vorrang/Ein-Modus leer), `_set_label_mode` (dash/bracket, Dirty *, Datum, Preset-Klammern), `update_mode_label`-Matching (Clone-Hash/Set-Service/flaches Plugin/Parent unveraendert) - ALLE PASS.
+- `../../test/check_all_labels.py` / `check_clone_labels.py` / `check_tree_mode_fix.py`: rendern das neue Format auf echten Baum-Daten (z. B. `swing_momentum - MA_Peak_Hysteresis (13.08.26 10:48)`, `srv_swing 34566 [swing_volume_profile] Volume_Profile (12.08.26 12:17)`, Parents nur Servicename).
+- `../../test/check_punkte_1_8.py` (9 Checks): ALLE PASS (keine Regression).
 - `py_compile` aller geaenderten Quelldateien OK.
 
 ## Runde 3d - Grafikteiler Tree|Parameter: Persistenz (Workspace + Profil + Historie)
@@ -2449,27 +2449,27 @@ def _on_mode_filter_changed(self) -> None:
 
 ### Aenderungen (Runde 3d)
 
-- `state_manager.py`: neue Methoden `save_splitter_state(dialog_key, sizes)` / `get_splitter_state(dialog_key)` (global_settings, JSON-Liste).
-- `serviceui/service_selector_dialog.py` (ServicePicker Tree|Parameter):
+- `../../state_manager.py`: neue Methoden `save_splitter_state(dialog_key, sizes)` / `get_splitter_state(dialog_key)` (global_settings, JSON-Liste).
+- `../../serviceui/service_selector_dialog.py` (ServicePicker Tree|Parameter):
   - Neues Signal `splitter_changed(int, int)` - wird bei jeder `splitterMoved`-Bewegung ans AnalyticsWindow gemeldet (Live-Tracking, `_on_splitter_moved`).
   - `_save_geometry()`: sichert die Splitter-Position zusaetzlich in global_settings (Historie); `_restore_geometry()`: stellt sie wieder her.
   - Neue Methoden `current_splitter_sizes()` / `set_splitter_sizes(sizes)` (defensiv: nur 2 positive Werte, Tree-Minimum 180px respektiert).
-- `analytics/ui/analytics_win.py`:
+- `../../analytics/ui/analytics_win.py`:
   - `_picker_splitter` merkt die letzte Position live (`_on_picker_splitter_changed`).
   - `_current_ui_layout()`: `service_picker_splitter` im Profil-Payload (`set_ui_layout` -> `save_profile`/`create_profile`).
   - `_save_workspace()`: `service_picker_splitter` im Workspace-Payload (+ global_settings-Backup).
   - Restore: beim Oeffnen des Pickers wird `service_picker_splitter` aus `workspace_layout` angewendet; beim Profilwechsel wird ein offener Picker-Dialog sofort nachgezogen.
-- `serviceui/service_win.py` (MasterTree|Param-Box): `save_state()` sichert `main_splitter.sizes()` in der Fenster-Historie; `restore_state()` stellt sie wieder her.
+- `../../serviceui/service_win.py` (MasterTree|Param-Box): `save_state()` sichert `main_splitter.sizes()` in der Fenster-Historie; `restore_state()` stellt sie wieder her.
 
 ### Verifikation (headless, keine UI - Grundsatz 2)
 
-- `test/check_splitter_persist.py` (17 Checks): StateManager-Roundtrip (Temp-DB in test/), Dialog-Methoden gemockt (set/current/on_moved inkl. Tree-Minimum + Invalid-Guards), AnalyticsWindow-Payload-Inspektion (service_picker_splitter in Profil- und Workspace-Payload, splitter_changed verdrahtet, Restore beim Oeffnen), ServiceWindow-Historie (save/get_splitter_state) - ALLE PASS.
-- `test/check_tree_mode_fix2.py` (46 Checks): weiterhin ALLE PASS (keine Regression).
+- `../../test/check_splitter_persist.py` (17 Checks): StateManager-Roundtrip (Temp-DB in test/), Dialog-Methoden gemockt (set/current/on_moved inkl. Tree-Minimum + Invalid-Guards), AnalyticsWindow-Payload-Inspektion (service_picker_splitter in Profil- und Workspace-Payload, splitter_changed verdrahtet, Restore beim Oeffnen), ServiceWindow-Historie (save/get_splitter_state) - ALLE PASS.
+- `../../test/check_tree_mode_fix2.py` (46 Checks): weiterhin ALLE PASS (keine Regression).
 - `py_compile` aller 7 geaenderten Quelldateien OK.
 
 ## Commit (13.08.2026) - Runde 3 final + Grafikteiler-Persistenz
 
-- **Geaenderte Dateien (7):** `analytics/engine/service_selector_model.py`, `analytics/ui/analytics_win.py`, `serviceui/master_tree.py`, `serviceui/param_columns.py`, `serviceui/service_selector_dialog.py`, `serviceui/service_win.py`, `state_manager.py`.
+- **Geaenderte Dateien (7):** `../../analytics/engine/service_selector_model.py`, `../../analytics/ui/analytics_win.py`, `../../serviceui/master_tree.py`, `../../serviceui/param_columns.py`, `../../serviceui/service_selector_dialog.py`, `../../serviceui/service_win.py`, `../../state_manager.py`.
 - **Testdateien:** verbleiben lokal in test/ (gitignored, Projekt-Konvention) - keine Commits.
 
 ---
@@ -2569,7 +2569,7 @@ Für die visuelle Darstellung von Häufungen werden drei spezifische Aggregation
 
 ## 🛠️ 5. Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### Schritt 1: Reader-Erweiterung für `COUNT DISTINCT` (`analytics/engine/feature_store_reader.py`)
+### Schritt 1: Reader-Erweiterung für `COUNT DISTINCT` (`../../analytics/engine/feature_store_reader.py`)
 
 In `fetch_generic_heatmap()` die Aggregation für Confluence absichern:
 
@@ -2581,7 +2581,7 @@ if agg_key == "confluence_count":
 elif agg_key == "count":
     agg_sql = "COUNT(*) AS val"
 
-### Schritt 2: Deaktivierungs-Steuerung im UI-Widget (`analytics/ui/heatmap_widget.py`)
+### Schritt 2: Deaktivierungs-Steuerung im UI-Widget (`../../analytics/ui/heatmap_widget.py`)
 
 In `_update_controls()` des `HeatmapWidget` die Feld-Freigabe an die Aggregation koppeln[cite: 5]:
 
@@ -2597,7 +2597,7 @@ def _update_controls(self) -> None:
         self._combo_field.setToolTip("Bei Confluence/Count-Aggregation nicht erforderlich.")
 
 
-### Schritt 3: ViewModel-Anpassung für Multi-Modus-Freigabe (`analytics/engine/analytics_view_model.py`)
+### Schritt 3: ViewModel-Anpassung für Multi-Modus-Freigabe (`../../analytics/engine/analytics_view_model.py`)
 
 Sicherstellen, dass `service_mode = "all"` bei Confluence-Queries keine `source_mode`-Einschränkung in SQL einfügt[cite: 5]:
 
@@ -2610,7 +2610,7 @@ def apply_smart_preset_confluence(self) -> None:
 
 ---
 
-## 📊 6. Akzeptanzkriterien für die Headless-Validierung (`test/test.py`)
+## 📊 6. Akzeptanzkriterien für die Headless-Validierung (`../../test/test.py`)
 
 1. **Confluence-Distinct-Test:** Bei 3 verschiedenen Services, die auf derselben Bar feuern, liefert `fetch_generic_heatmap(..., agg="confluence_count")` exakt den Wert $3.0$ für die Zelle[cite: 5].
 2. **Multi-Modus-Inklusion-Test:** Bei `service_mode = "all"` enthält das SQL-Ergebnis Signale aus *allen* aktiven Modi der gewählten Services (kein Ausschluss einzelner Modi)[cite: 5].
@@ -2624,8 +2624,8 @@ def apply_smart_preset_confluence(self) -> None:
 
 | Kapitel-Abschnitt | Status im Bestand |
 | --- | --- |
-| §4.1 / §5 Schritt 1: `COUNT(DISTINCT feature_id)` | ✅ vorhanden (`analytics/engine/feature_store_reader.py` Z. 1283-1286, `HEATMAP_AGGREGATIONS` Z. 117) |
-| §5 Schritt 2 / §3.3: Feld-Dropdown-Deaktivierung (F7) | ✅ vorhanden (`analytics/ui/heatmap_widget.py` `_update_controls` / `_VALUE_AGGS`) |
+| §4.1 / §5 Schritt 1: `COUNT(DISTINCT feature_id)` | ✅ vorhanden (`../../analytics/engine/feature_store_reader.py` Z. 1283-1286, `HEATMAP_AGGREGATIONS` Z. 117) |
+| §5 Schritt 2 / §3.3: Feld-Dropdown-Deaktivierung (F7) | ✅ vorhanden (`../../analytics/ui/heatmap_widget.py` `_update_controls` / `_VALUE_AGGS`) |
 | §5 Schritt 3: `apply_smart_preset_confluence()` | ⚠️ vorhanden, aber OHNE `set_service_mode("all")` |
 | §3.2 Modus-Dropdown Standard "all" | ✅ vorhanden als `_combo_mode_filter` / „[Alle Modi]" (data "all") |
 | §4.2 `weighted_confluence` | ❌ nicht vorhanden |
@@ -2647,23 +2647,23 @@ def apply_smart_preset_confluence(self) -> None:
 
 ## 3. Umsetzungs-Spezifikation (Coding – wird NUR auf manuellen Startbefehl ausgeführt)
 
-### Schritt A: Preset-Reset des Modus-Filters (`analytics/engine/analytics_view_model.py`)
+### Schritt A: Preset-Reset des Modus-Filters (`../../analytics/engine/analytics_view_model.py`)
 In `apply_smart_preset_confluence()` VOR `set_heatmap_config(...)` ergänzen:
 - `self.set_service_mode("all")` – bereits idempotent (early-return bei aktuellem `"all"`); bei echter Änderung Dirty-Flag + Refresh von `QUERY_FEATURES` und allen Datenquellen (Tabelle, beide Heatmaps, Scatter, Verteilung).
 
-### Schritt B: AK2-Headless-Test (`test/test.py`)
-- Temporäre `analytics.duckdb` (im Unterordner `test/`!) mit `feature_store`-Rows inkl. top-level `source_mode` (z. B. 2 Services × je 2 Modi = 4 Zeilen auf derselben Bar).
+### Schritt B: AK2-Headless-Test (`../../test/test.py`)
+- Temporäre `analytics.duckdb` (im Unterordner `../../test`!) mit `feature_store`-Rows inkl. top-level `source_mode` (z. B. 2 Services × je 2 Modi = 4 Zeilen auf derselben Bar).
 - `fetch_generic_heatmap(..., x_dim="date", y_dim="hour", agg="count", service_mode="all")` → Zellenwert exakt `4.0` (alle Modi inkludiert, kein `source_mode`-WHERE).
 - `fetch_generic_heatmap(..., agg="count", service_mode="<Modus1>")` → Zellenwert exakt `2.0` (nur ein Modus je Service).
 - Kein UI-Test (Regel 4), reiner Reader-Test.
 
 ## 4. Implementierungs-Log (Doku-Teil, erledigt)
 
-- **13.08.2026 20:06:** Kapitel 21.03.21 gründlich gegen den Ist-Stand analysiert (Review-Tabelle); Entscheidungsprotokoll + Umsetzungs-Spezifikation (Schritt A/B) in `docs/AKTUELLE_UMSETZUNG.md` dokumentiert; Git-Commit `phase21_step1` gesetzt. **Kein Coding ausgeführt** – Umsetzung wartet auf den manuellen Startbefehl des Anwenders.
+- **13.08.2026 20:06:** Kapitel 21.03.21 gründlich gegen den Ist-Stand analysiert (Review-Tabelle); Entscheidungsprotokoll + Umsetzungs-Spezifikation (Schritt A/B) in `../AKTUELLE_UMSETZUNG.md` dokumentiert; Git-Commit `phase21_step1` gesetzt. **Kein Coding ausgeführt** – Umsetzung wartet auf den manuellen Startbefehl des Anwenders.
 - **13.08.2026 20:35 (Umsetzung, manueller Startbefehl):**
-  - **Schritt A:** `apply_smart_preset_confluence()` in `analytics/engine/analytics_view_model.py` setzt jetzt VOR der Heatmap-Konfiguration `set_service_mode("all")` – Confluence-Preset resetet den Modus-Filter auf „Alle Modi" (idempotent, early-return bei bereits `"all"`). Docstring ergänzt (21.03.21 Hotspot-Orchestrierung).
-  - **Schritt B:** AK2-Headless-Test in `test/test.py` (Block „37 k1/k2"): Temp-`analytics.duckdb` im `test/`-Ordner mit 2 Services × 2 Modi (`source_mode` top-level) auf derselben Bar → `service_mode="all"` liefert Zellwert `4.0`, `service_mode="ModeA"` liefert `2.0`.
-  - **Validierung (headless, `.venv`):** `py_compile` beider Dateien OK; `test/test.py` → `[PASS] 37 k1` + `[PASS] 37 k2`. Übrige FAILs im Harness sind vorbestehende Schema-Diskrepanzen (Test-Tabellen ohne `instance_hash`-Spalte, „Binder Error") in unveränderten Code-Pfaden (Tests 32/36/20.03.02/20.03.03/39/37 e1/g1/g2/j1) – nicht durch diese Änderung verursacht.
+  - **Schritt A:** `apply_smart_preset_confluence()` in `../../analytics/engine/analytics_view_model.py` setzt jetzt VOR der Heatmap-Konfiguration `set_service_mode("all")` – Confluence-Preset resetet den Modus-Filter auf „Alle Modi" (idempotent, early-return bei bereits `"all"`). Docstring ergänzt (21.03.21 Hotspot-Orchestrierung).
+  - **Schritt B:** AK2-Headless-Test in `../../test/test.py` (Block „37 k1/k2"): Temp-`analytics.duckdb` im `../../test`-Ordner mit 2 Services × 2 Modi (`source_mode` top-level) auf derselben Bar → `service_mode="all"` liefert Zellwert `4.0`, `service_mode="ModeA"` liefert `2.0`.
+  - **Validierung (headless, `.venv`):** `py_compile` beider Dateien OK; `../../test/test.py` → `[PASS] 37 k1` + `[PASS] 37 k2`. Übrige FAILs im Harness sind vorbestehende Schema-Diskrepanzen (Test-Tabellen ohne `instance_hash`-Spalte, „Binder Error") in unveränderten Code-Pfaden (Tests 32/36/20.03.02/20.03.03/39/37 e1/g1/g2/j1) – nicht durch diese Änderung verursacht.
   - Git-Commit `phase21_step2` (Umsetzung) gesetzt.
 
 ---
@@ -2677,9 +2677,9 @@ Für umfassende Analysen im `ServiceWindow` müssen alle in `market_data.duckdb`
 
 ## ✅ Entscheidungen & Antworten auf IDE-Rückfragen (13.08.2026)
 
-1. **Einbindung in `serviceui/service_win.py`:** Es existieren KEINE Methoden `_build_ui()` / `_wire_events()` – Layout-Aufbau (Zeilen 184–395) und Signal-Verdrahtung (ab Zeile 410) passieren direkt im `__init__`. **Positions-Korrektur (User-Feedback 13.08.2026):** Der Button wird im `top_row`-Block (NACH `self.top_row.addWidget(self.main_splitter)`, Zeile ~365) mit Parent `self.ui` erzeugt, aber NICHT in `top_row` platziert – die Einfügung erfolgt im `layout_symbol`-Block (neben `btn_symbol_fav`, Zeile ~468) **direkt vor `btn_trash_sets`** (`insertWidget(indexOf(btn_trash_sets), btn)`). Für die Rechtsbündigkeit wird der bestehende `horizontalSpacer` der `.ui` per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer gemacht, sodass Papierkorb + Sync-Button am rechten Fensterrand (= rechtes Ende der Parameter-Box) abschließen. Signal-Verdrahtung `clicked.connect(...)` im bestehenden Connect-Block ab Zeile 410.
+1. **Einbindung in `../../serviceui/service_win.py`:** Es existieren KEINE Methoden `_build_ui()` / `_wire_events()` – Layout-Aufbau (Zeilen 184–395) und Signal-Verdrahtung (ab Zeile 410) passieren direkt im `__init__`. **Positions-Korrektur (User-Feedback 13.08.2026):** Der Button wird im `top_row`-Block (NACH `self.top_row.addWidget(self.main_splitter)`, Zeile ~365) mit Parent `self.ui` erzeugt, aber NICHT in `top_row` platziert – die Einfügung erfolgt im `layout_symbol`-Block (neben `btn_symbol_fav`, Zeile ~468) **direkt vor `btn_trash_sets`** (`insertWidget(indexOf(btn_trash_sets), btn)`). Für die Rechtsbündigkeit wird der bestehende `horizontalSpacer` der `.ui` per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer gemacht, sodass Papierkorb + Sync-Button am rechten Fensterrand (= rechtes Ende der Parameter-Box) abschließen. Signal-Verdrahtung `clicked.connect(...)` im bestehenden Connect-Block ab Zeile 410.
 2. **`sync_market_data(target_pairs=None)`:** Signatur `sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None)`. Bei übergebenem `target_pairs` (nicht `None`) wird **exakt über diese `(symbol, timeframe)`-Paare** iteriert; bei `None`/leer greift der **Fallback auf das bisherige Standard-Raster** (`SYMBOLS` × `get_timeframes()`). Der Delta-Sync-Abgleich mit `get_latest_timestamp(symbol, tf)` bleibt pro Paar voll erhalten (inkrementelles Laden).
-3. **Signal & Typing:** `sync_completed = Signal(set)` wird übernommen (voll kompatibel mit `main.py`, das ein Set empfängt). `from typing import Optional, Set, Tuple` im `DataSyncWorker` ergänzen.
+3. **Signal & Typing:** `sync_completed = Signal(set)` wird übernommen (voll kompatibel mit `../../main.py`, das ein Set empfängt). `from typing import Optional, Set, Tuple` im `DataSyncWorker` ergänzen.
 4. **DB-Zugriffsmuster im Repository:** Generell `DbPool.get(self.db_path)` nutzen (Thread-local, kein manuelles `close()`, konsistent mit `get_symbol_precision` und projektweiten Standards).
 5. **Headless-Testbarkeit (Akzeptanzkriterium 2):** `sync_market_data` bzw. der `DataSyncWorker` wird im Test gemockt (Monkeypatching) – **kein echter MT5-Netzwerk-Sync**. Der Test verifiziert rein synchron die Signal-Emission (`service_run_started` vor Start, `service_run_finished` nach `sync_completed`) sowie die Button-Deaktivierung/Aktivierung.
 6. **Formatierung:** Rechtsbündige Platzierung in `top_row` bestätigt; entbehrliche Casts (`str(r[0])`) entfallen zugunsten des Filters `if r[0] and r[1]`.
@@ -2688,9 +2688,9 @@ Für umfassende Analysen im `ServiceWindow` müssen alle in `market_data.duckdb`
 
 ## 🛠️ Schritt-für-Schritt Umsetzungsanleitung für die IDE
 
-### Schritt 1: Paar-Abfrage im Repository (`repositories/market_data_repository.py`)
+### Schritt 1: Paar-Abfrage im Repository (`../../repositories/market_data_repository.py`)
 
-Ergänze `repositories/market_data_repository.py` um die Abfrage aller gespeicherten Paare (Muster: `DbPool.get`, kein manuelles `close()`, Filter auf nicht-leere Werte statt Casts):
+Ergänze `../../repositories/market_data_repository.py` um die Abfrage aller gespeicherten Paare (Muster: `DbPool.get`, kein manuelles `close()`, Filter auf nicht-leere Werte statt Casts):
 
 # repositories/market_data_repository.py
 
@@ -2711,7 +2711,7 @@ def get_all_stored_symbol_tf_pairs(self) -> Set[Tuple[str, str]]:
 
 ---
 
-### Schritt 2: `DataSyncWorker` erweitern (`workers/data_sync_worker.py`)
+### Schritt 2: `DataSyncWorker` erweitern (`../../workers/data_sync_worker.py`)
 
 Erweitere den Konstruktor von `DataSyncWorker`, um ein optionales `pairs`-Set zu akzeptieren (Typing `Optional` ergänzen, Signal `Signal(set)`):
 
@@ -2733,7 +2733,7 @@ class DataSyncWorker(QThread):
 
 ---
 
-### Schritt 2b: `sync_market_data(target_pairs=None)` erweitern (`data_sync/mt5_sync_service.py`)
+### Schritt 2b: `sync_market_data(target_pairs=None)` erweitern (`../../data_sync/mt5_sync_service.py`)
 
 - **Signatur:** `sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None)`
 - **Logik:**
@@ -2743,9 +2743,9 @@ class DataSyncWorker(QThread):
 
 ---
 
-### Schritt 3: Button & Einbindung in `serviceui/service_win.py`
+### Schritt 3: Button & Einbindung in `../../serviceui/service_win.py`
 
-In `serviceui/service_win.py` direkt im `__init__` (kein `_build_ui()`/`_wire_events()` – Aufbau und Verdrahtung passieren dort):
+In `../../serviceui/service_win.py` direkt im `__init__` (kein `_build_ui()`/`_wire_events()` – Aufbau und Verdrahtung passieren dort):
 
 # serviceui/service_win.py (in __init__, top_row-Block NACH self.top_row.addWidget(self.main_splitter), Zeile ~365)
 # Erzeugung mit Parent self.ui - PLATZIERT wird der Button weiter unten!
@@ -2818,7 +2818,7 @@ def _on_sync_all_completed(self, updated_pairs) -> None:
 
 ---
 
-## 📊 Akzeptanzkriterien für die Validierung (`test/test.py`)
+## 📊 Akzeptanzkriterien für die Validierung (`../../test/test.py`)
 
 1. **Pair-Query-Test:** `MarketDataRepository().get_all_stored_symbol_tf_pairs()` liefert alle in `ohlcv_bars` vertretenen Paare als Set von Tuples zurück.
 2. **Signal-Emission-Test (headless via Mock):** `sync_market_data` bzw. der `DataSyncWorker` wird gemockt (Monkeypatching) – **kein echter MT5-Netzwerk-Sync**. Der Test verifiziert rein synchron, dass `event_bus.service_run_started` VOR dem Start des Workers und `event_bus.service_run_finished` NACH `sync_completed` emittiert wird.
@@ -2831,14 +2831,14 @@ def _on_sync_all_completed(self, updated_pairs) -> None:
 **13.08.2026 (Entscheidungen zu IDE-Rückfragen):** Kapitel 21.03.22 um den Abschnitt „Entscheidungen & Antworten auf IDE-Rückfragen" erweitert und die Schritte 1–3 sowie die Akzeptanzkriterien entsprechend präzisiert: (1) Einbindung direkt im `__init__` statt `_build_ui()`/`_wire_events()`; (2) `sync_market_data(target_pairs=None)` mit exakter Paar-Iteration und Fallback auf `SYMBOLS` × `get_timeframes()`; (3) `Signal(set)` + `Optional`-Import im `DataSyncWorker`; (4) DB-Muster `DbPool.get` ohne manuelles `close()`; (5) Headless-Test via Monkeypatch (kein echter MT5-Sync); (6) Casts entfallen, Filter `if r[0] and r[1]`. **Noch kein Coding – Umsetzung wartet auf manuellen Befehl.**
 
 **13.08.2026 (Umsetzung & Validierung, phase21_step4):** Kapitel 21.03.22 vollständig umgesetzt:
-- `repositories/market_data_repository.py`: `get_all_stored_symbol_tf_pairs()` ergänzt (`DbPool.get`-Muster, UPPER-normalisiert, NULL-Filter).
-- `workers/data_sync_worker.py`: `DataSyncWorker(pairs=None)` + `sync_completed = Signal(set)`; reicht `target_pairs` an `sync_market_data()` durch.
-- `data_sync/mt5_sync_service.py`: `sync_market_data(target_pairs=None)` – exakte Paar-Iteration (UPPER-normalisiert, unbekannte TFs gefiltert) mit Fallback auf `SYMBOLS` × `get_timeframes()`; Delta-Sync via `get_latest_timestamp` bleibt pro Paar erhalten.
-- `serviceui/service_win.py`: `btn_sync_all_market` rechtsbündig in `top_row` (nach Splitter, Zeile ~365), `clicked`-Verdrahtung im Connect-Block (Zeile ~427), Handler `_on_sync_all_market_clicked`/`_on_sync_all_completed` (vor `_refresh_badge_bar`). Concurrency-Guard via `event_bus.service_run_started/finished`; UI-Refresh via `_refresh_badge_bar()` + `service_selector.refresh()`. Zwei Robustheits-Fixes während der Validierung: Guard nutzt `_qt_valid` (shiboken) gegen „Internal C++ object already deleted" nach `deleteLater`, und `_sync_worker` wird nach Abschluss auf `None` gesetzt.
-- **Validierung (headless, `test/check_21322_full_sync.py` + Block in `test/test.py`, kein echter MT5-Sync):** T1 Pair-Query (UPPER + NULL-Filter), T2/T2b Worker-Param-Durchreichung (pairs/None), T2c/T2c2 `target_pairs`-Filter (D1 raus) + Fallback-Raster (6 Paare), T3a–T3e Signal-Emission (`service_run_started` vor Start, `service_run_finished` nach `sync_completed`) + Button-State (enabled/disabled/enabled). **Alle Checks PASS.** `py_compile` OK für alle 4 Dateien. Git-Tag: `phase21_step4`.
+- `../../repositories/market_data_repository.py`: `get_all_stored_symbol_tf_pairs()` ergänzt (`DbPool.get`-Muster, UPPER-normalisiert, NULL-Filter).
+- `../../workers/data_sync_worker.py`: `DataSyncWorker(pairs=None)` + `sync_completed = Signal(set)`; reicht `target_pairs` an `sync_market_data()` durch.
+- `../../data_sync/mt5_sync_service.py`: `sync_market_data(target_pairs=None)` – exakte Paar-Iteration (UPPER-normalisiert, unbekannte TFs gefiltert) mit Fallback auf `SYMBOLS` × `get_timeframes()`; Delta-Sync via `get_latest_timestamp` bleibt pro Paar erhalten.
+- `../../serviceui/service_win.py`: `btn_sync_all_market` rechtsbündig in `top_row` (nach Splitter, Zeile ~365), `clicked`-Verdrahtung im Connect-Block (Zeile ~427), Handler `_on_sync_all_market_clicked`/`_on_sync_all_completed` (vor `_refresh_badge_bar`). Concurrency-Guard via `event_bus.service_run_started/finished`; UI-Refresh via `_refresh_badge_bar()` + `service_selector.refresh()`. Zwei Robustheits-Fixes während der Validierung: Guard nutzt `_qt_valid` (shiboken) gegen „Internal C++ object already deleted" nach `deleteLater`, und `_sync_worker` wird nach Abschluss auf `None` gesetzt.
+- **Validierung (headless, `../../test/check_21322_full_sync.py` + Block in `../../test/test.py`, kein echter MT5-Sync):** T1 Pair-Query (UPPER + NULL-Filter), T2/T2b Worker-Param-Durchreichung (pairs/None), T2c/T2c2 `target_pairs`-Filter (D1 raus) + Fallback-Raster (6 Paare), T3a–T3e Signal-Emission (`service_run_started` vor Start, `service_run_finished` nach `sync_completed`) + Button-State (enabled/disabled/enabled). **Alle Checks PASS.** `py_compile` OK für alle 4 Dateien. Git-Tag: `phase21_step4`.
 
 **13.08.2026 (Positions-Korrektur, User-Feedback, phase21_step5):** Der `btn_sync_all_market` sitzt nun **links neben dem Papierkorb** in der Filter-/Symbol-Zeile (`layout_symbol`) statt rechts in `top_row`:
-- `serviceui/service_win.py`: Button-Erzeugung im `top_row`-Block mit Parent `self.ui` (kein `addStretch`/`addWidget` in `top_row` mehr); Einfügung im `layout_symbol`-Block via `insertWidget(indexOf(btn_trash_sets), btn)` – direkt vor den Papierkorb. Der bestehende `horizontalSpacer` der `.ui` wird per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer, damit Papierkorb + Sync-Button rechtsbündig mit dem rechten Ende der Parameter-Box abschließen.
-- **Validierung:** Neue Checks T3f (Sync-Button direkt links neben Papierkorb: `indexOf(sync)+1 == indexOf(trash)`) und T3f2 (Stretch-Spacer vor der Gruppe, `stretch(i) >= 1`) in `test/check_21322_full_sync.py` + `test/test.py` – **alle 12 Checks PASS**, `py_compile` OK. Git-Tag: `phase21_step5`.
+- `../../serviceui/service_win.py`: Button-Erzeugung im `top_row`-Block mit Parent `self.ui` (kein `addStretch`/`addWidget` in `top_row` mehr); Einfügung im `layout_symbol`-Block via `insertWidget(indexOf(btn_trash_sets), btn)` – direkt vor den Papierkorb. Der bestehende `horizontalSpacer` der `.ui` wird per `layout_symbol.setStretch(i, 1)` zum Stretch-Spacer, damit Papierkorb + Sync-Button rechtsbündig mit dem rechten Ende der Parameter-Box abschließen.
+- **Validierung:** Neue Checks T3f (Sync-Button direkt links neben Papierkorb: `indexOf(sync)+1 == indexOf(trash)`) und T3f2 (Stretch-Spacer vor der Gruppe, `stretch(i) >= 1`) in `../../test/check_21322_full_sync.py` + `../../test/test.py` – **alle 12 Checks PASS**, `py_compile` OK. Git-Tag: `phase21_step5`.
 
 

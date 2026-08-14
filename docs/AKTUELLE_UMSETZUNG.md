@@ -25,3 +25,1810 @@
 
 ---
 
+# 22.01 Spezifikation: `ind_peak` & Peak-Grabber (PyTrader Engine)
+
+---
+
+## 0. Review-Ergebnis & Entscheidungen (14.08.2026)
+
+Das Review der Erstfassung (Review-Textblock vom 14.08.2026) ergab **7 harte Bugs (B1–B7)**, **fehlende Pflicht-Sektionen** und **Konventions-Verstöße**. Das Kapitel wurde als durchgehendes Konzept neu gefasst – die Entscheidungen zu den 7 Review-Fragen und die integrierten Bugfixes sind unten verbindlich.
+
+### 0.1 Entscheidungen zu den Review-Fragen
+
+1. **Plugin-Services statt isolierter Klassen:** `srv_peak_finder` und `srv_peak_grabber` werden **echte Plugin-Services** in `analytics/features/definitions/` (erben von `PluginFeature`, **zustandslos**, `calculate(df, params, context)`). Die zustandsbehaftete Live-State-Machine wird als Helper-Klasse `PeakGrabberLiveState` **direkt im Indikator** `ind_peak` implementiert (Muster `ind_fixed_grid_proximity`: Live-Pfad ohne Pipeline, Open/Closed). Eine Ausnahme-Regel ist damit nicht nötig.
+2. **`ind_peak` vollständig in `BaseIndicator` integriert:** volle Indicator-API (`indicator_id`, `display_name`, `default_params`, `parameter_schema`, `calculate`, `update_live_candle`, `get_live_overlays`, `remember_live_time`) → erscheint im Prop-Dialog und wird vom ChartWindow generisch getrieben (kein Sonderfall).
+3. **`is_yellow_window`-Ableitung (direkt im Service implementiert, Frage 3):**
+   `is_yellow_window := is_in_proximity_zone ∧ is_in_time_window(±5 min um :00/:30)` (Wanduhr, Präambel 8).
+   * `is_in_time_window`: Wanduhr-Minute der Bar in `[0±5]` oder `[30±5]` (Muster `_f_in_window_around`, srv_proximity).
+   * `is_in_proximity_zone`: Preis trifft eine Proximity-Zone (`levels_hit` ≠ leer) – Zone-Hit-Daten je Bar kommen aus der `srv_proximity`-Instanz im `context.shared_state` (depends_on).
+   * **Fallback `True`:** Fehlt das Proximity-Signal im Context (kein Zone-Hit-Datensatz), gilt `is_in_proximity_zone := True` (Gate offen).
+   Batch: Der Service `srv_peak_grabber` leitet das bool-Array je Bar selbst her (§4B `_derive_yellow_window`). Live: Yellow-Flag der aktuellen Bar analog (letzter Proximity-Record, Fallback `True`).
+4. **Outcome-Evaluator NICHT in 22.01 (Frage 4):** Die Spalten `outcome_status`, `pnl_r_multiple`, `max_favorable_exc`, `max_adverse_exc` werden im Schema angelegt und initial mit `'PENDING'` / `NULL` befüllt. Die dedizierte Exit-/Forward-Evaluation (TP/SL-Simulation) folgt als **separates Auswertungs-Modul in einem späteren Kapitel** – `PeakGrabberConfig.take_profit_r` / `max_hold_bars` bleiben als reservierte (dokumentierte) Felder für dieses Modul erhalten und werden in 22.01 **nicht** ausgewertet.
+5. **Button-Anbindung im AnalyticsWindow (Frage 5):** primär `analytics/ui/analytics_win.py` (Alternative: Chart-Overlay-Controlbar). Kommunikation über **neue EventBus-Signale** – angepasst an das bestehende `Signal`-Attribut-Muster des EventBus (kein String-`emit`):
+   `grabber_toggle = Signal(dict)` mit Payload `{"active": bool, "symbol": str, "timeframe": str}` und `grabber_event = Signal(object)` (`GrabberResultRecord`). `chart_win` subscribed `grabber_toggle` generisch und ruft `set_button_active(active)` auf allen Indikatoren mit diesem Hook auf (IoC, kein Hardcoding). Order-Vorschau: `analytics/ui/order_preview_dialog.py` (`OrderPreviewDialog`, PySide6-Modal, **keine Order-Platzierung**, **kein SQL in UI** – MVVM, Präambel 4). **Zusätzlich (14.08.2026):** Das ChartWindow erhält einen eigenen **aufrufenden Button** `btn_peak_grabber` (§9.5), der denselben `grabber_toggle`-Payload emittiert – beide Buttons laufen über **einen** Routing-Pfad (§9.3), kein Sonderfall im ChartWindow.
+6. **DDL-Ort (Frage 6):** `grabber_test_results` wird **additiv in `db/schema_initializer.py`** (`check_and_init_databases()`, analytics.duckdb) registriert – das ist die tatsächliche Schema-Init-Stelle im Code (zusätzlich zu `state_manager.py`-Initialisierung). Schreibzugriff **ausschließlich** über `repositories/grabber_repository.py` (DbPool-Muster, kein manuelles `close()`, Präambel 6).
+7. **Naming:** `ind_peak` (klein, Konvention 16.08.01). Services `srv_peak_finder` / `srv_peak_grabber`. Keine neuen Top-Level-Ordner `services/`, `models/`, `bridge/` – Einordnung in bestehende Pakete (siehe §2.1).
+
+### 0.2 Integrierte Review-Bugfixes (B1–B9)
+
+| ID | Finding | Fix im Kapitel |
+|----|---------|----------------|
+| B1 | INSERT nur 17 Werte vs. 18 Tabellenspalten (`max_adverse_exc` fehlt) → DuckDB-Mismatch | §2.3 DDL 18 Spalten; §7 Repository-INSERT mit exakt 18 Spalten |
+| B2 | Kernel startet `ARMED(1)` bei `gate_active`, Live startet `IDLE(0)` → Backtest ≠ Live | §3.1/3.2 IDLE-Start; Bar 0 = Bootstrap (First-Peak-Skip), Live äquivalent |
+| B3 | Live berechnet `bars_h` **nach** `update_scalar()` → immer 0 bei neuem High (toter `else`-Zweig) | §4C VOR `update_scalar()` sichern; Alter des **vorherigen** Peaks (Parität zu Kernel) |
+| B4 | `bootstrap_history` setzt keinen Scalar-State → Live-SL-Linie startet inkonsistent | §5 `_bootstrap_live_state` übernimmt Batch-Endwerte in den `PeakFinderLive`-Scalar-State |
+| B5 | `np.roll` in `on_bar_close` ist O(n)-Kopie → widerspricht Zero-GC | §5 Ringpuffer mit zirkulärem Index (kein `np.roll`) |
+| B6 | Division-by-Zero bei `prev_h`/`peak_l` = 0 (Exoten-Symbole) | §3.2 Kernel-Guards + §4C Live-Guards (NaN-Schutz) |
+| B7 | `timestamps[idx].astype(datetime)` fragil | §7/§8 `pd.Timestamp(...).to_pydatetime()` |
+| B8 | Tabs statt 4 Leerzeichen (Präambel 3) | Alle Code-Blöcke in diesem Kapitel: exakt 4 Leerzeichen |
+| B9 | Keine MasterTree-/Varianten-Integration (Präambel 7) | `metadata["category"]` + `indicator_id` je Service; `instance_hash` via ServiceSet-Evaluator |
+
+---
+
+## 1. Systemarchitektur & Datenfluss
+
+```
+[ DuckDB ohlcv_bars / MT5 Live Tick Feed ]
+                    │
+                    ▼
+         ┌─────────────────────────────────────────────┐
+         │            PyTrader Core Pipeline           │
+         └──────────────┬──────────────────────────────┘
+                        │ (OHLCV Stream / Ring-Buffer)
+     ┌──────────────────┴───────────────────────────────────────────┐
+     ▼                                                              ▼
+┌──────────────────────────────┐                    ┌──────────────────────────────┐
+│   srv_proximity (Bestand)    │                    │      srv_peak_finder         │
+│   feature_store: in_time_    │                    │   (Peak/SL-Batch, stateless) │
+│   window, levels_hit         │                    └──────────────┬───────────────┘
+└──────────────┬───────────────┘                                   │ depends_on
+               │ Zone-Hits (levels_hit) via shared_state            ▼
+               │ Fallback True ohne Proximity-Signal      ┌──────────────────────────────┐
+               │  Yellow = Zone-Hit ∧ Zeitfenster          │      srv_peak_grabber        │
+               └──────────────┬──────────────────────────│  (Kernel-Batch, stateless)   │
+                              │                          └──────────────┬───────────────┘
+                              ▼                                         │ Signals/SL/Peak
+   ┌──────────────────────────────────────────────────────────────┐     │ (feature_store)
+   │              chart/indicators/ind_peak.py                    │     ▼
+   │  ┌─────────────────────────┐   ┌──────────────────────────┐  │  ┌──────────────────────────┐
+   │  │ calculate() (Hist)      │   │ PeakGrabberLiveState     │  │  │  outcome: PENDING/NULL  │
+   │  │ ServiceSet-Evaluation   │   │ (Live-State-Machine,     │  │  │  (Modul folgt später)   │
+   │  │ → SL-Linien + Marker    │   │  ring buffer, live SL)   │  │  └────────────┬─────────────┘
+   │  └─────────────────────────┘   └──────────────────────────┘  │               │ records
+   └───────────────┬──────────────────────────────────────────────┘               ▼
+                   │                                                     ┌──────────────────────┐
+                   ▼                                                     │  grabber_repository  │
+   event_bus.grabber_event (record)                                      │  (DbPool, analytics) │
+                   │                                                     └──────────┬───────────┘
+                   ▼                                                                ▼
+┌──────────────────────────────┐                                      ┌──────────────────────────────┐
+│ analytics/order_preview_dialog│    analytics_win: btn_grabber_peak    │   DuckDB: grabber_test_     │
+│ (PySide6-Modal, KEINE Order)  │ ◄── event_bus.grabber_toggle(dict)   │   results (Serientests)     │
+└──────────────────────────────┘                                      └──────────────────────────────┘
+```
+
+**Pfade im Überblick:**
+* Batch/Backtest: `ohlcv` → `srv_grid_lines` + `srv_proximity` (Yellow-Zonen) + `srv_peak_finder` + `srv_peak_grabber` (ServiceSetEvaluator) → `GrabberRepository.save_records()` (Outcome-Spalten `'PENDING'`/`NULL`, Frage 4).
+* Live: `ind_peak.on_tick()` → `PeakGrabberLiveState` (zirkulärer Ringpuffer) → Live-Overlays an den Chart; Trigger/Update-Records via `event_bus.grabber_event` → `OrderPreviewDialog` (UI) + `GrabberRepository` (DB, über das AnalyticsWindow als Subscriber).
+* `is_yellow_window` wird **im Service `srv_peak_grabber`** hergeleitet (`_derive_yellow_window`, Frage 3): Zone-Hits aus der `srv_proximity`-Instanz im `context.shared_state` + eigenes Zeitfenster (±5 min um :00/:30, Wanduhr); **Fallback `True`** ohne Proximity-Signal.
+
+---
+
+## 2. Datenmodelle & DuckDB Schema
+
+### 2.1 Dateien (Konvention statt neuer Top-Level-Ordner)
+
+* `analytics/engine/peak_models.py` – Dataclasses, Enums, Configs (Kollokation im Engine-Paket neben `service_models.py`).
+* `analytics/features/definitions/grabber_kernel.py` – NumPy/Numba-Kernel (Helper-Modul, analog `grid_math.py`; enthält KEINE `PluginFeature`-Subklasse → wird von der Plugin-Discovery nicht als Plugin registriert).
+* `db/schema_initializer.py` – DDL `grabber_test_results` (additiv).
+* `repositories/grabber_repository.py` – DB-Zugriff (DbPool).
+* `analytics/engine/peak_backtest_runner.py` – Serientest-Orchestrierung (Outcome-Spalten bleiben `'PENDING'`/`NULL`, Frage 4).
+* `chart/indicators/ind_peak.py` – Indikator + `PeakGrabberLiveState` + `PeakFinderLive`.
+* `config/event_bus.py` – neue Signale `grabber_toggle` (dict), `grabber_event` (object).
+* `analytics/ui/order_preview_dialog.py` – Order-Vorschau-Modal.
+* `analytics/ui/analytics_win.py` – Button `btn_grabber_peak`; `chart/chart_win.py` – Subscription (§9.3) + aufrufender Button `btn_peak_grabber` (§9.5).
+
+**Deferred (späteres Kapitel, NICHT 22.01):** `analytics/engine/peak_outcome.py` – Exit-/Forward-Evaluation (TP/SL-Simulation, Frage 4).
+
+### 2.2 Dataclasses (`analytics/engine/peak_models.py`)
+
+```python
+# analytics/engine/peak_models.py
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+import numpy as np
+
+
+class SignalDirection(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class GrabberState(int, Enum):
+    IDLE = 0
+    ARMED = 1
+    TRIGGERED = 2
+    INVALIDATED = 3
+
+
+@dataclass(frozen=True)
+class PeakConfig:
+    sl_offset_pct: float = 0.15  # SL-Puffer über/unter Peak (%)
+
+    def sl_factor_high(self) -> float:
+        return 1.0 + (self.sl_offset_pct / 100.0)
+
+    def sl_factor_low(self) -> float:
+        return 1.0 - (self.sl_offset_pct / 100.0)
+
+
+@dataclass(frozen=True)
+class PeakGrabberConfig:
+    reversal_pct: float = 0.30           # z% Reversal für Trigger
+    min_hold_bars: int = 3               # Min. Bars Haltedauer des Peaks
+    invalidation_bars: int = 5           # x Bars Beobachtungsfenster
+    invalidation_threshold_pct: float = 0.10  # y% Toleranz vor Hard-Invalidation
+    require_proximity_window: bool = True     # Verknüpfung mit Yellow Window
+    take_profit_r: Optional[float] = None     # RESERVIERT (Frage 4): TP in R für späteres Outcome-Modul (None = kein TP)
+    max_hold_bars: int = 100                  # RESERVIERT (Frage 4): Timeout für späteres Outcome-Modul
+
+
+@dataclass
+class GrabberResultRecord:
+    signal_id: str
+    run_id: str
+    timestamp: datetime
+    symbol: str
+    timeframe: str
+    direction: SignalDirection
+    entry_price: float
+    sl_price: float
+    peak_price: float
+    peak_bar_index: int
+    is_update: bool                       # True bei <= y% Aktualisierung
+    reversal_pct: float
+    is_yellow_window: bool
+    gate_source: str                      # GATE_/SERIES_ + UPDATE/TRIGGER
+    outcome_status: str = "PENDING"
+    pnl_r_multiple: Optional[float] = None
+    max_favorable_exc: Optional[float] = None
+    max_adverse_exc: Optional[float] = None
+```
+
+### 2.3 DuckDB Schema (`db/schema_initializer.py`, additiv in analytics.duckdb)
+
+**18 Spalten** – der INSERT-Weg (§7) muss exakt diese 18 Spalten bedienen (B1).
+
+```sql
+-- db/schema_initializer.py (check_and_init_databases, analytics.duckdb)
+CREATE TABLE IF NOT EXISTS grabber_test_results (
+    signal_id           VARCHAR PRIMARY KEY,
+    run_id              VARCHAR NOT NULL,
+    timestamp           TIMESTAMPTZ NOT NULL,   -- Wanduhr-Epochs (Präambel 8)
+    symbol              VARCHAR NOT NULL,
+    timeframe           VARCHAR NOT NULL,
+    direction           VARCHAR NOT NULL,
+    entry_price         DOUBLE NOT NULL,
+    sl_price            DOUBLE NOT NULL,
+    peak_price          DOUBLE NOT NULL,
+    peak_bar_index      BIGINT NOT NULL,
+    is_update           BOOLEAN NOT NULL,
+    reversal_pct        FLOAT NOT NULL,
+    is_yellow_window    BOOLEAN NOT NULL,
+    gate_source         VARCHAR NOT NULL,
+    outcome_status      VARCHAR DEFAULT 'PENDING',
+    pnl_r_multiple      FLOAT,
+    max_favorable_exc   FLOAT,
+    max_adverse_exc     FLOAT
+);
+CREATE INDEX IF NOT EXISTS idx_grabber_run ON grabber_test_results (run_id);
+```
+
+`run_id`-Konvention: `"LIVE-<YYYYmmdd-HHMMSS>"` für Live-Läufe, `"BT-<YYYYmmdd-HHMMSS>"` für Serientests (kein UUID-Salat, gruppierbar).
+
+---
+
+## 3. High-Speed NumPy State-Machine Kernel (`analytics/features/definitions/grabber_kernel.py`)
+
+### 3.1 Definierte Kernel-Semantik (Basis für Live/Batch-Parität)
+
+* **Signale:** `0` = Keins, `1` = BUY_TRIGGER, `2` = BUY_UPDATE, `-1` = SELL_TRIGGER, `-2` = SELL_UPDATE.
+* **Zustände:** `0` IDLE, `1` ARMED, `2` TRIGGERED, `3` INVALIDATED.
+* **Startzustand immer IDLE (B2):** `gate_active` armiert NICHT automatisch – es schaltet nur das Gate frei.
+* **Bar 0 = Bootstrap:** initialisiert `peak_h/peak_l` OHNE Event (entspricht dem ersten Live-Tick, dessen `prev` noch `NaN` ist – First-Peak-Skip).
+* **`bars_h/bars_l` = Alter des VORHERIGEN Peaks** im New-Peak-Zweig (vor dem Update ermittelt), **= Alter des AKTUELLEN Peaks** im Reversal-Zweig (B3, identisch zur Live-Logik).
+* **Division-by-Zero-Guards (B6):** `prev_h`/`peak_l` ≤ 0 → `breach_pct = 0.0` bzw. `rev_pct = 0.0` (kein NaN/Inf).
+
+### 3.2 Kernel-Code (korrigiert, 4 Leerzeichen)
+
+```python
+# analytics/features/definitions/grabber_kernel.py
+import numpy as np
+
+try:
+    from numba import njit
+except ImportError:  # Fallback: pure NumPy (gleiche Semantik, langsamer)
+
+    def njit(func):
+        return func
+
+
+@njit(fastmath=True)
+def run_grabber_kernel(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    is_yellow_window: np.ndarray,
+    reversal_pct: float,
+    min_hold_bars: int,
+    inval_bars: int,
+    inval_thresh_pct: float,
+    sl_offset_pct: float,
+    require_prox: bool,
+    gate_active: bool,
+):
+    """Serieller Backtest-Kernel (Zero-GC, native Geschwindigkeit).
+
+    Signale: 0: Keins, 1: BUY_TRIGGER, 2: BUY_UPDATE, -1: SELL_TRIGGER,
+    -2: SELL_UPDATE. Zustände: 0 IDLE, 1 ARMED, 2 TRIGGERED, 3 INVALIDATED.
+    Startzustand IDLE (B2); Bar 0 = Bootstrap ohne Event.
+    """
+    n = len(highs)
+    signals = np.zeros(n, dtype=np.int8)
+    sl_prices = np.full(n, np.nan, dtype=np.float64)
+    peak_prices = np.full(n, np.nan, dtype=np.float64)
+
+    sl_factor_h = 1.0 + (sl_offset_pct / 100.0)
+    sl_factor_l = 1.0 - (sl_offset_pct / 100.0)
+
+    peak_h = highs[0]          # Bootstrap: kein Event (First-Peak-Skip, B2)
+    peak_h_idx = 0
+    state_short = 0            # IDLE
+
+    peak_l = lows[0]           # Bootstrap
+    peak_l_idx = 0
+    state_long = 0             # IDLE
+
+    for i in range(1, n):
+        h = highs[i]
+        l = lows[i]
+        c = closes[i]
+        yw = is_yellow_window[i]
+        gate = gate_active and (yw if require_prox else True)
+
+        # --- SHORT LOGIK (Peak = laufendes High) --------------------------
+        if h > peak_h:
+            prev_h = peak_h
+            bars_h = i - peak_h_idx       # B2/B3: Alter des VORHERIGEN Peaks
+            peak_h = h
+            peak_h_idx = i
+            if gate:
+                breach_pct = ((h - prev_h) / prev_h) * 100.0 if prev_h > 0.0 else 0.0
+                if bars_h <= inval_bars:
+                    if breach_pct <= inval_thresh_pct:
+                        state_short = 1   # ARMED / UPDATE
+                        signals[i] = -2
+                        sl_prices[i] = peak_h * sl_factor_h
+                        peak_prices[i] = peak_h
+                    else:
+                        state_short = 3   # INVALIDATED
+                else:
+                    state_short = 1       # frischer Peak nach langer Ruhe
+        elif gate and state_short == 1:   # ARMED: Reversal-Pruefung
+            bars_h = i - peak_h_idx       # Alter des AKTUELLEN Peaks
+            rev_pct = ((peak_h - c) / peak_h) * 100.0 if peak_h > 0.0 else 0.0
+            if rev_pct >= reversal_pct and bars_h >= min_hold_bars:
+                state_short = 2           # TRIGGERED
+                signals[i] = -1
+                sl_prices[i] = peak_h * sl_factor_h
+                peak_prices[i] = peak_h
+
+        # --- LONG LOGIK (Peak = laufendes Low) ----------------------------
+        if l < peak_l:
+            prev_l = peak_l
+            bars_l = i - peak_l_idx       # Alter des VORHERIGEN Peaks
+            peak_l = l
+            peak_l_idx = i
+            if gate:
+                breach_pct = ((prev_l - l) / prev_l) * 100.0 if prev_l > 0.0 else 0.0
+                if bars_l <= inval_bars:
+                    if breach_pct <= inval_thresh_pct:
+                        state_long = 1    # ARMED / UPDATE
+                        signals[i] = 2
+                        sl_prices[i] = peak_l * sl_factor_l
+                        peak_prices[i] = peak_l
+                    else:
+                        state_long = 3    # INVALIDATED
+                else:
+                    state_long = 1        # frischer Peak nach langer Ruhe
+        elif gate and state_long == 1:    # ARMED: Reversal-Pruefung
+            bars_l = i - peak_l_idx       # Alter des AKTUELLEN Peaks
+            rev_pct = ((c - peak_l) / peak_l) * 100.0 if peak_l > 0.0 else 0.0
+            if rev_pct >= reversal_pct and bars_l >= min_hold_bars:
+                state_long = 2            # TRIGGERED
+                signals[i] = 1
+                sl_prices[i] = peak_l * sl_factor_l
+                peak_prices[i] = peak_l
+
+    return signals, sl_prices, peak_prices
+```
+
+---
+
+## 4. Service-Implementierungen (Plugin-Services)
+
+### A. `srv_peak_finder` (`analytics/features/definitions/srv_peak_finder.py`)
+
+Zustandsloser Plugin-Service (erbt `PluginFeature`): vektorisierte Peak-/SL-Berechnung, **keine** eigene Zustandshaltung.
+
+```python
+# analytics/features/definitions/srv_peak_finder.py
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+_PEAK_FINDER_SCHEMA: Dict[str, ParameterSchema] = {
+    "sl_offset_pct": {
+        "type": "float", "default": 0.15, "min": 0.0, "max": 10.0,
+        "step": 0.01, "description": "SL-Puffer über/unter Peak (%)",
+    },
+}
+
+
+class PeakFinderService(PluginFeature):
+    """Vektorisierte Peak-Tracking & SL-Berechnung (Hist-Batch, stateless)."""
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_peak_finder"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, str]:
+        return {
+            "category": "Swing Points/Peak Grabber",
+            "display_name": "Peak Finder",
+            "indicator_name": "Ind_Peak",
+            "indicator_id": "ind_peak",
+            "description": "Running Highs/Lows samt SL-Offset (Batch, stateless)",
+            "author": "PyTrader AI",
+            "tags": ["peak", "swing", "stop-loss"],
+            "condition_rules": [
+                "peak_high = maximum.accumulate(high)",
+                "peak_low  = minimum.accumulate(low)",
+                "sl_high = peak_high * (1 + sl_offset_pct/100)",
+                "sl_low  = peak_low  * (1 - sl_offset_pct/100)",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": True,
+            "batch": True,
+            "live": False,            # Live läuft im Indikator (PeakGrabberLiveState)
+            "feature_store": True,
+            "render": False,          # P16.01: Styling baut der Indikator
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {k: dict(v) for k, v in _PEAK_FINDER_SCHEMA.items()}
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        if df is None or df.empty:
+            return {"feature_store_payload": {}}
+        p = self.validate_params(params)
+        highs = df["high"].to_numpy(dtype=np.float64)
+        lows = df["low"].to_numpy(dtype=np.float64)
+
+        peak_highs = np.maximum.accumulate(highs)
+        peak_lows = np.minimum.accumulate(lows)
+        f_h = 1.0 + (float(p["sl_offset_pct"]) / 100.0)
+        f_l = 1.0 - (float(p["sl_offset_pct"]) / 100.0)
+
+        records: List[Dict[str, Any]] = []
+        times = df["time"].to_numpy()
+        for i in range(len(df)):
+            records.append({
+                "bar_time": int(times[i]),
+                "peak_high": float(peak_highs[i]),
+                "peak_low": float(peak_lows[i]),
+                "sl_high": float(peak_highs[i] * f_h),
+                "sl_low": float(peak_lows[i] * f_l),
+            })
+        # Shared-State für nachgelagerte srv_peak_grabber (depends_on):
+        if context is not None and context.instance_id:
+            context.shared_state[context.instance_id] = {
+                "peak_highs": peak_highs,
+                "peak_lows": peak_lows,
+                "sl_highs": peak_highs * f_h,
+                "sl_lows": peak_lows * f_l,
+                "records": records,
+            }
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {"schema_version": "1.0.0"},
+            },
+        }
+```
+
+### B. `srv_peak_grabber` (`analytics/features/definitions/srv_peak_grabber.py`)
+
+Zustandsloser Plugin-Service (erbt `PluginFeature`): liest die Peak-Arrays aus `shared_state` (`depends_on` `srv_peak_finder`), leitet `is_yellow_window` **selbst** her (`_derive_yellow_window`, Frage 3: Zone-Hit ∧ Zeitfenster ±5 min um :00/:30, **Fallback `True`**) und ruft `run_grabber_kernel`.
+
+```python
+# analytics/features/definitions/srv_peak_grabber.py
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.definitions.grabber_kernel import run_grabber_kernel
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+_PEAK_GRABBER_SCHEMA: Dict[str, ParameterSchema] = {
+    "reversal_pct": {"type": "float", "default": 0.30, "min": 0.01, "max": 10.0, "step": 0.01, "description": "Reversal % für Trigger (z)"},
+    "min_hold_bars": {"type": "int", "default": 3, "min": 1, "max": 1000, "step": 1, "description": "Min. Bars Haltedauer des Peaks"},
+    "invalidation_bars": {"type": "int", "default": 5, "min": 1, "max": 10000, "step": 1, "description": "Beobachtungsfenster x (Bars)"},
+    "invalidation_threshold_pct": {"type": "float", "default": 0.10, "min": 0.0, "max": 10.0, "step": 0.01, "description": "Toleranz y% vor Hard-Invalidation"},
+    "require_proximity_window": {"type": "bool", "default": True, "description": "Nur im Yellow Window triggern"},
+    # Gemeinsamer SL-Parameter (Parität zu srv_peak_finder): Das Set muss
+    # BEIDEN Instanzen denselben Wert geben (Single Source: Indikator-Schema).
+    "sl_offset_pct": {"type": "float", "default": 0.15, "min": 0.0, "max": 10.0, "step": 0.01, "description": "SL-Puffer über/unter Peak (%) – muss srv_peak_finder entsprechen"},
+    # Optionaler Test-Override (NICHT in parameter_order): JSON-bool-Liste je
+    # Bar. Fehlt er, leitet der Service selbst ab (_derive_yellow_window, Frage 3).
+    "is_yellow_window": {"type": "str", "default": "", "description": "Intern/Test: JSON-bool-Liste je Bar (Override)"},
+}
+
+
+class PeakGrabberService(PluginFeature):
+    """Batch-Pfad der Peak-Grabber-State-Machine (stateless, Kernel)."""
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_peak_grabber"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, str]:
+        return {
+            "category": "Swing Points/Peak Grabber",
+            "display_name": "Peak Grabber",
+            "indicator_name": "Ind_Peak",
+            "indicator_id": "ind_peak",
+            "description": "Gated State-Machine: BUY/SELL-Trigger & -Updates aus Peaks",
+            "author": "PyTrader AI",
+            "tags": ["peak", "grabber", "signal"],
+            "condition_rules": [
+                "Startzustand IDLE; Bar 0 = Bootstrap (First-Peak-Skip)",
+                "Neuer Peak im Fenster: kleine Überschreitung -> ARMED/UPDATE, grosse -> INVALIDATED",
+                "Reversal >= z% nach min_hold_bars -> TRIGGERED",
+                "is_yellow_window = Zone-Hit ∧ Zeitfenster (±5 min um :00/:30); Fallback True ohne Proximity-Signal (Frage 3)",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": True,
+            "batch": True,
+            "live": False,            # Live läuft im Indikator
+            "feature_store": True,
+            "render": False,          # P16.01: Styling baut der Indikator
+        }
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["srv_peak_finder"]
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {k: dict(v) for k, v in _PEAK_GRABBER_SCHEMA.items()}
+
+    # -------------------------------------------------- Frage 3: Yellow-Fenster
+    @staticmethod
+    def _bar_in_time_window(epoch_sec: int) -> bool:
+        """Wanduhr-Minute in [0±5] oder [30±5] (Präambel 8: MT5-Epochs sind
+        Berlin-Wanduhr-encoded; Muster `_f_in_window_around`, srv_proximity)."""
+        minute = (epoch_sec // 60) % 60
+
+        def _in(center: int, span: int = 5) -> bool:
+            lower = center - span
+            upper = center + span
+            if lower < 0:
+                return minute >= (60 + lower) or minute <= upper
+            if upper > 59:
+                return minute >= lower or minute <= (upper - 60)
+            return lower <= minute <= upper
+
+        return _in(0) or _in(30)
+
+    @staticmethod
+    def _extract_prox_zone_map(context: Optional[PluginContext]):
+        """Zone-Hit (`levels_hit` ≠ leer) je bar_time aus der srv_proximity-
+        Instanz im `context.shared_state`. None = kein Proximity-Signal."""
+        if context is None:
+            return None
+        for _key, value in (context.shared_state or {}).items():
+            if not isinstance(value, dict):
+                continue
+            if isinstance(value.get("records"), list):
+                rows = value["records"]
+                if any("levels_hit" in r for r in rows):
+                    return {
+                        int(r.get("bar_time", 0)): bool(r.get("levels_hit"))
+                        for r in rows
+                    }
+            if "levels_hit" in value:  # Einzel-Record (Live)
+                return {
+                    int(value.get("bar_time", 0)): bool(
+                        value.get("levels_hit"))
+                }
+        return None
+
+    def _derive_yellow_window(
+        self, df: pd.DataFrame, context: Optional[PluginContext]
+    ) -> List[bool]:
+        """Frage 3: `is_yellow_window := is_in_proximity_zone ∧
+        is_in_time_window(±5 min um :00/:30)`.
+
+        `is_in_proximity_zone` aus der srv_proximity-Instanz im Context
+        (Zone-Hit-Records); **fehlt das Proximity-Signal → Fallback `True`**
+        (Gate offen). `is_in_time_window` wird immer aus der Wanduhr-Minute
+        der Bar hergeleitet (Präambel 8)."""
+        zone_map = self._extract_prox_zone_map(context)
+        out: List[bool] = []
+        for t in df["time"]:
+            epoch = int(t)
+            in_win = self._bar_in_time_window(epoch)
+            zone = True if zone_map is None else bool(
+                zone_map.get(epoch, False))
+            out.append(bool(zone and in_win))
+        return out
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        if df is None or df.empty:
+            return {"feature_store_payload": {}}
+        p = self.validate_params(params)
+
+        # Frage 3: is_yellow_window wird IM SERVICE hergeleitet
+        # (_derive_yellow_window, Zone-Hit ∧ Zeitfenster, Fallback True).
+        # Optionaler Test-Override: params["is_yellow_window"] als JSON-bool-
+        # Liste (nicht in parameter_order, siehe Schema-Kommentar).
+        yw_raw = p.get("is_yellow_window")
+        if isinstance(yw_raw, str) and yw_raw.strip():
+            import json as _json
+            yw_list = _json.loads(yw_raw)
+        elif isinstance(yw_raw, (list, tuple)):
+            yw_list = list(yw_raw)
+        else:
+            yw_list = self._derive_yellow_window(df, context)
+        yw = np.asarray([bool(x) for x in yw_list], dtype=bool)
+
+        highs = df["high"].to_numpy(dtype=np.float64)
+        lows = df["low"].to_numpy(dtype=np.float64)
+        closes = df["close"].to_numpy(dtype=np.float64)
+
+        # Peak/SL-Arrays aus dem depends_on-shared_state (srv_peak_finder).
+        if context is not None and context.depends_on:
+            src = context.shared_state.get(context.depends_on[0]) or {}
+        else:
+            src = {}
+        sl_offset_pct = float((p.get("sl_offset_pct") or 0.15))
+        if src and "sl_highs" in src:
+            sl_highs = src["sl_highs"]
+            sl_lows = src["sl_lows"]
+            peak_highs = src["peak_highs"]
+            peak_lows = src["peak_lows"]
+        else:
+            # Fallback: eigene Peak-Berechnung (Parität srv_peak_finder).
+            peak_highs = np.maximum.accumulate(highs)
+            peak_lows = np.minimum.accumulate(lows)
+            f_h = 1.0 + (sl_offset_pct / 100.0)
+            f_l = 1.0 - (sl_offset_pct / 100.0)
+            sl_highs = peak_highs * f_h
+            sl_lows = peak_lows * f_l
+
+        signals, sl_prices, peak_prices = run_grabber_kernel(
+            highs, lows, closes, yw,
+            float(p["reversal_pct"]),
+            int(p["min_hold_bars"]),
+            int(p["invalidation_bars"]),
+            float(p["invalidation_threshold_pct"]),
+            sl_offset_pct,
+            bool(p["require_proximity_window"]),
+            True,  # gate_active: Button-Steuerung ist Aufgabe des Aufrufers
+        )
+
+        records: List[Dict[str, Any]] = []
+        times = df["time"].to_numpy()
+        for i in range(len(df)):
+            if signals[i] == 0:
+                continue
+            records.append({
+                "bar_time": int(times[i]),
+                "signal": int(signals[i]),
+                "signal_label": _SIGNAL_LABELS.get(int(signals[i]), "?"),
+                "sl_price": float(sl_prices[i]),
+                "peak_price": float(peak_prices[i]),
+                "peak_high": float(peak_highs[i]),
+                "peak_low": float(peak_lows[i]),
+                "is_yellow_window": bool(yw[i]),
+            })
+        n_triggers = int(np.count_nonzero((signals == 1) | (signals == -1)))
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    "schema_version": "1.0.0",
+                    "statistics": {
+                        "signal_count": len(records),
+                        "trigger_count": n_triggers,
+                    },
+                },
+            },
+        }
+
+
+_SIGNAL_LABELS: Dict[int, str] = {
+    1: "BUY_TRIGGER",
+    2: "BUY_UPDATE",
+    -1: "SELL_TRIGGER",
+    -2: "SELL_UPDATE",
+}
+```
+
+**Wichtig:** Der Plugin-Service erzeugt **keine** `GrabberResultRecord`-Objekte (zustandslos, keine DB). Die Record-Bildung übernimmt der Backtest-Runner (§8) bzw. der Live-Indikator (§5) – **eine** Record-Semantik, zwei Erzeuger.
+
+**Set-Kopplung (Frage 3):** Die `srv_proximity`-Instanz muss im selben Set laufen und ihre Zone-Hit-Records (`{bar_time, levels_hit}`) über `context.shared_state` bereitstellen (`execution_order: grid_1 → prox_1 → peak_1 → grab_1`; `grab_1.depends_on = ["peak_1", "prox_1"]`). Fehlt sie (oder liefert keine Daten), greift der **Fallback `True`** – `srv_peak_grabber` bleibt auch ohne Proximity funktionsfähig.
+
+### C. Live-State-Machine `PeakGrabberLiveState` (`chart/indicators/ind_peak.py`)
+
+Zustandsbehaftet, aber **nur im Indikator** (kein Plugin) – Muster `ind_fixed_grid_proximity`. Parität zu Kernel gemäß §3.1.
+
+```python
+# chart/indicators/ind_peak.py (Teil 1: Live-State-Machine)
+import numpy as np
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+from analytics.engine.peak_models import (
+    GrabberResultRecord,
+    GrabberState,
+    PeakConfig,
+    PeakGrabberConfig,
+    SignalDirection,
+)
+
+
+class PeakFinderLive:
+    """O(1) Live-Peak-Tracker (Scalar-State, Parität zu compute_batch)."""
+
+    def __init__(self, cfg: PeakConfig) -> None:
+        self.cfg = cfg
+        self.cur_high_price: float = np.nan
+        self.cur_high_idx: int = -1
+        self.cur_high_sl: float = np.nan
+        self.cur_low_price: float = np.nan
+        self.cur_low_idx: int = -1
+        self.cur_low_sl: float = np.nan
+
+    def reset(self) -> None:
+        self.cur_high_price = np.nan
+        self.cur_high_idx = -1
+        self.cur_high_sl = np.nan
+        self.cur_low_price = np.nan
+        self.cur_low_idx = -1
+        self.cur_low_sl = np.nan
+
+    def set_state(self, high: float, high_idx: int, low: float,
+                  low_idx: int) -> None:
+        """B4: Übernahme der Batch-Endwerte (bootstrap_history)."""
+        self.cur_high_price = float(high)
+        self.cur_high_idx = int(high_idx)
+        self.cur_high_sl = float(high) * self.cfg.sl_factor_high()
+        self.cur_low_price = float(low)
+        self.cur_low_idx = int(low_idx)
+        self.cur_low_sl = float(low) * self.cfg.sl_factor_low()
+
+    def update_scalar(self, bar_idx: int, high: float,
+                      low: float) -> Tuple[bool, bool]:
+        is_new_h = False
+        is_new_l = False
+        if np.isnan(self.cur_high_price) or high > self.cur_high_price:
+            self.cur_high_price = high
+            self.cur_high_idx = bar_idx
+            self.cur_high_sl = high * self.cfg.sl_factor_high()
+            is_new_h = True
+        if np.isnan(self.cur_low_price) or low < self.cur_low_price:
+            self.cur_low_price = low
+            self.cur_low_idx = bar_idx
+            self.cur_low_sl = low * self.cfg.sl_factor_low()
+            is_new_l = True
+        return is_new_h, is_new_l
+
+
+class PeakGrabberLiveState:
+    """Live-State-Machine (Parität zum Kernel §3.1, B2/B3/B6).
+
+    Kein Plugin – wird ausschließlich vom Indikator ind_peak getrieben.
+    """
+
+    def __init__(self, cfg: PeakGrabberConfig, finder: PeakFinderLive,
+                 symbol: str, timeframe: str) -> None:
+        self.cfg = cfg
+        self.finder = finder
+        self.symbol = symbol
+        self.tf = timeframe
+        self.run_id: str = "LIVE"
+        self.is_btn_active: bool = False
+        self.state_short: GrabberState = GrabberState.IDLE
+        self.state_long: GrabberState = GrabberState.IDLE
+
+    def set_button_active(self, active: bool) -> None:
+        self.is_btn_active = bool(active)
+        if not active:
+            self.state_short = GrabberState.IDLE
+            self.state_long = GrabberState.IDLE
+
+    def process_tick_or_bar(
+        self,
+        bar_idx: int,
+        high: float,
+        low: float,
+        close: float,
+        ts: datetime,
+        is_yellow_window: bool,
+    ) -> List[GrabberResultRecord]:
+        events: List[GrabberResultRecord] = []
+
+        # B3: VOR update_scalar den vorherigen Peak-Stand sichern
+        # (Alter des VORHERIGEN Peaks, Parität zur Kernel-Semantik).
+        prev_h_price = self.finder.cur_high_price
+        prev_h_idx = self.finder.cur_high_idx
+        prev_l_price = self.finder.cur_low_price
+        prev_l_idx = self.finder.cur_low_idx
+
+        is_new_h, is_new_l = self.finder.update_scalar(bar_idx, high, low)
+
+        gate = self.is_btn_active and (
+            is_yellow_window if self.cfg.require_proximity_window else True
+        )
+        if not gate:
+            return events
+
+        # --- Short Side (Peak = laufendes High) --------------------------
+        if is_new_h and not np.isnan(prev_h_price):
+            bars_h = bar_idx - prev_h_idx
+            breach_pct = ((high - prev_h_price) / prev_h_price) * 100.0
+            if bars_h <= self.cfg.invalidation_bars:
+                if breach_pct <= self.cfg.invalidation_threshold_pct:
+                    self.state_short = GrabberState.ARMED
+                    events.append(self._build_record(
+                        ts, SignalDirection.SELL, close,
+                        self.finder.cur_high_sl, self.finder.cur_high_price,
+                        bar_idx, True, 0.0, is_yellow_window,
+                        "GATE_UPDATE"))
+                else:
+                    self.state_short = GrabberState.INVALIDATED
+            else:
+                self.state_short = GrabberState.ARMED
+        elif self.state_short == GrabberState.ARMED:
+            bars_h = bar_idx - self.finder.cur_high_idx
+            rev = (((self.finder.cur_high_price - close)
+                    / self.finder.cur_high_price) * 100.0
+                   if self.finder.cur_high_price > 0.0 else 0.0)
+            if rev >= self.cfg.reversal_pct and bars_h >= self.cfg.min_hold_bars:
+                self.state_short = GrabberState.TRIGGERED
+                events.append(self._build_record(
+                    ts, SignalDirection.SELL, close,
+                    self.finder.cur_high_sl, self.finder.cur_high_price,
+                    bar_idx, False, rev, is_yellow_window, "GATE_TRIGGER"))
+
+        # --- Long Side (Peak = laufendes Low) ----------------------------
+        if is_new_l and not np.isnan(prev_l_price):
+            bars_l = bar_idx - prev_l_idx
+            breach_pct = ((prev_l_price - low) / prev_l_price) * 100.0
+            if bars_l <= self.cfg.invalidation_bars:
+                if breach_pct <= self.cfg.invalidation_threshold_pct:
+                    self.state_long = GrabberState.ARMED
+                    events.append(self._build_record(
+                        ts, SignalDirection.BUY, close,
+                        self.finder.cur_low_sl, self.finder.cur_low_price,
+                        bar_idx, True, 0.0, is_yellow_window,
+                        "GATE_UPDATE"))
+                else:
+                    self.state_long = GrabberState.INVALIDATED
+            else:
+                self.state_long = GrabberState.ARMED
+        elif self.state_long == GrabberState.ARMED:
+            bars_l = bar_idx - self.finder.cur_low_idx
+            rev = (((close - self.finder.cur_low_price)
+                    / self.finder.cur_low_price) * 100.0
+                   if self.finder.cur_low_price > 0.0 else 0.0)
+            if rev >= self.cfg.reversal_pct and bars_l >= self.cfg.min_hold_bars:
+                self.state_long = GrabberState.TRIGGERED
+                events.append(self._build_record(
+                    ts, SignalDirection.BUY, close,
+                    self.finder.cur_low_sl, self.finder.cur_low_price,
+                    bar_idx, False, rev, is_yellow_window, "GATE_TRIGGER"))
+
+        return events
+
+    def _build_record(self, ts: datetime, direction: SignalDirection,
+                      entry: float, sl: float, peak: float, idx: int,
+                      upd: bool, rev: float, yellow: bool,
+                      src: str) -> GrabberResultRecord:
+        import uuid
+        return GrabberResultRecord(
+            signal_id=str(uuid.uuid4()),
+            run_id=self.run_id,
+            timestamp=ts,
+            symbol=self.symbol,
+            timeframe=self.tf,
+            direction=direction,
+            entry_price=entry,
+            sl_price=sl,
+            peak_price=peak,
+            peak_bar_index=idx,
+            is_update=upd,
+            reversal_pct=rev,
+            is_yellow_window=yellow,
+            gate_source=src,
+        )
+```
+
+**Hinweis (Import-Disziplin):** `PeakFinderLive` ist im Indikator lokal implementiert (kein Import des Plugin-Services `srv_peak_finder` in die Chart-Schicht nötig). Die Plugin-Variante `srv_peak_finder` bedient ausschließlich die Batch-/Store-Pipeline; beide teilen dieselbe Mathematik (`PeakConfig.sl_factor_high/low`).
+
+---
+
+## 5. Indikator & Charting-Adapter (`chart/indicators/ind_peak.py`)
+
+`IndPeak` erbt von `BaseIndicator` (volle API, Frage 2). Render-Payload-Konvention (P16.05):
+
+* **`lines`** (Zeitreihen-LineSeries, Multi-MA-Konvention): `{id, data:[{time, value, color}], width, style, title}` – `sl_high` (rot/SELL) und `sl_low` (grün/BUY).
+* **`markers`** (LWC-v5): TRIGGER = `arrowUp`/`arrowDown` (aboveBar/belowBar, size 2); UPDATE = `circle` (size 1) nur bei `show_updates=True`.
+* **`status_info`**: `{is_btn_active, trigger_count}` aus den Service-`metadata["statistics"]`.
+
+```python
+# chart/indicators/ind_peak.py (Teil 2: Indikator, BaseIndicator)
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from chart.indicators.base_indicator import BaseIndicator
+from analytics.engine.peak_models import (
+    GrabberResultRecord,
+    PeakConfig,
+    PeakGrabberConfig,
+)
+from analytics.features.feature_builder import PluginExecutor
+from analytics.features.plugins.base_plugin import PluginContext
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+
+_PEAK_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "sl_offset_pct": {"type": "float", "default": 0.15, "min": 0.0, "max": 10.0, "step": 0.01, "description": "SL-Puffer über/unter Peak (%)"},
+    "reversal_pct": {"type": "float", "default": 0.30, "min": 0.01, "max": 10.0, "step": 0.01, "description": "Reversal % für Trigger (z)"},
+    "min_hold_bars": {"type": "int", "default": 3, "min": 1, "max": 1000, "step": 1, "description": "Min. Bars Haltedauer des Peaks"},
+    "invalidation_bars": {"type": "int", "default": 5, "min": 1, "max": 10000, "step": 1, "description": "Beobachtungsfenster x (Bars)"},
+    "invalidation_threshold_pct": {"type": "float", "default": 0.10, "min": 0.0, "max": 10.0, "step": 0.01, "description": "Toleranz y% vor Hard-Invalidation"},
+    "require_proximity_window": {"type": "bool", "default": True, "description": "Nur im Yellow Window triggern"},
+    "show_sl_high": {"type": "bool", "default": True, "description": "SL-High-Linie anzeigen"},
+    "show_sl_low": {"type": "bool", "default": True, "description": "SL-Low-Linie anzeigen"},
+    "show_signals": {"type": "bool", "default": True, "description": "Trigger-Marker anzeigen"},
+    "show_updates": {"type": "bool", "default": False, "description": "Update-Marker anzeigen"},
+    "sl_high_color": {"type": "color", "default": "#EF5350", "description": "Farbe SL-High-Linie", "style_type": "line", "show_visibility": False},
+    "sl_low_color": {"type": "color", "default": "#26A69A", "description": "Farbe SL-Low-Linie", "style_type": "line", "show_visibility": False},
+}
+
+
+class IndPeak(BaseIndicator):
+    """Peak-Grabber-Indikator: SL-Linien + Trigger-Marker (Hist & Live)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._symbol: Optional[str] = None
+        self._timeframe: Optional[str] = None
+        self._settings: Any = None
+        self._on_new_candle: Optional[Callable[[], None]] = None
+        self._executor = PluginExecutor()
+        self._evaluator = ServiceSetEvaluator(self._executor)
+        self._last_params: Dict[str, Any] = {}
+
+        # Live-Komponenten (ring buffer, Zero-GC, B5)
+        self._buffer_size: int = 2000
+        self._head: int = 0
+        self._buf_time = np.zeros(self._buffer_size, dtype=np.int64)
+        self._buf_sl_high = np.full(self._buffer_size, np.nan, dtype=np.float64)
+        self._buf_sl_low = np.full(self._buffer_size, np.nan, dtype=np.float64)
+        self._filled: int = 0
+        self._known_times: set = set()  # New-Candle-Erkennung (gerundete Zeit)
+
+        self._live_state: Optional[PeakGrabberLiveState] = None
+
+    # ------------------------------------------------------------- Identität
+    @property
+    def indicator_id(self) -> str:
+        return "ind_peak"
+
+    @property
+    def display_name(self) -> str:
+        return "Ind_Peak (Peak Grabber)"
+
+    @property
+    def plugin_id(self) -> str:
+        return "ind_peak"
+
+    @property
+    def service_plugin_ids(self) -> List[str]:
+        return ["srv_peak_finder", "srv_peak_grabber"]
+
+    @property
+    def parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        return {k: dict(v) for k, v in _PEAK_SCHEMA.items()}
+
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_PEAK_SCHEMA.keys())
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {k: v["default"] for k, v in _PEAK_SCHEMA.items() if "default" in v}
+
+    # ------------------------------------------------------------- Kontext
+    def set_context(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._timeframe = timeframe
+
+    def set_settings(self, settings: Any) -> None:
+        self._settings = settings
+
+    def set_new_candle_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        self._on_new_candle = callback
+
+    # ------------------------------------------------------------- Live-Hook
+    def set_button_active(self, active: bool) -> None:
+        """Wird von chart_win generisch über event_bus.grabber_toggle gerufen."""
+        if self._live_state is not None:
+            self._live_state.set_button_active(active)
+
+    # ------------------------------------------------ Ringpuffer (B5, Zero-GC)
+    def _push(self, ts: int, sl_high: float, sl_low: float) -> None:
+        idx = self._head % self._buffer_size
+        self._buf_time[idx] = int(ts)
+        self._buf_sl_high[idx] = float(sl_high)
+        self._buf_sl_low[idx] = float(sl_low)
+        self._head += 1
+        if self._filled < self._buffer_size:
+            self._filled += 1
+
+    def _ordered_buffers(self):
+        start = max(0, self._head - self._filled)
+        out_t = np.empty(self._filled, dtype=np.int64)
+        out_h = np.empty(self._filled, dtype=np.float64)
+        out_l = np.empty(self._filled, dtype=np.float64)
+        for k in range(self._filled):
+            src = (start + k) % self._buffer_size
+            out_t[k] = self._buf_time[src]
+            out_h[k] = self._buf_sl_high[src]
+            out_l[k] = self._buf_sl_low[src]
+        return out_t, out_h, out_l
+
+    # ------------------------------------------------------------ Berechnung
+    def _get_app_settings(self) -> Any:
+        if self._settings is not None:
+            return self._settings
+        try:
+            from state_manager import StateManager
+            return StateManager().get_app_settings()
+        except Exception:
+            return None
+
+    def _build_set_definition(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Frage 3: Set mit grid_1 → prox_1 (Zone-Hits in shared_state) →
+        peak_1 → grab_1. Der Service srv_peak_grabber leitet is_yellow_window
+        selbst her (Fallback True ohne Proximity-Signal)."""
+        return {
+            "set_id": "ind_peak_internal",
+            "display_name": "Ind_Peak (intern)",
+            "execution_order": ["grid_1", "prox_1", "peak_1", "grab_1"],
+            "services": {
+                "grid_1": {
+                    "plugin_id": "srv_grid_lines",
+                    "lookback": int(params.get("lookback") or 1000),
+                    "params": {
+                        "step_size": params.get("grid_step", 0.5),
+                        "steps_around": params.get("steps_around", 4),
+                    },
+                },
+                "prox_1": {
+                    "plugin_id": "srv_proximity",
+                    "lookback": int(params.get("lookback") or 1000),
+                    "depends_on": ["grid_1"],
+                    "params": {
+                        # Frage 3: festes Zeitfenster ±5 min um :00/:30
+                        "visit_pct": params.get("proximity_threshold", 0.05),
+                        "time_window_mins": 5,
+                        "use_time_filter": True,
+                    },
+                },
+                "peak_1": {
+                    "plugin_id": "srv_peak_finder",
+                    "lookback": int(params.get("lookback") or 1000),
+                    "params": {"sl_offset_pct": params.get("sl_offset_pct", 0.15)},
+                },
+                "grab_1": {
+                    "plugin_id": "srv_peak_grabber",
+                    "lookback": int(params.get("lookback") or 1000),
+                    "depends_on": ["peak_1", "prox_1"],
+                    "params": {
+                        "reversal_pct": params.get("reversal_pct", 0.30),
+                        "min_hold_bars": params.get("min_hold_bars", 3),
+                        "invalidation_bars": params.get("invalidation_bars", 5),
+                        "invalidation_threshold_pct": params.get(
+                            "invalidation_threshold_pct", 0.10),
+                        "require_proximity_window": params.get(
+                            "require_proximity_window", True),
+                        "sl_offset_pct": params.get("sl_offset_pct", 0.15),
+                    },
+                },
+            },
+        }
+
+    def calculate(self, df: pd.DataFrame,
+                  params: Dict[str, Any]) -> Dict[str, Any]:
+        empty = {"lines": [], "markers": [], "status_info": {}}
+        if df is None or df.empty:
+            return empty
+        try:
+            p = dict(params or {})
+            self._last_params = dict(p)
+            context = PluginContext(
+                symbol=self._symbol or "",
+                timeframe=self._timeframe or "",
+                mode="chart",
+                settings=self._get_app_settings(),
+            )
+            definition = self._build_set_definition(p)
+            results = self._evaluator.execute_set(definition, df, context)
+
+            # SL-Linien aus srv_peak_finder (sl_high/sl_low je Bar)
+            finder_recs = ((results.get("peak_1") or {}).get(
+                "feature_store_payload") or {}).get("records") or []
+            grabber_recs = ((results.get("grab_1") or {}).get(
+                "feature_store_payload") or {}).get("records") or []
+            stats = ((results.get("grab_1") or {}).get(
+                "feature_store_payload") or {}).get("metadata") or {}
+
+            lines: List[Dict[str, Any]] = []
+            if p.get("show_sl_high", True):
+                lines.append({
+                    "id": "sl_high",
+                    "data": [{"time": int(r["bar_time"]),
+                              "value": float(r["sl_high"]),
+                              "color": p.get("sl_high_color", "#EF5350")}
+                             for r in finder_recs],
+                    "width": 1, "style": "solid", "title": "SL High",
+                })
+            if p.get("show_sl_low", True):
+                lines.append({
+                    "id": "sl_low",
+                    "data": [{"time": int(r["bar_time"]),
+                              "value": float(r["sl_low"]),
+                              "color": p.get("sl_low_color", "#26A69A")}
+                             for r in finder_recs],
+                    "width": 1, "style": "solid", "title": "SL Low",
+                })
+
+            markers: List[Dict[str, Any]] = []
+            if p.get("show_signals", True):
+                for r in grabber_recs:
+                    sig = int(r["signal"])
+                    if sig in (1, -1):  # Trigger
+                        markers.append({
+                            "time": int(r["bar_time"]),
+                            "position": "aboveBar" if sig == 1 else "belowBar",
+                            "color": "#26A69A" if sig == 1 else "#EF5350",
+                            "shape": "arrowUp" if sig == 1 else "arrowDown",
+                            "size": 2,
+                            "text": "BUY" if sig == 1 else "SELL",
+                            "priority": 8,
+                        })
+                    elif p.get("show_updates", False):  # Update
+                        markers.append({
+                            "time": int(r["bar_time"]),
+                            "position": "aboveBar" if sig == 2 else "belowBar",
+                            "color": "#90A4AE",
+                            "shape": "circle",
+                            "size": 1,
+                            "text": "upd",
+                            "priority": 5,
+                        })
+
+            # Bootstrap des Live-States (B4): Batch-Endwerte übernehmen.
+            self._bootstrap_live_state(finder_recs, p)
+
+            return {
+                "lines": lines,
+                "markers": markers,
+                "status_info": {
+                    "is_btn_active": bool(
+                        self._live_state and self._live_state.is_btn_active),
+                    "trigger_count": int((stats.get("statistics") or {}).get(
+                        "trigger_count", 0)),
+                },
+            }
+        except Exception as e:
+            print(f"[IndPeak] Service-Pipeline fehlgeschlagen: {e}")
+            return empty
+
+    def _bootstrap_live_state(self, finder_recs: List[Dict[str, Any]],
+                              p: Dict[str, Any]) -> None:
+        """B4: übernimmt die letzten Batch-Peaks in den Live-Scalar-State."""
+        if not finder_recs:
+            return
+        last = finder_recs[-1]
+        peak_cfg = PeakConfig(sl_offset_pct=float(
+            p.get("sl_offset_pct", 0.15)))
+        if self._live_state is None:
+            finder_live = PeakFinderLive(peak_cfg)
+            self._live_state = PeakGrabberLiveState(
+                PeakGrabberConfig(
+                    reversal_pct=float(p.get("reversal_pct", 0.30)),
+                    min_hold_bars=int(p.get("min_hold_bars", 3)),
+                    invalidation_bars=int(p.get("invalidation_bars", 5)),
+                    invalidation_threshold_pct=float(p.get(
+                        "invalidation_threshold_pct", 0.10)),
+                    require_proximity_window=bool(p.get(
+                        "require_proximity_window", True)),
+                ),
+                finder_live,
+                self._symbol or "",
+                self._timeframe or "",
+            )
+        # Ringpuffer mit History-SL füllen (nur die letzten buffer_size).
+        n = min(len(finder_recs), self._buffer_size)
+        self._filled = 0
+        self._head = 0
+        for r in finder_recs[-n:]:
+            self._push(int(r["bar_time"]),
+                       float(r["sl_high"]), float(r["sl_low"]))
+        last_high = float(last["peak_high"])
+        last_low = float(last["peak_low"])
+        self._live_state.finder.set_state(
+            last_high, len(finder_recs) - 1, last_low, len(finder_recs) - 1)
+
+    # ----------------------------------------------------- Live-Tick-Pfad
+    def update_live_candle(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Live: O(1) Tick-Update auf den letzten Ringpuffer-Slot + Yellow-
+        Flag der aktuellen Bar. Neue Candle → genau EIN debounced Refresh."""
+        if not candle or self._live_state is None:
+            return []
+        try:
+            ts = int(candle.get("time", 0))
+            high = float(candle.get("high", candle.get("price", 0.0)))
+            low = float(candle.get("low", high))
+            close = float(candle.get("close", candle.get("price", 0.0)))
+        except (TypeError, ValueError):
+            return []
+
+        # Yellow-Flag aktuell (letzter srv_proximity-Record, FeatureStoreReader)
+        yellow = self._is_current_bar_yellow(ts)
+        # New-Candle-Erkennung (gerundete Zeit, Muster ind_fixed_grid_proximity)
+        from db_service import TF_SECONDS_MAP
+        t_sec = TF_SECONDS_MAP.get(str(self._timeframe or "").upper(), 60)
+        rounded = ts - (ts % t_sec)
+        if rounded not in self._known_times:
+            self._known_times.add(rounded)
+            if self._on_new_candle is not None:
+                try:
+                    self._on_new_candle()
+                except Exception:
+                    pass
+
+        bar_idx = max(self._filled, self._live_state.finder.cur_high_idx + 1)
+        records = self._live_state.process_tick_or_bar(
+            bar_idx, high, low, close,
+            pd.Timestamp(ts, unit="s").to_pydatetime(),  # B7
+            yellow)
+        # Live-SL-Punkt in den Ringpuffer (In-Place, letzter Slot).
+        self._push(ts, self._live_state.finder.cur_high_sl,
+                   self._live_state.finder.cur_low_sl)
+
+        if records:
+            # Persistenz + UI-Modal über den EventBus (Präambel 4, IoC)
+            try:
+                from config.event_bus import event_bus
+                for rec in records:
+                    event_bus.grabber_event.emit(rec)
+            except Exception:
+                pass
+        return records
+
+    def _is_current_bar_yellow(self, ts: int) -> bool:
+        """Frage 3 (Live): Zone-Hit ∧ Zeitfenster der aktuellen Bar aus dem
+        letzten srv_proximity-Record; **Fallback `True`** ohne Proximity-
+        Signal (Gate offen)."""
+        try:
+            from analytics.engine.feature_store_reader import FeatureStoreReader
+            reader = FeatureStoreReader(db_path=None)
+            rec = reader.latest_proximity_record(
+                self._symbol or "", self._timeframe or "", int(ts))
+            if rec:
+                fd = rec.get("feature_data") or {}
+                return bool(fd.get("in_time_window") and (fd.get("levels_hit") or []))
+        except Exception:
+            pass
+        return True
+
+    # ---------------------------------------------------- Overlay-Hooks (P14-03)
+    def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Live-SL-Punkte als generische Overlays (kind='circle')."""
+        self.update_live_candle(candle)
+        if self._live_state is None:
+            return []
+        overlays = []
+        if not np.isnan(self._live_state.finder.cur_high_sl):
+            overlays.append({
+                "kind": "circle", "layer": self.indicator_id,
+                "time": int(candle.get("time", 0)),
+                "price": float(self._live_state.finder.cur_high_sl),
+                "color": self._last_params.get("sl_high_color", "#EF5350"),
+                "priority": 10,
+            })
+        if not np.isnan(self._live_state.finder.cur_low_sl):
+            overlays.append({
+                "kind": "circle", "layer": self.indicator_id,
+                "time": int(candle.get("time", 0)),
+                "price": float(self._live_state.finder.cur_low_sl),
+                "color": self._last_params.get("sl_low_color", "#26A69A"),
+                "priority": 10,
+            })
+        return overlays
+
+    def remember_live_time(self, ts: int) -> None:
+        try:
+            self._known_times.add(int(ts))
+        except (TypeError, ValueError):
+            pass
+```
+
+---
+
+## 6. Outcome-Spalten (PENDING-Platzhalter, Frage 4)
+
+**In 22.01 wird KEINE Exit-/Forward-Evaluation implementiert** (Entscheidung 4). Die vier Outcome-Spalten existieren bereits im DDL-Schema (§2.3) mit Defaults:
+
+| Spalte | 22.01-Wert |
+|--------|-----------|
+| `outcome_status` | `'PENDING'` (DEFAULT) |
+| `pnl_r_multiple` | `NULL` |
+| `max_favorable_exc` | `NULL` |
+| `max_adverse_exc` | `NULL` |
+
+**Deferred – separates Auswertungs-Modul (späteres Kapitel):** `analytics/engine/peak_outcome.py` – Forward-Walk-Exit-Evaluation (SL-Hit, TP-Hit via `PeakGrabberConfig.take_profit_r`, `max_hold_bars`-Timeout, OPEN; MFE/MAE in Preis-Einheiten; `pd.Timestamp(...).to_pydatetime()`-Semantik, B7). Nur TRIGGER-Records (`is_update=False`) öffnen dort eine Position. Die reservierten Config-Felder `take_profit_r` / `max_hold_bars` (§2.2) werden erst in diesem Modul ausgewertet.
+
+**Wichtig:** `GrabberRepository` (§7) persistiert die Records **immer** mit `outcome_status='PENDING'` / Outcome-`NULL` – das spätere Modul aktualisiert die Zeilen per `ON CONFLICT (signal_id) DO UPDATE` (nur die 4 Outcome-Spalten, §7).
+
+---
+
+## 7. Persistenz & Repository (`repositories/grabber_repository.py`)
+
+DbPool-Muster (Präambel 6): Thread-local `DbPool.get(self.db_path)`, **kein** manuelles `close()`. Batch-INSERT via `con.register` (Muster `store_plugin_payload`) mit **exakt 18 Spalten** (B1).
+
+```python
+# repositories/grabber_repository.py
+from typing import List
+
+import pandas as pd
+
+from analytics.engine.peak_models import GrabberResultRecord
+from db_service import DB_ANALYTICS, DbPool
+
+
+class GrabberRepository:
+    """Kapselt den DB-Zugriff auf grabber_test_results (MVVM, Präambel 4/6)."""
+
+    def __init__(self, db_path: str = DB_ANALYTICS) -> None:
+        self.db_path = db_path
+
+    _COLS = [
+        "signal_id", "run_id", "timestamp", "symbol", "timeframe",
+        "direction", "entry_price", "sl_price", "peak_price",
+        "peak_bar_index", "is_update", "reversal_pct",
+        "is_yellow_window", "gate_source", "outcome_status",
+        "pnl_r_multiple", "max_favorable_exc", "max_adverse_exc",
+    ]
+
+    def save_records(self, records: List[GrabberResultRecord]) -> int:
+        """Batch-Upsert (18 Spalten, B1). ON CONFLICT aktualisiert nur
+        die Outcome-Felder (nachlaufende Serientest-Bewertung)."""
+        if not records:
+            return 0
+        rows = [
+            (
+                r.signal_id, r.run_id, r.timestamp, r.symbol, r.timeframe,
+                r.direction.value, r.entry_price, r.sl_price, r.peak_price,
+                r.peak_bar_index, r.is_update, r.reversal_pct,
+                r.is_yellow_window, r.gate_source, r.outcome_status,
+                r.pnl_r_multiple, r.max_favorable_exc, r.max_adverse_exc,
+            )
+            for r in records
+        ]
+        con = DbPool.get(self.db_path)
+        df = pd.DataFrame(rows, columns=self._COLS)
+        con.register("df_grabber", df)
+        cols = ", ".join(self._COLS)
+        try:
+            con.execute(f"""
+                INSERT INTO grabber_test_results ({cols})
+                SELECT {cols} FROM df_grabber
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    outcome_status = EXCLUDED.outcome_status,
+                    pnl_r_multiple = EXCLUDED.pnl_r_multiple,
+                    max_favorable_exc = EXCLUDED.max_favorable_exc,
+                    max_adverse_exc = EXCLUDED.max_adverse_exc
+            """)
+        finally:
+            con.unregister("df_grabber")
+        return len(rows)
+
+    def fetch_records(self, run_id: str) -> List[dict]:
+        con = DbPool.get(self.db_path)
+        rows = con.execute(
+            "SELECT * FROM grabber_test_results WHERE run_id = ? "
+            "ORDER BY timestamp", [run_id]).fetchall()
+        cols = [d[0] for d in con.description]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def delete_run(self, run_id: str) -> int:
+        con = DbPool.get(self.db_path)
+        res = con.execute(
+            "DELETE FROM grabber_test_results WHERE run_id = ?",
+            [run_id])
+        return len(res.fetchall() or [])
+```
+
+---
+
+## 8. Serientests / Backtest-Orchestrierung (`analytics/engine/peak_backtest_runner.py`)
+
+Headless Runner (läuft in einem Worker nach `ServiceRunWorker`-Muster mit `event_bus.service_run_started/finished`, Präambel 9):
+
+```python
+# analytics/engine/peak_backtest_runner.py
+import uuid
+from datetime import datetime
+from typing import List, Optional
+
+import pandas as pd
+
+from analytics.engine.peak_models import (
+    GrabberResultRecord,
+    PeakConfig,
+    PeakGrabberConfig,
+)
+from analytics.features.feature_builder import (
+    PluginExecutor,
+    prepare_plugin_df,
+)
+from analytics.features.plugins.base_plugin import PluginContext
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+from repositories.grabber_repository import GrabberRepository
+
+
+class PeakBacktestRunner:
+    """Serientest: ohlcv → grid/prox + peak-Services → DB (PENDING/NULL)."""
+
+    def __init__(self) -> None:
+        self.executor = PluginExecutor()
+        self.evaluator = ServiceSetEvaluator(self.executor)
+        self.repo = GrabberRepository()
+
+    def _load_ohlcv(self, symbol: str, timeframe: str,
+                    limit: Optional[int]) -> pd.DataFrame:
+        from analytics.features.feature_builder import FeatureBuilder
+        df = FeatureBuilder().load_ohlcv(symbol, timeframe, limit)
+        return prepare_plugin_df(df)
+
+    def run_series(
+        self,
+        symbol: str,
+        timeframe: str,
+        cfg: PeakGrabberConfig,
+        peak_cfg: PeakConfig = PeakConfig(),
+        limit: Optional[int] = None,
+    ) -> List[GrabberResultRecord]:
+        df = self._load_ohlcv(symbol, timeframe, limit)
+        if df is None or df.empty:
+            return []
+
+        # Frage 3: grid_1 → prox_1 (Zone-Hits in shared_state) → peak_1 → grab_1.
+        # Der Service srv_peak_grabber leitet is_yellow_window selbst her.
+        definition = {
+            "set_id": "peak_backtest_internal",
+            "display_name": "Peak Backtest (intern)",
+            "execution_order": ["grid_1", "prox_1", "peak_1", "grab_1"],
+            "services": {
+                "grid_1": {
+                    "plugin_id": "srv_grid_lines",
+                    "lookback": int(limit or len(df)),
+                    "params": {"step_size": 0.5, "steps_around": 4},
+                },
+                "prox_1": {
+                    "plugin_id": "srv_proximity",
+                    "lookback": int(limit or len(df)),
+                    "depends_on": ["grid_1"],
+                    "params": {
+                        "visit_pct": 0.05,
+                        "time_window_mins": 5,   # Frage 3: ±5 min um :00/:30
+                        "use_time_filter": True,
+                    },
+                },
+                "peak_1": {
+                    "plugin_id": "srv_peak_finder",
+                    "lookback": int(limit or len(df)),
+                    "params": {"sl_offset_pct": peak_cfg.sl_offset_pct},
+                },
+                "grab_1": {
+                    "plugin_id": "srv_peak_grabber",
+                    "lookback": int(limit or len(df)),
+                    "depends_on": ["peak_1", "prox_1"],
+                    "params": {
+                        "reversal_pct": cfg.reversal_pct,
+                        "min_hold_bars": cfg.min_hold_bars,
+                        "invalidation_bars": cfg.invalidation_bars,
+                        "invalidation_threshold_pct": cfg.invalidation_threshold_pct,
+                        "require_proximity_window": cfg.require_proximity_window,
+                        "sl_offset_pct": peak_cfg.sl_offset_pct,
+                    },
+                },
+            },
+        }
+        context = PluginContext(symbol=symbol, timeframe=timeframe,
+                                mode="batch")
+        results = self.evaluator.execute_set(definition, df, context)
+        grab_recs = ((results.get("grab_1") or {}).get(
+            "feature_store_payload") or {}).get("records") or []
+
+        # Schnellzugriff: bar_time (epoch) -> Zeilen-Index (kein index()-Scan)
+        times = df["time"].to_numpy()
+        idx_by_time = {int(t): i for i, t in enumerate(times)}
+
+        run_id = f"BT-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        records: List[GrabberResultRecord] = []
+        for r in grab_recs:
+            sig = int(r["signal"])
+            is_upd = abs(sig) == 2
+            i = idx_by_time.get(int(r["bar_time"]))
+            if i is None:
+                continue
+            rec = GrabberResultRecord(
+                signal_id=str(uuid.uuid4()),  # stabil (kein hash(), B: Pythons
+                # hash() ist pro Prozess randomisiert)
+                run_id=run_id,
+                timestamp=pd.Timestamp(int(r["bar_time"]),
+                                       unit="s").to_pydatetime(),  # B7
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=("BUY" if sig > 0 else "SELL"),
+                entry_price=float(df.iloc[i]["close"]),
+                sl_price=float(r["sl_price"]),
+                peak_price=float(r["peak_price"]),
+                peak_bar_index=i,
+                is_update=is_upd,
+                reversal_pct=(0.0 if is_upd else abs(
+                    float(df.iloc[i]["close"]) - float(r["peak_price"]))
+                    / float(r["peak_price"]) * 100.0),
+                is_yellow_window=bool(r["is_yellow_window"]),
+                gate_source="SERIES_UPDATE" if is_upd else "SERIES_TRIGGER",
+                # Frage 4: Outcome bleibt PENDING-Platzhalter (späteres Modul)
+                outcome_status="PENDING",
+                pnl_r_multiple=None,
+                max_favorable_exc=None,
+                max_adverse_exc=None,
+            )
+            records.append(rec)
+        self.repo.save_records(records)
+        return records
+```
+
+---
+
+## 9. UI-Integration (EventBus, AnalyticsWindow, ChartWindow, OrderPreviewDialog)
+
+### 9.1 EventBus-Signale (`config/event_bus.py`, additiv)
+
+```python
+# config/event_bus.py (additiv zu den bestehenden Signal-Deklarationen)
+    # 22.01 (14.08.2026): Peak-Grabber (Frage 5). Der AnalyticsWindow-Button
+    # emittiert grabber_toggle(dict) mit {"active", "symbol", "timeframe"} –
+    # chart_win subscribed und ruft generisch set_button_active(active) auf
+    # allen Indikatoren mit diesem Hook auf (IoC). Live-Trigger/-Updates
+    # emittieren grabber_event(GrabberResultRecord) – das AnalyticsWindow
+    # persistiert über GrabberRepository und öffnet die OrderPreviewDialog
+    # (UI ohne SQL, MVVM).
+    grabber_toggle = Signal(dict)
+    grabber_event = Signal(object)
+```
+
+### 9.2 Button im AnalyticsWindow (`analytics/ui/analytics_win.py`)
+
+Primärer Ort (Frage 5): Toolbar/Control-Zeile des AnalyticsWindow; Alternative: Chart-Overlay-Controlbar. Der Handler emittiert den **Dict-Payload** `{"active", "symbol", "timeframe"}` – die Symbol-/Timeframe-Werte kommen aus dem aktuellen Analytics-Kontext.
+
+```python
+# analytics/ui/analytics_win.py (in der Toolbar-/Control-Zeile)
+self.btn_grabber_peak = QPushButton("🎯 Peak Grabber", self)
+self.btn_grabber_peak.setCheckable(True)
+self.btn_grabber_peak.setToolTip(
+    "Aktiviert den Peak-Grabber (Trigger/Updates im Yellow Window).")
+self.btn_grabber_peak.toggled.connect(self._on_grabber_toggled)
+
+# analytics/ui/analytics_win.py (Handler)
+from PySide6.QtCore import Slot
+
+@Slot(bool)
+def _on_grabber_toggled(self, active: bool) -> None:
+    """Frage 5: leitet den Button-Zustand + Kontext entkoppelt an den Chart
+    weiter (IoC, kein Hardcoding auf Indikator-/Fensterklassen)."""
+    from config.event_bus import event_bus
+    event_bus.grabber_toggle.emit({
+        "active": bool(active),
+        "symbol": str(self._current_symbol or ""),
+        "timeframe": str(self._current_timeframe or ""),
+    })
+```
+
+### 9.3 ChartWindow-Subscription (`chart/chart_win.py`)
+
+`chart_win` subscribed `grabber_toggle` und routet generisch an alle Indikatoren mit `set_button_active`-Hook (IoC, kein Indikator-Sonderfall, kein `if ind_id == ...`-Branch). Voraussetzung: `ind_peak` ist in der Indikator-Registry `self.indicators` registriert (additiv, §9.5 §2A). **Korrektur:** `_get_active_plugins()` existiert im Code nicht – iteriert wird über `self.indicators.values()`.
+
+```python
+# chart/chart_win.py (in der Connect-Zone des __init__)
+from config.event_bus import event_bus
+event_bus.grabber_toggle.connect(self._on_grabber_toggle)
+
+# chart/chart_win.py (Handler, generisch – kein Indikator-Sonderfall)
+def _on_grabber_toggle(self, payload: dict) -> None:
+    """Reicht den Grabber-Zustand (active) an alle Indikatoren mit
+    set_button_active weiter (Open/Closed – neue Indikatoren brauchen keinen
+    chart_win-Branch). symbol/timeframe des Payloads dienen optional der
+    Kontext-Prüfung gegen das aktuelle Chart-Symbol."""
+    active = bool((payload or {}).get("active", False))
+    # 9.5: Eigener ChartButton bleibt synchron (blockSignals gegen Rekursion).
+    if self.btn_peak_grabber is not None and self.btn_peak_grabber.isChecked() != active:
+        self.btn_peak_grabber.blockSignals(True)
+        self.btn_peak_grabber.setChecked(active)
+        self.btn_peak_grabber.blockSignals(False)
+        self._apply_peak_grabber_button_style()
+    # Hinweis: _get_active_plugins() existiert nicht -> self.indicators.
+    for plugin in self.indicators.values():
+        setter = getattr(plugin, "set_button_active", None)
+        if callable(setter):
+            try:
+                setter(active)
+            except Exception as e:
+                print(f"WARN [chart_win] set_button_active fehlgeschlagen: {e}")
+```
+
+### 9.4 OrderPreviewDialog (`analytics/ui/order_preview_dialog.py`)
+
+Schlankes PySide6-Modal: zeigt die Order-Vorschau, **platzierr keine Order**, enthält **kein SQL** (MVVM, Präambel 4). AnalyticsWindow subscribed `grabber_event` und öffnet/aktualisiert den Dialog.
+
+```python
+# analytics/ui/order_preview_dialog.py
+from PySide6.QtWidgets import QDialog, QLabel, QVBoxLayout, QPushButton
+
+
+class OrderPreviewDialog(QDialog):
+    """Order-Vorschau (keine Platzierung, kein SQL – MVVM)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Order-Vorschau (Peak Grabber)")
+        self.setMinimumWidth(420)
+        self._label = QLabel(self)
+        self._close_btn = QPushButton("Schließen", self)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._label)
+        layout.addWidget(self._close_btn)
+        self._close_btn.clicked.connect(self.accept)
+
+    def show_record(self, record) -> None:
+        risk_pct = (abs(record.entry_price - record.sl_price)
+                    / record.entry_price * 100.0)
+        flag = "[UPDATE]" if record.is_update else "[NEW TRIGGER]"
+        self._label.setText(
+            f"{'=' * 56}\n"
+            f"  ORDER PREVIEW {flag}\n"
+            f"  Action   : {record.direction.value} {record.symbol} "
+            f"@ {record.entry_price:.4f}\n"
+            f"  StopLoss : {record.sl_price:.4f} ({risk_pct:.2f}% Risk)\n"
+            f"  Peak Ref : {record.peak_price:.4f} | "
+            f"Yellow Window: {record.is_yellow_window}\n"
+            f"{'=' * 56}\n"
+            f"  Run: {record.run_id} | {record.gate_source}")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+```
+
+```python
+# analytics/ui/analytics_win.py (Subscription, Kontext-Abwärtskompatibel)
+from config.event_bus import event_bus
+from analytics.ui.order_preview_dialog import OrderPreviewDialog
+self._order_preview = None
+
+def _on_grabber_event(self, record) -> None:
+    """Öffnet/aktualisiert das Order-Vorschau-Modal (kein SQL)."""
+    if self._order_preview is None:
+        self._order_preview = OrderPreviewDialog(self)
+    self._order_preview.show_record(record)
+
+event_bus.grabber_event.connect(self._on_grabber_event)
+```
+
+### 9.5 Aufrufender Button im ChartWindow (`chart/chart_win.py`)
+
+Zusätzlich zum AnalyticsWindow-Button (§9.2) erhält das ChartWindow einen eigenen **aufrufenden Button** `btn_peak_grabber`. Beide Buttons emittieren denselben `grabber_toggle`-Dict-Payload; `chart_win` subscribed selbst (§9.3) und routet generisch zu `ind_peak.set_button_active(active)` – **ein einziger Code-Pfad**. Kein Loop: `set_button_active` emittiert nicht zurück.
+
+> **Korrekturen ggü. Entwurf (14.08.2026):** Der Entwurf verwies auf `charts_win`, `btn_inms_1`-Buttons, statisches `EventBus.emit(...)` und `_get_active_plugins()` – keines davon existiert im Code. Verbindlich ist der reale Stand:
+> * Datei/Klasse: `chart/chart_win.py`, `PyTraderChartWindow(QMainWindow)` (kein `charts_win`).
+> * Die Indikator-Buttons heißen `btn_indicator_grid_liquidity` („≋", `ind_fixed_grid_proximity`) und `btn_indicator_ma` („MA") – beide in `horizontalLayout_row1` der `ui/chart_win.ui` (selbe Zeile wie `combo_symbol`/`combo_tf`), **keine** `btn_inms_*`.
+> * `EventBus` ist ein QObject mit Signal-Attributen – **keine** statische `emit`-Methode: `event_bus.grabber_toggle.emit({...})`.
+> * `_get_active_plugins()` existiert nicht – Iteration über `self.indicators.values()` (§9.3).
+> * Attribut: `self.current_tf` (nicht `current_timeframe`), `self.current_symbol` (nicht `current_symbol`-Variante im Entwurf).
+
+#### §1 Icon-Empfehlung
+* Primär: SVG-Icon `resources/icons/peak.svg` (Strichzeichnung z. B. Mountain/Activity/Trending-up) als `QIcon`.
+* Fallback ohne SVG: `self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp)`.
+* Textfallback (Muster Nachbar-Buttons „≋"/„MA"): „⛰" bzw. „PK", 28×28.
+
+#### §2A Button erzeugen (additiv)
+Platzierung: `ui/chart_win.ui`, `horizontalLayout_row1`, **direkt nach `btn_indicator_ma`** (Muster `btn_indicator_grid_liquidity`/`btn_indicator_ma`: 28×28, checkable). Danach im `__init__` per `findChild` greifen (Muster Zeilen 405–407) und verdrahten:
+
+```python
+# chart/chart_win.py (in der Connect-Zone des __init__, nach btn_indicator_ma-Wiring)
+self.btn_peak_grabber = self.ui_widget.findChild(QPushButton, "btn_peak_grabber")
+if self.btn_peak_grabber is not None:
+    self.btn_peak_grabber.setCheckable(True)
+    self.btn_peak_grabber.toggled.connect(self._on_peak_grabber_toggled)
+    self.btn_peak_grabber.installEventFilter(self)  # Rechtsklick -> Einstellungen
+    self._apply_peak_grabber_button_style()
+```
+
+Zusätzlich muss `ind_peak` in die Indikator-Registry aufgenommen werden (additiv, sonst findet §9.3 den Hook nicht):
+
+```python
+# chart/chart_win.py (self.indicators-Dict, additiv)
+self.indicators: Dict[str, BaseIndicator] = {
+    "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
+    "ind_moving_averages": MultiMovingAverageIndicator(),
+    # 22.01: Peak-Grabber (live) - set_button_active-Hook via grabber_toggle.
+    "ind_peak": IndPeak(),
+}
+```
+
+Rechtsklick → `_toggle_settings_dialog("ind_peak")`: `ind_peak` additiv in die `eventFilter`-Tupel-Zeile (Muster Zeilen 479–484) und in `update_indicator_button_style()` (Muster Zeilen 503–510) aufnehmen – sonst bleibt der Button ohne Rechtsklick-/Styling-Anbindung.
+
+#### §2B Handler (EventBus-emit, kein String-emit)
+```python
+# chart/chart_win.py
+from PySide6.QtCore import Slot
+
+@Slot(bool)
+def _on_peak_grabber_toggled(self, active: bool) -> None:
+    """ChartButton -> EventBus. Gleicher Payload wie AnalyticsWindow-Button
+    (9.2); chart_win subscribed selbst (9.3) -> generischer Routing-Pfad.
+    Kein Loop: set_button_active emittiert nicht zurueck."""
+    event_bus.grabber_toggle.emit({
+        "active": bool(active),
+        "symbol": str(self.current_symbol or ""),
+        "timeframe": str(self.current_tf or ""),
+    })
+    self._apply_peak_grabber_button_style()
+```
+
+#### §2C Styling (checked/unchecked)
+Muster `_apply_indicator_button_style` (chart_win.py, `#2e7d32`/`#37474f`), aber **eigene Methode + eigene Akzentfarbe** (Grabber-Modus ≠ Indikator-An/Aus), damit der Zustand sofort sichtbar ist:
+
+```python
+# chart/chart_win.py
+def _apply_peak_grabber_button_style(self) -> None:
+    if self.btn_peak_grabber is None:
+        return
+    active = self.btn_peak_grabber.isChecked()
+    color = "#e65100" if active else "#37474f"  # tiefes Orange = aktiv
+    self.btn_peak_grabber.setStyleSheet(
+        f"background-color: {color}; color: white; font-weight: bold; "
+        f"border-radius: 4px; padding: 3px 10px;")
+```
+
+---
+
+## 10. Akzeptanzkriterien & Validierung (headless)
+
+**Test-Harness:** `test/check_2201_peak_grabber.py` + Block in `test/test.py` (kein UI, kein echter MT5-Sync). Alle Prüfungen gegen eine Test-DB unter `test/`.
+
+| ID | Kriterium | Nachweis |
+|----|-----------|----------|
+| T1 | `grabber_test_results` existiert nach `check_and_init_databases()` in analytics.duckdb, **18 Spalten** + Index `idx_grabber_run` | `information_schema.columns` / `duckdb_indexes()` |
+| T2 | Repository-Roundtrip: `save_records()` (18 Werte, B1) → `fetch_records(run_id)` liefert identische Records | Insert/Fetch-Vergleich |
+| T3 | **Kernel/Live-Parität (B2/B3):** frisches `PeakGrabberLiveState` + frischer Kernel auf identischem Mini-Datensatz liefern identische Trigger/Update-Bars | Vergleich der Signal-Indices |
+| T4 | First-Peak-Skip + IDLE-Start: kein Signal auf Bar 0; Bar 1 erzeugt nur bei New-Peak + Gate ein UPDATE | Kernel-Output auf Mini-Datensatz |
+| T5 | Division-by-Zero-Guard (B6): Datensatz mit `high=0`/`low=0` läuft ohne NaN/Inf durch | `np.isfinite` auf SL/Peak-Arrays |
+| T6 | Ringpuffer (B5): nach N>buffer_size `_push` sind Zeit/SL konsistent, letzter Slot == aktueller SL | `_ordered_buffers()` |
+| T7 | `bootstrap_history` (B4): `cur_high_price/idx/sl` == Batch-Endwerte | Scalar-State nach `_bootstrap_live_state` |
+| T8 | **Outcome-Platzhalter (Frage 4):** alle `save_records()`-Rows haben `outcome_status='PENDING'`, `pnl_r_multiple`/`max_favorable_exc`/`max_adverse_exc` = `NULL` | `fetch_records(run_id)` nach `run_series()` |
+| T9 | Plugin-Discovery: `PluginRegistry().get("srv_peak_finder")` / `("srv_peak_grabber")` gefunden; `ind_peak` erfüllt `BaseIndicator`-API (`indicator_id`/`display_name`/`default_params`/`parameter_schema`/`calculate`) | `py_compile` + Discovery-Test |
+| T10 | EventBus (Frage 5): `grabber_toggle(dict)` emit→Slot (Payload `{"active","symbol","timeframe"}`), `grabber_event(record)` emit→Slot (headless) | Signal-Proxy-Mock |
+| T11 | Serientest-Runner: `run_series()` persistiert Records in Test-DB; **Yellow-Ableitung (Frage 3)**: Fallback `True` ohne Proximity-Signal, Zone-Hit ∧ Zeitfenster bei vorhandener `srv_proximity`-Instanz | `fetch_records(run_id)` + Direktaufruf `_derive_yellow_window` |
+
+Abschluss: `py_compile` aller neuen/geänderten Dateien; **keine UI-Tests** (Präambel 2, harte Regel).
+
+---
+
+## 11. Schritt-für-Schritt Umsetzungsanleitung
+
+1. **Schritt 1 – Modelle:** `analytics/engine/peak_models.py` (§2.2) anlegen (Dataclasses, Enums, `sl_factor_*`-Methoden, 18-Feld-Record).
+2. **Schritt 2 – DDL:** `db/schema_initializer.py` um `grabber_test_results` + `idx_grabber_run` erweitern (§2.3); additive, idempotente Migration (Outcome-Defaults `'PENDING'`/`NULL`, Frage 4).
+3. **Schritt 3 – Kernel:** `analytics/features/definitions/grabber_kernel.py` (§3) anlegen (IDLE-Start, First-Peak-Skip, Guards, 4 Spaces).
+4. **Schritt 4 – `srv_peak_finder`:** Plugin-Service (§4A) in `analytics/features/definitions/` mit Schema, `metadata["category"]="Swing Points/Peak Grabber"`, `capabilities`.
+5. **Schritt 5 – `srv_peak_grabber`:** Plugin-Service (§4B) mit `depends_on=["srv_peak_finder"]`, `_derive_yellow_window` (Frage 3, Fallback `True`), Kernel-Aufruf, feature_store_payload.
+6. **Schritt 6 – (entfällt, Frage 4):** Kein Outcome-Modul in 22.01 – Exit-/Forward-Evaluation folgt als separates Auswertungs-Modul in einem späteren Kapitel.
+7. **Schritt 7 – Repository:** `repositories/grabber_repository.py` (§7) mit 18-Spalten-Batch-Upsert (DbPool, Outcome-Spalten `'PENDING'`/`NULL`).
+8. **Schritt 8 – Indikator:** `chart/indicators/ind_peak.py` (§5) – `BaseIndicator`-API + `PeakGrabberLiveState` + `PeakFinderLive` + Ringpuffer; `srv_proximity`-Zone-Hit-Bereitstellung im `shared_state` sicherstellen; `latest_proximity_record`-Lese-Helfer in `FeatureStoreReader` ergänzen (nur Lese-Methoden, additiv).
+9. **Schritt 9 – UI (Frage 5):** `config/event_bus.py` Signale `grabber_toggle(dict)` + `grabber_event(object)` (§9.1); `analytics/ui/order_preview_dialog.py` (§9.4); `analytics_win.py` Button + Handler (§9.2/9.4); `chart_win.py` Subscription (§9.3) **+ aufrufender Button `btn_peak_grabber` (§9.5, inkl. `ind_peak`-Registry-Eintrag)**.
+10. **Schritt 10 – Runner:** `analytics/engine/peak_backtest_runner.py` (§8); Worker-Anbindung nach `ServiceRunWorker`-Muster mit Concurrency-Guard (Präambel 9).
+11. **Schritt 11 – Validierung:** `test/check_2201_peak_grabber.py` + Block in `test/test.py` (§10 T1–T11), headless; `py_compile`.
+12. **Schritt 12 – Doku:** Implementierungs-Log (§12) erst NACH bestätigter Funktionsfähigkeit durch den Anwender eintragen (Regel 4.5C).
+
+---
+
+## 12. Implementierungs-Log
+
+_(Noch leer – Eintrag erfolgt nach Umsetzung und Freigabe durch den Anwender, Format wie Kapitel 21.03.22.)_
