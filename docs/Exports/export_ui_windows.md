@@ -806,6 +806,16 @@ class EventBus(QObject):
     service_run_started = Signal()
     service_run_finished = Signal()
 
+    # 22.01 (14.08.2026): Peak-Grabber (Frage 5). Der AnalyticsWindow-Button
+    # emittiert grabber_toggle(dict) mit {"active", "symbol", "timeframe"} –
+    # chart_win subscribed und ruft generisch set_button_active(active) auf
+    # allen Indikatoren mit diesem Hook auf (IoC). Live-Trigger/-Updates
+    # emittieren grabber_event(GrabberResultRecord) – das AnalyticsWindow
+    # persistiert über GrabberRepository und öffnet die OrderPreviewDialog
+    # (UI ohne SQL, MVVM).
+    grabber_toggle = Signal(dict)
+    grabber_event = Signal(object)
+
     _instance: ClassVar[Optional["EventBus"]] = None
 
     def __init__(self) -> None:
@@ -1080,6 +1090,34 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
            </property>
            <property name="text">
             <string>MA</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_peak_grabber">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Peak Grabber (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
+           </property>
+           <property name="text">
+            <string>PK</string>
            </property>
           </widget>
          </item>

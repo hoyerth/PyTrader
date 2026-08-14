@@ -1,7 +1,7 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Analytics-UI & Feature Store
 
 > Teil-Export (sachbezogen). Vollständiger Export: export_Full.md
-> Dateien in dieser Datei: 13
+> Dateien in dieser Datei: 14
 
 ## 1. ORDNERSTRUKTUR
 ```
@@ -20,6 +20,7 @@ PyTrader/
             equity_page.py
             heatmap_page.py
             heatmap_widget.py
+            order_preview_dialog.py
             scatter_page.py
             table_page.py
 ```
@@ -5707,6 +5708,130 @@ class FeatureStoreReader:
             return int(row[0])
         return None
 
+    # 22.01 (14.08.2026): Peak-Grabber (Frage 3, Live-Pfad). Lese-Helfer fuer
+    # das Yellow-Flag der aktuellen Bar: liefert den letzten srv_proximity-
+    # Record (bis `up_to_epoch`) mit geparstem feature_data (levels_hit /
+    # in_time_window). Reine Lese-Methode (MVVM, Praeambel 4) – kein Schreib-
+    # zugriff. Der Indikator ind_peak nutzt ihn in _is_current_bar_yellow();
+    # fehlt der Record, greift der Fallback True (Gate offen, Frage 3).
+    def latest_proximity_record(
+        self,
+        symbol: str,
+        timeframe: str,
+        up_to_epoch: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Liefert den letzten srv_proximity-Record (feature_id='srv_proximity')
+        bis zur Wanduhr-Epoch `up_to_epoch` oder None.
+
+        Returns:
+            {"time": Wanduhr-Epoch, "feature_data": geparstes JSON (inkl.
+            schema_version-Default)} – oder None, wenn kein Record existiert.
+        """
+        if not symbol or not timeframe:
+            return None
+        try:
+            up_to = int(up_to_epoch)
+        except (TypeError, ValueError):
+            return None
+        con = self._get_connection()
+        try:
+            row = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND LOWER(TRIM(feature_id)) = 'srv_proximity'
+                  AND EXTRACT('epoch' FROM bar_time)::BIGINT <= ?
+                  AND feature_data IS NOT NULL
+                ORDER BY bar_time DESC
+                LIMIT 1
+            """, [symbol, timeframe, up_to]).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] latest_proximity_record "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row is None or row[0] is None:
+            return None
+        return {
+            "time": int(row[0]),
+            "feature_data": self._normalize_feature_data(row[1]),
+        }
+
+    def fetch_plugin_records(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: str,
+        limit: Optional[int] = None,
+        up_to_epoch: Optional[int] = None,
+        from_epoch: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """22.01d: Liefert die persistierten Records eines Plugin-Services
+        (feature_data + bar_time) aufsteigend nach bar_time.
+
+        Reine Lese-Methode (MVVM, Praeambel 4) - kein Schreibzugriff. Der
+        Indikator ind_peak liest damit die srv_peak_finder/srv_peak_grabber-
+        Daten AUSSCHLIESSLICH aus dem feature_store (keine In-Memory-
+        Fantasie-Linien; User-Anweisung 1: vor Servicelauf keine Zeichnung).
+
+        Args:
+            up_to_epoch: optionale Zeitfenster-Obergrenze (Wanduhr-Epoch,
+                inklusiv) - begrenzt die DB-Last auf den relevanten
+                Chart-Bereich (Records jenseits der letzten df-Bar werden
+                im Render-Payload ohnehin verworfen; Performance-Fix 22.01e).
+            from_epoch: optionale Zeitfenster-Untergrenze (Wanduhr-Epoch,
+                inklusiv) - analog; beide Filter werden als
+                `EXTRACT('epoch' FROM bar_time)::BIGINT` auf die Spalte
+                angewendet (identisch zu latest_proximity_record).
+
+        Returns:
+            Liste von Dicts, je Record = feature_data (geparstes JSON inkl.
+            schema_version-Default) zzgl. `bar_time` (Wanduhr-Epoch, int).
+        """
+        if not symbol or not timeframe or not feature_id:
+            return []
+        if limit is None:
+            limit = 20000
+        conds = ["LOWER(symbol) = LOWER(?)",
+                 "LOWER(timeframe) = LOWER(?)",
+                 "LOWER(TRIM(feature_id)) = LOWER(?)",
+                 "feature_data IS NOT NULL"]
+        params = [symbol, timeframe, feature_id]
+        try:
+            if up_to_epoch is not None:
+                conds.append(
+                    "EXTRACT('epoch' FROM bar_time)::BIGINT <= ?")
+                params.append(int(up_to_epoch))
+            if from_epoch is not None:
+                conds.append(
+                    "EXTRACT('epoch' FROM bar_time)::BIGINT >= ?")
+                params.append(int(from_epoch))
+        except (TypeError, ValueError):
+            return []
+        params.append(limit)
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT, feature_data
+                FROM feature_store
+                WHERE """ + " AND ".join(conds) + """
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_plugin_records "
+                  f"fehlgeschlagen: {e}")
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            fd = self._normalize_feature_data(r[1])
+            if not isinstance(fd, dict):
+                continue
+            rec = dict(fd)
+            rec["bar_time"] = int(r[0])
+            out.append(rec)
+        return out
+
     def exists(self) -> bool:
         """True, wenn die analytics.duckdb-Datei existiert."""
         return os.path.exists(self.db_path)
@@ -6092,6 +6217,10 @@ class AnalyticsWindow(PersistentWindow):
             "color: #c62828; font-weight: bold;")
         self.label_missing_warning.setVisible(False)
         filt.addWidget(self.label_missing_warning)
+        # 22.01c (14.08.2026, Bugfix 3): Der Peak-Grabber-Toggle und die
+        # Order-Vorschau gehoeren ausschliesslich in das Chart-Fenster
+        # (btn_peak_grabber / ind_peak-Prop-Fenster / chart_win-Handler).
+        # Analytics ist seit 22.01b KEIN Konsument von grabber_event mehr.
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -6445,6 +6574,10 @@ class AnalyticsWindow(PersistentWindow):
         # Filterleisten-Zustand aus den VM-Params initial synchronisieren
         # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
         self._sync_mtf_bar_from_params()
+        # 22.01c (14.08.2026, Bugfix 3): grabber_event wird NICHT mehr hier
+        # konsumiert - die Order-Vorschau zeigt ausschliesslich das
+        # ChartWindow (Live-Kontext; der Peak-Indikator emittiert dort via
+        # ind_peak.update_live_candle -> chart_win._on_grabber_event).
 
     @Slot()
     def _on_service_set_changed(self) -> None:
@@ -10823,6 +10956,48 @@ class HeatmapWidget(QWidget):
             symbol="s", symbolSize=10,
             symbolBrush=pg.mkColor(color), symbolPen=pg.mkPen(None))
         self._legend.addItem(item, str(label))
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/order_preview_dialog.py
+```py
+# analytics/ui/order_preview_dialog.py
+from PySide6.QtWidgets import QDialog, QLabel, QVBoxLayout, QPushButton
+
+
+class OrderPreviewDialog(QDialog):
+    """Order-Vorschau (keine Platzierung, kein SQL – MVVM)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Order-Vorschau (Peak Grabber)")
+        self.setMinimumWidth(420)
+        self._label = QLabel(self)
+        self._close_btn = QPushButton("Schließen", self)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._label)
+        layout.addWidget(self._close_btn)
+        self._close_btn.clicked.connect(self.accept)
+
+    def show_record(self, record) -> None:
+        risk_pct = (abs(record.entry_price - record.sl_price)
+                    / record.entry_price * 100.0)
+        flag = "[UPDATE]" if record.is_update else "[NEW TRIGGER]"
+        self._label.setText(
+            f"{'=' * 56}\n"
+            f"  ORDER PREVIEW {flag}\n"
+            f"  Action   : {record.direction.value} {record.symbol} "
+            f"@ {record.entry_price:.4f}\n"
+            f"  StopLoss : {record.sl_price:.4f} ({risk_pct:.2f}% Risk)\n"
+            f"  Peak Ref : {record.peak_price:.4f} | "
+            f"Yellow Window: {record.is_yellow_window}\n"
+            f"{'=' * 56}\n"
+            f"  Run: {record.run_id} | {record.gate_source}")
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
 ```
 

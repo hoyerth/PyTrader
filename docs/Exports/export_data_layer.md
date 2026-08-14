@@ -1,7 +1,7 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Datenzugriff, Sync & Repositories
 
 > Teil-Export (sachbezogen). Vollständiger Export: export_Full.md
-> Dateien in dieser Datei: 10
+> Dateien in dieser Datei: 11
 
 ## 1. ORDNERSTRUKTUR
 ```
@@ -16,6 +16,7 @@ PyTrader/
         schema_initializer.py
     repositories/
         __init__.py
+        grabber_repository.py
         market_data_repository.py
     symbol_repository.py
     window_state_repository.py
@@ -1687,6 +1688,38 @@ def check_and_init_databases() -> None:
     except Exception as e:
         print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
               f"konnte nicht wiederhergestellt werden: {e}")
+    # 22.01 (14.08.2026): Peak-Grabber-Serientests. Die Outcome-Spalten
+    # (outcome_status/pnl_r_multiple/max_favorable_exc/max_adverse_exc)
+    # sind PENDING/NULL-Platzhalter (Frage 4) – die Exit-/Forward-Evaluation
+    # folgt als separates Modul in einem spaeteren Kapitel (peak_outcome.py).
+    # Schreibzugriff ausschliesslich ueber repositories/grabber_repository.py
+    # (DbPool-Muster, Praeambel 4/6). run_id-Konvention: "LIVE-<YYYYmmdd-HHMMSS>"
+    # fuer Live-Laeufe, "BT-<YYYYmmdd-HHMMSS>" fuer Serientests.
+    con_analytics.execute("""
+        CREATE TABLE IF NOT EXISTS grabber_test_results (
+            signal_id           VARCHAR PRIMARY KEY,
+            run_id              VARCHAR NOT NULL,
+            timestamp           TIMESTAMPTZ NOT NULL,   -- Wanduhr-Epochs (Praemabel 8)
+            symbol              VARCHAR NOT NULL,
+            timeframe           VARCHAR NOT NULL,
+            direction           VARCHAR NOT NULL,
+            entry_price         DOUBLE NOT NULL,
+            sl_price            DOUBLE NOT NULL,
+            peak_price          DOUBLE NOT NULL,
+            peak_bar_index      BIGINT NOT NULL,
+            is_update           BOOLEAN NOT NULL,
+            reversal_pct        FLOAT NOT NULL,
+            is_yellow_window    BOOLEAN NOT NULL,
+            gate_source         VARCHAR NOT NULL,
+            outcome_status      VARCHAR DEFAULT 'PENDING',
+            pnl_r_multiple      FLOAT,
+            max_favorable_exc   FLOAT,
+            max_adverse_exc     FLOAT
+        );
+    """)
+    con_analytics.execute(
+        "CREATE INDEX IF NOT EXISTS idx_grabber_run "
+        "ON grabber_test_results (run_id);")
 
     con_app = DbPool.get(DB_APP_DATA)
     con_app.execute("""
@@ -1749,6 +1782,83 @@ repositories-Paket (18.01.02, E3): Exklusive Lese-Repositories.
 
 Importiert nur die db-Basisschicht (E4); kein Import von main.py/db_service.py.
 """
+
+```
+
+--------------------------------------------------
+
+### DATEI: repositories/grabber_repository.py
+```py
+# repositories/grabber_repository.py
+from typing import List
+
+import pandas as pd
+
+from analytics.engine.peak_models import GrabberResultRecord
+from db_service import DB_ANALYTICS, DbPool
+
+
+class GrabberRepository:
+    """Kapselt den DB-Zugriff auf grabber_test_results (MVVM, Präambel 4/6)."""
+
+    def __init__(self, db_path: str = DB_ANALYTICS) -> None:
+        self.db_path = db_path
+
+    _COLS = [
+        "signal_id", "run_id", "timestamp", "symbol", "timeframe",
+        "direction", "entry_price", "sl_price", "peak_price",
+        "peak_bar_index", "is_update", "reversal_pct",
+        "is_yellow_window", "gate_source", "outcome_status",
+        "pnl_r_multiple", "max_favorable_exc", "max_adverse_exc",
+    ]
+
+    def save_records(self, records: List[GrabberResultRecord]) -> int:
+        """Batch-Upsert (18 Spalten, B1). ON CONFLICT aktualisiert nur
+        die Outcome-Felder (nachlaufende Serientest-Bewertung)."""
+        if not records:
+            return 0
+        rows = [
+            (
+                r.signal_id, r.run_id, r.timestamp, r.symbol, r.timeframe,
+                r.direction.value, r.entry_price, r.sl_price, r.peak_price,
+                r.peak_bar_index, r.is_update, r.reversal_pct,
+                r.is_yellow_window, r.gate_source, r.outcome_status,
+                r.pnl_r_multiple, r.max_favorable_exc, r.max_adverse_exc,
+            )
+            for r in records
+        ]
+        con = DbPool.get(self.db_path)
+        df = pd.DataFrame(rows, columns=self._COLS)
+        con.register("df_grabber", df)
+        cols = ", ".join(self._COLS)
+        try:
+            con.execute(f"""
+                INSERT INTO grabber_test_results ({cols})
+                SELECT {cols} FROM df_grabber
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    outcome_status = EXCLUDED.outcome_status,
+                    pnl_r_multiple = EXCLUDED.pnl_r_multiple,
+                    max_favorable_exc = EXCLUDED.max_favorable_exc,
+                    max_adverse_exc = EXCLUDED.max_adverse_exc
+            """)
+        finally:
+            con.unregister("df_grabber")
+        return len(rows)
+
+    def fetch_records(self, run_id: str) -> List[dict]:
+        con = DbPool.get(self.db_path)
+        rows = con.execute(
+            "SELECT * FROM grabber_test_results WHERE run_id = ? "
+            "ORDER BY timestamp", [run_id]).fetchall()
+        cols = [d[0] for d in con.description]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def delete_run(self, run_id: str) -> int:
+        con = DbPool.get(self.db_path)
+        res = con.execute(
+            "DELETE FROM grabber_test_results WHERE run_id = ?",
+            [run_id])
+        return len(res.fetchall() or [])
 
 ```
 

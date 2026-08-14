@@ -1,7 +1,7 @@
 # PROJEKT-ÜBERSICHT: PyTrader — Rest (automatisch ergaenzt)
 
 > Teil-Export (sachbezogen). Vollständiger Export: export_Full.md
-> Dateien in dieser Datei: 8
+> Dateien in dieser Datei: 10
 
 ## 1. ORDNERSTRUKTUR
 ```
@@ -16,6 +16,8 @@ PyTrader/
             mtf_fc_provider.py
             mtf_fc_state.py
             mtf_fc_templates.py
+            peak_backtest_runner.py
+            peak_models.py
 ```
 
 ## 2. QUELLCODE
@@ -1191,6 +1193,266 @@ class MtfFcTemplateStore:
     def delete(self, name: str) -> bool:
         """Entfernt ein Template. Rueckgabe: True, wenn es existierte."""
         return self._templates.pop(name, None) is not None
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/peak_backtest_runner.py
+```py
+# analytics/engine/peak_backtest_runner.py
+"""
+peak_backtest_runner.py - Serientests / Backtest-Orchestrierung (22.01).
+
+Headless Runner: ohlcv -> grid/prox + peak-Services -> DB (PENDING/NULL).
+Laeuft in einem Worker nach dem `ServiceRunWorker`-Muster (Pr�ambel 9),
+ohne UI-Importe (SRP - Rule 2.3).
+
+Pipeline (Frage 3): grid_1 -> prox_1 (Zone-Hits in shared_state) ->
+peak_1 -> grab_1. Der Service `srv_peak_grabber` leitet `is_yellow_window`
+selbst her (Fallback True ohne Proximity-Signal, Frage 3).
+
+Frage 4: Outcome bleibt PENDING-Platzhalter (Exit-/Forward-Evaluation folgt
+in einem spaeteren Kapitel als separates Auswertungs-Modul).
+"""
+import uuid
+from datetime import datetime
+from typing import List, Optional
+
+import pandas as pd
+
+from analytics.engine.peak_models import (
+    GrabberResultRecord,
+    PeakConfig,
+    PeakGrabberConfig,
+    SignalDirection,
+)
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+from analytics.features.feature_builder import (
+    PluginExecutor,
+    prepare_plugin_df,
+)
+from analytics.features.plugins.base_plugin import PluginContext
+from repositories.grabber_repository import GrabberRepository
+
+
+class PeakBacktestRunner:
+    """Serientest: ohlcv -> grid/prox + peak-Services -> DB (PENDING/NULL)."""
+
+    def __init__(self) -> None:
+        self.executor = PluginExecutor()
+        self.evaluator = ServiceSetEvaluator(self.executor)
+        self.repo = GrabberRepository()
+
+    def _load_ohlcv(self, symbol: str, timeframe: str,
+                    limit: Optional[int]) -> Optional[pd.DataFrame]:
+        from analytics.features.feature_builder import FeatureBuilder
+        df = FeatureBuilder().load_ohlcv(symbol, timeframe, limit)
+        return prepare_plugin_df(df)
+
+    def run_series(
+        self,
+        symbol: str,
+        timeframe: str,
+        cfg: PeakGrabberConfig,
+        peak_cfg: PeakConfig = PeakConfig(),
+        limit: Optional[int] = None,
+    ) -> List[GrabberResultRecord]:
+        df = self._load_ohlcv(symbol, timeframe, limit)
+        if df is None or df.empty:
+            return []
+
+        # Frage 3: grid_1 -> prox_1 (Zone-Hits in shared_state) -> peak_1 ->
+        # grab_1. Der Service srv_peak_grabber leitet is_yellow_window selbst
+        # her.
+        definition = {
+            "set_id": "peak_backtest_internal",
+            "display_name": "Peak Backtest (intern)",
+            "execution_order": ["grid_1", "prox_1", "peak_1", "grab_1"],
+            "services": {
+                "grid_1": {
+                    "plugin_id": "srv_grid_lines",
+                    "lookback": int(limit or len(df)),
+                    "params": {"step_size": 0.5, "steps_around": 4},
+                },
+                "prox_1": {
+                    "plugin_id": "srv_proximity",
+                    "lookback": int(limit or len(df)),
+                    "depends_on": ["grid_1"],
+                    "params": {
+                        "visit_pct": 0.05,
+                        "time_window_mins": 5,   # Frage 3: +/-5 min um :00/:30
+                        "use_time_filter": True,
+                    },
+                },
+                "peak_1": {
+                    "plugin_id": "srv_peak_finder",
+                    "lookback": int(limit or len(df)),
+                    "params": {
+                        "sl_offset_pct": peak_cfg.sl_offset_pct,
+                        # 22.01b: Viewback-Fenster (Rolling-Window) - gehoert
+                        # in den PEAK FINDER (nicht in den Grabber).
+                        "viewback_bars": peak_cfg.viewback_bars,
+                    },
+                },
+                "grab_1": {
+                    "plugin_id": "srv_peak_grabber",
+                    "lookback": int(limit or len(df)),
+                    "depends_on": ["peak_1", "prox_1"],
+                    "params": {
+                        "reversal_pct": cfg.reversal_pct,
+                        "min_hold_bars": cfg.min_hold_bars,
+                        "invalidation_bars": cfg.invalidation_bars,
+                        "invalidation_threshold_pct": cfg.invalidation_threshold_pct,
+                        "require_proximity_window": cfg.require_proximity_window,
+                        "sl_offset_pct": peak_cfg.sl_offset_pct,
+                    },
+                },
+            },
+        }
+        context = PluginContext(symbol=symbol, timeframe=timeframe,
+                                mode="batch")
+        results = self.evaluator.execute_set(definition, df, context)
+        grab_recs = ((results.get("grab_1") or {}).get(
+            "feature_store_payload") or {}).get("records") or []
+
+        # Schnellzugriff: bar_time (epoch) -> Zeilen-Index (kein index()-Scan)
+        times = df["time"].to_numpy()
+        idx_by_time = {int(t): i for i, t in enumerate(times)}
+
+        run_id = f"BT-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        records: List[GrabberResultRecord] = []
+        for r in grab_recs:
+            sig = int(r["signal"])
+            is_upd = abs(sig) == 2
+            i = idx_by_time.get(int(r["bar_time"]))
+            if i is None:
+                continue
+            rec = GrabberResultRecord(
+                signal_id=str(uuid.uuid4()),  # stabil (kein hash(), B: Pythons
+                # hash() ist pro Prozess randomisiert)
+                run_id=run_id,
+                timestamp=pd.Timestamp(int(r["bar_time"]),
+                                       unit="s").to_pydatetime(),  # B7
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=SignalDirection.BUY if sig > 0 else SignalDirection.SELL,
+                entry_price=float(df.iloc[i]["close"]),
+                sl_price=float(r["sl_price"]),
+                peak_price=float(r["peak_price"]),
+                peak_bar_index=i,
+                is_update=is_upd,
+                reversal_pct=(0.0 if is_upd else abs(
+                    float(df.iloc[i]["close"]) - float(r["peak_price"]))
+                    / float(r["peak_price"]) * 100.0),
+                is_yellow_window=bool(r["is_yellow_window"]),
+                gate_source="SERIES_UPDATE" if is_upd else "SERIES_TRIGGER",
+                # Frage 4: Outcome bleibt PENDING-Platzhalter (spaeteres Modul)
+                outcome_status="PENDING",
+                pnl_r_multiple=None,
+                max_favorable_exc=None,
+                max_adverse_exc=None,
+            )
+            records.append(rec)
+        self.repo.save_records(records)
+        return records
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/peak_models.py
+```py
+# analytics/engine/peak_models.py
+"""
+Dataclasses, Enums & Configs des Peak-Grabbers (22.01).
+
+Kollokation im Engine-Paket neben `service_models.py`. Die Modelle sind
+bewusst von UI und DB entkoppelt (MVVM, Praeambel 4):
+
+  * `SignalDirection`  – BUY/SELL-Richtung eines Grabber-Records.
+  * `GrabberState`     – Zustands-Enum der State-Machine (IDLE/ARMED/
+                         TRIGGERED/INVALIDATED) – Paritaet zwischen
+                         Kernel (§3) und Live-State (§5).
+  * `PeakConfig`       – SL-Offset des Peak-Finders (sl_factor_*).
+  * `PeakGrabberConfig`– Trigger-/Invalidations-Parameter der State-Machine.
+                         `take_profit_r` / `max_hold_bars` sind RESERVIERTE
+                         Felder (Frage 4) fuer das spaetere Outcome-Modul
+                         (analytics/engine/peak_outcome.py, NICHT 22.01).
+  * `GrabberResultRecord` – 18-Felder-Persistenz-Vertrag (B1) exakt passend
+                         zur DDL `grabber_test_results` (§2.3) und zum
+                         Repository-INSERT (§7).
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+import numpy as np
+
+
+class SignalDirection(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class GrabberState(int, Enum):
+    IDLE = 0
+    ARMED = 1
+    TRIGGERED = 2
+    INVALIDATED = 3
+
+
+@dataclass(frozen=True)
+class PeakConfig:
+    sl_offset_pct: float = 0.15  # SL-Puffer über/unter Peak (%)
+    # 22.01b (14.08.2026, User-Anweisung 4a): Viewback-Fenster des Peak
+    # Finders - wie viele Bars zurueckgeschaut wird, um ein lokales
+    # Hoch/Tief zu isolieren (Rolling-Window). Der SL-Punkt wandert dem
+    # Kurs entlang; Records aelterer Peaks innerhalb des Fensters werden
+    # entfernt (Supersession), Records aelter als viewback bleiben
+    # persistent. Vorgabe: 3 Bars.
+    viewback_bars: int = 3
+
+    def sl_factor_high(self) -> float:
+        return 1.0 + (self.sl_offset_pct / 100.0)
+
+    def sl_factor_low(self) -> float:
+        return 1.0 - (self.sl_offset_pct / 100.0)
+
+
+@dataclass(frozen=True)
+class PeakGrabberConfig:
+    reversal_pct: float = 0.30           # z% Reversal für Trigger
+    min_hold_bars: int = 3               # Min. Bars Haltedauer des Peaks
+    invalidation_bars: int = 5           # x Bars Beobachtungsfenster
+    invalidation_threshold_pct: float = 0.10  # y% Toleranz vor Hard-Invalidation
+    require_proximity_window: bool = True     # Verknüpfung mit Yellow Window
+    take_profit_r: Optional[float] = None     # RESERVIERT (Frage 4): TP in R für späteres Outcome-Modul (None = kein TP)
+    max_hold_bars: int = 100                  # RESERVIERT (Frage 4): Timeout für späteres Outcome-Modul
+
+
+@dataclass
+class GrabberResultRecord:
+    signal_id: str
+    run_id: str
+    timestamp: datetime
+    symbol: str
+    timeframe: str
+    direction: SignalDirection
+    entry_price: float
+    sl_price: float
+    peak_price: float
+    peak_bar_index: int
+    is_update: bool                       # True bei <= y% Aktualisierung
+    reversal_pct: float
+    is_yellow_window: bool
+    gate_source: str                      # GATE_/SERIES_ + UPDATE/TRIGGER
+    outcome_status: str = "PENDING"
+    pnl_r_multiple: Optional[float] = None
+    max_favorable_exc: Optional[float] = None
+    max_adverse_exc: Optional[float] = None
 
 ```
 
