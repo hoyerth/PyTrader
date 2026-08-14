@@ -2473,6 +2473,55 @@ class FeatureStoreReader:
             return int(row[0])
         return None
 
+    # 22.01 (14.08.2026): Peak-Grabber (Frage 3, Live-Pfad). Lese-Helfer fuer
+    # das Yellow-Flag der aktuellen Bar: liefert den letzten srv_proximity-
+    # Record (bis `up_to_epoch`) mit geparstem feature_data (levels_hit /
+    # in_time_window). Reine Lese-Methode (MVVM, Praeambel 4) – kein Schreib-
+    # zugriff. Der Indikator ind_peak nutzt ihn in _is_current_bar_yellow();
+    # fehlt der Record, greift der Fallback True (Gate offen, Frage 3).
+    def latest_proximity_record(
+        self,
+        symbol: str,
+        timeframe: str,
+        up_to_epoch: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Liefert den letzten srv_proximity-Record (feature_id='srv_proximity')
+        bis zur Wanduhr-Epoch `up_to_epoch` oder None.
+
+        Returns:
+            {"time": Wanduhr-Epoch, "feature_data": geparstes JSON (inkl.
+            schema_version-Default)} – oder None, wenn kein Record existiert.
+        """
+        if not symbol or not timeframe:
+            return None
+        try:
+            up_to = int(up_to_epoch)
+        except (TypeError, ValueError):
+            return None
+        con = self._get_connection()
+        try:
+            row = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND LOWER(TRIM(feature_id)) = 'srv_proximity'
+                  AND EXTRACT('epoch' FROM bar_time)::BIGINT <= ?
+                  AND feature_data IS NOT NULL
+                ORDER BY bar_time DESC
+                LIMIT 1
+            """, [symbol, timeframe, up_to]).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] latest_proximity_record "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row is None or row[0] is None:
+            return None
+        return {
+            "time": int(row[0]),
+            "feature_data": self._normalize_feature_data(row[1]),
+        }
+
     def exists(self) -> bool:
         """True, wenn die analytics.duckdb-Datei existiert."""
         return os.path.exists(self.db_path)
