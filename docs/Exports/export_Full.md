@@ -36411,7 +36411,7 @@ db/schema_initializer (check_and_init_databases).
 
 import threading
 import time
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import duckdb
 import pandas as pd
@@ -36517,27 +36517,50 @@ def get_latest_timestamp(con: duckdb.DuckDBPyConnection, symbol: str, timeframe_
     return res[0] if res and res[0] is not None else None
 
 
-def sync_market_data() -> Set[Tuple[str, str]]:
-    """Synchronisiert die MT5-Historie (VOLLIMPORT oder UPDATE) je Symbol/Timeframe."""
+def sync_market_data(target_pairs: Optional[Set[Tuple[str, str]]] = None) -> Set[Tuple[str, str]]:
+    """Synchronisiert die MT5-Historie (VOLLIMPORT oder UPDATE) je Symbol/Timeframe.
+
+    Phase 21.03.22 (Full Market-Data Sync Button): Optionaler `target_pairs`-
+    Filter. Ist das Set uebergeben (nicht None), werden exakt diese
+    (symbol, timeframe)-Paare synchronisiert (statt des Standard-Rasters);
+    bei None/leer greift der Fallback auf das bisherige Standard-Raster
+    (SYMBOLS x get_timeframes()). Der Delta-Sync-Abgleich via
+    get_latest_timestamp() bleibt pro Paar voll erhalten.
+    """
     import MetaTrader5 as _mt5
     timeframes = get_timeframes()
 
     check_and_init_databases()
     check_mt5_connection()
 
-    print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(SYMBOLS)} über {len(timeframes)} Timeframes...")
+    # 21.03.22: Paar-Filter (UPPER-normalisiert, unbekannte Timeframes
+    # werden ignoriert); None/leer -> Standard-Raster (Abwaertskompatibilitaet).
+    filtered_pairs: Optional[Set[Tuple[str, str]]] = None
+    symbols_to_sync: List[str] = list(SYMBOLS)
+    if target_pairs:
+        filtered_pairs = {
+            (str(s).upper(), str(tf).upper())
+            for s, tf in target_pairs
+            if str(tf).upper() in timeframes
+        }
+        symbols_to_sync = sorted({s for s, _ in filtered_pairs})
+
+    print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(symbols_to_sync)} über {len(timeframes)} Timeframes...")
 
     start_time_total = time.perf_counter()
     total_bars_downloaded = 0
     updated_pairs: Set[Tuple[str, str]] = set()
 
-    for symbol in SYMBOLS:
+    for symbol in symbols_to_sync:
         print(f"\n--- Synchronisiere {symbol} ---")
         # Connection pro Symbol öffnen/schließen, damit andere Threads (LiveTickWorker)
         # zwischendurch ebenfalls auf die DB zugreifen können
         con = db_connect(DB_MARKET_DATA)
         try:
             for tf_str, tf_mt5 in timeframes.items():
+                # 21.03.22: Bei target_pairs-Filter exakt diese Paare abgleichen.
+                if filtered_pairs is not None and (symbol, tf_str) not in filtered_pairs:
+                    continue
                 tf_start = time.perf_counter()
 
                 last_time = get_latest_timestamp(con, symbol, tf_str)
@@ -37237,7 +37260,7 @@ Custom-Level-Eingabefelder). Importiert nur db/db_pool (E4).
 
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from db.db_pool import DB_MARKET_DATA, DbPool, db_connect
 
@@ -37392,6 +37415,26 @@ class MarketDataRepository:
                     time.sleep(0.1)
 
         return candles, precision
+
+    def get_all_stored_symbol_tf_pairs(self) -> Set[Tuple[str, str]]:
+        """Liefert alle (symbol, timeframe)-Paare, für die bereits Daten in ohlcv_bars existieren.
+
+        Phase 21.03.22 (Full Market-Data Sync Button): Grundlage fuer den
+        manuellen Sync aller lokal gespeicherten Paare im ServiceWindow.
+        UPPER-normalisiert (DISTINCT); Muster: DbPool.get (Thread-local,
+        kein manuelles close(), konsistent mit get_symbol_precision).
+        """
+        try:
+            con = DbPool.get(self.db_path)
+            rows = con.execute("""
+                SELECT DISTINCT UPPER(symbol), UPPER(timeframe)
+                FROM ohlcv_bars
+                WHERE symbol IS NOT NULL AND timeframe IS NOT NULL
+            """).fetchall()
+            return {(str(r[0]), str(r[1])) for r in rows if r[0] and r[1]}
+        except Exception as e:
+            print(f"WARN [MarketDataRepository] Pair-Abfrage fehlgeschlagen: {e}")
+            return set()
 
 ```
 
@@ -45449,6 +45492,18 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.main_splitter.setSizes([460, 820])
 
             self.top_row.addWidget(self.main_splitter)
+            # 21.03.22 (Full Market-Data Sync Button): Der Button wird hier
+            # nur ERZEUGT (Parent self.ui) - platziert wird er weiter unten
+            # in der Filter-/Symbol-Zeile (layout_symbol) LINKS neben dem
+            # Papierkorb (btn_trash_sets). Waehrend des Syncs pausiert der
+            # 45s-Auto-Sync (Concurrency-Guard).
+            self.btn_sync_all_market = QPushButton(
+                "🔄 Sync Alle Daten", self.ui)
+            self.btn_sync_all_market.setToolTip(
+                "Aktualisiert ALLE in market_data.duckdb gespeicherten "
+                "Symbol:Timeframe-Paare aus MT5."
+            )
+            self._sync_worker = None
             self.central_layout.insertLayout(idx, self.top_row)
         # Fenstergroesse (15.02): 1280 x 800 als Default – Single Source of
         # Truth ist die ui/service_win.ui-Geometrie (der QUiLoader wendet sie
@@ -45495,6 +45550,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
         if self.btn_trash_sets:
             self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
+        # 21.03.22 (Full Market-Data Sync Button): Manueller Full-Sync aller
+        # gespeicherten Symbol:TF-Paare (Concurrency-Guard pausiert den
+        # 45s-sync_timer waehrend des Laufs).
+        if self.btn_sync_all_market:
+            self.btn_sync_all_market.clicked.connect(
+                self._on_sync_all_market_clicked)
         # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste (Speichern /
         # Speichern & Ausführen) – siehe _save_params_from_panel /
         # _save_and_run_from_panel.
@@ -45537,6 +45598,21 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if layout_symbol is not None and self.combo_symbol is not None:
             idx = layout_symbol.indexOf(self.combo_symbol)
             layout_symbol.insertWidget(idx + 1, self.btn_symbol_fav)
+        # 21.03.22 (Full Market-Data Sync Button): Links neben dem Papierkorb
+        # (btn_trash_sets). Damit Papierkorb + Sync-Button rechtsbuendig mit
+        # dem rechten Ende der Parameter-Box abschliessen, wird der bestehende
+        # horizontalSpacer der .ui zum Stretch-Spacer (setStretch) - die
+        # Gruppe rutscht damit an den rechten Fensterrand (= Param-Box-Rand).
+        if layout_symbol is not None and self.btn_trash_sets is not None:
+            btn_sync = getattr(self, "btn_sync_all_market", None)
+            if btn_sync is not None:
+                for _i in range(layout_symbol.count()):
+                    _item = layout_symbol.itemAt(_i)
+                    if _item is not None and _item.spacerItem() is not None:
+                        layout_symbol.setStretch(_i, 1)
+                        break
+                idx = layout_symbol.indexOf(self.btn_trash_sets)
+                layout_symbol.insertWidget(idx, btn_sync)
         self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
         # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
@@ -46737,6 +46813,51 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                                 h = None
                         return pid, h
         return (str(service_id) if service_id else None), None
+
+    # -------------------------------------------------------------------------
+    # Phase 21.03.22: Full Market-Data Sync Button (alle Paare aktualisieren)
+    # -------------------------------------------------------------------------
+
+    @Slot()
+    def _on_sync_all_market_clicked(self) -> None:
+        """Startet den Full-Sync aller in market_data.duckdb vorhandenen Symbol:TF-Paare."""
+        _worker = getattr(self, "_sync_worker", None)
+        if _worker is not None and _qt_valid(_worker) and _worker.isRunning():
+            return
+
+        from repositories.market_data_repository import MarketDataRepository
+        all_pairs = MarketDataRepository().get_all_stored_symbol_tf_pairs()
+
+        if not all_pairs:
+            return
+
+        # 45s-Auto-Sync pausieren via Concurrency-Guard (EventBus, IoC)
+        from config.event_bus import event_bus
+        event_bus.service_run_started.emit()
+
+        self.btn_sync_all_market.setEnabled(False)
+        self.btn_sync_all_market.setText("⏳ Sync läuft...")
+
+        from workers.data_sync_worker import DataSyncWorker
+        self._sync_worker = DataSyncWorker(pairs=all_pairs, parent=self)
+        self._sync_worker.sync_completed.connect(self._on_sync_all_completed)
+        self._sync_worker.finished.connect(self._sync_worker.deleteLater)
+        self._sync_worker.start()
+
+    @Slot(set)
+    def _on_sync_all_completed(self, updated_pairs: set) -> None:
+        """Nach Abschluss des Full-Syncs: Auto-Sync fortsetzen & UI refreshen."""
+        from config.event_bus import event_bus
+        event_bus.service_run_finished.emit()
+
+        self.btn_sync_all_market.setEnabled(True)
+        self.btn_sync_all_market.setText("🔄 Sync Alle Daten")
+
+        self._refresh_badge_bar()
+        if hasattr(self, "service_selector"):
+            self.service_selector.refresh()
+        # Nach deleteLater (finished-Signal) keine stale C++-Referenz halten.
+        self._sync_worker = None
 
     def _refresh_badge_bar(self, plugin_id: Optional[str] = None,
                            instance_hash: Optional[str] = None) -> None:
@@ -50336,7 +50457,7 @@ Voll-/Update-Import der MT5-Historie in einem QThread aus und emittiert die
 aktualisierten Symbol/Timeframe-Paare. Keine UI-Logik (SRP).
 """
 
-from typing import Set, Tuple
+from typing import Optional, Set, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -50346,12 +50467,26 @@ from data_sync.mt5_sync_service import sync_market_data
 class DataSyncWorker(QThread):
     """Führt den Hintergrund-Sync für alle historischen Daten aus."""
 
-    sync_completed = Signal(object)
+    sync_completed = Signal(set)
+
+    def __init__(self, pairs: Optional[Set[Tuple[str, str]]] = None,
+                 parent=None) -> None:
+        """Initialisiert den Sync-Worker.
+
+        Phase 21.03.22 (Full Market-Data Sync Button): Optionales `pairs`-Set
+        an (symbol, timeframe)-Paaren. Wird es uebergeben (nicht None),
+        synchronisiert sync_market_data() exakt diese Paare statt des
+        Standard-Rasters (SYMBOLS x Timeframes). Ohne Angabe ist das
+        Verhalten unveraendert (Abwaertskompatibilitaet zu main.py).
+        """
+        super().__init__(parent)
+        self.pairs = pairs
 
     def run(self) -> None:
         """Führt den Hintergrund-Sync für alle historischen Daten aus."""
         try:
-            updated_pairs: Set[Tuple[str, str]] = sync_market_data()
+            updated_pairs: Set[Tuple[str, str]] = sync_market_data(
+                target_pairs=self.pairs)
             self.sync_completed.emit(updated_pairs)
         except Exception as e:
             print(f"❌ Fehler im DataSyncWorker: {e}")
