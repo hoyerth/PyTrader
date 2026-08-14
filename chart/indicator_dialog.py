@@ -266,14 +266,14 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
 			return ""
 
 	def _item_list_names(self) -> List[str]:
-		return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
+		return [s.get("display_name") or "" for s in self.dlg._indicator_sets()]
 
 	def _item_exists(self, name: str) -> bool:
 		"""True, wenn ein ANDERES Set bereits diesen Namen trägt."""
 		current = self._item_current_id()
 		return any(
 			(s.get("display_name") or "") == name and s.get("set_id") != current
-			for s in self.dlg.set_repo.list_sets()
+			for s in self.dlg._indicator_sets()
 		)
 
 	def _item_save_as(self, name: str) -> Optional[str]:
@@ -290,7 +290,7 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
 			return None
 		definition["display_name"] = name
 		existing = next(
-			(s for s in self.dlg.set_repo.list_sets()
+			(s for s in self.dlg._indicator_sets()
 			 if (s.get("display_name") or "") == name
 			 and s.get("set_id") != self._item_current_id()),
 			None,
@@ -1216,7 +1216,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.combo_service_set.blockSignals(True)
 		self.combo_service_set.clear()
 		self.combo_service_set.addItem("- kein Set -", "")
-		for s in self.set_repo.list_sets():
+		for s in self._indicator_sets():
 			label = s.get("display_name") or s.get("set_id") or "Unbenannt"
 			self.combo_service_set.addItem(label, s.get("set_id"))
 		if prefer:
@@ -1225,6 +1225,41 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				self.combo_service_set.setCurrentIndex(idx)
 		self.combo_service_set.blockSignals(False)
 		self._on_service_set_changed()
+
+	def _indicator_sets(self) -> List[Dict[str, Any]]:
+		"""22.01b (14.08.2026, User-Anweisung 2): Indikator-gebundene Set-Auswahl.
+
+		Strenger Filter fuer das Prop-Fenster: nur Sets, deren
+		`indicator_id == self.indicator.indicator_id` ODER die ausschliesslich
+		Plugins dieses Indikators enthalten (alle service plugin_ids ⊆
+		indicator.service_plugin_ids). Freie Sets und Sets anderer Indikatoren
+		bleiben im globalen service_win sichtbar, NICHT hier (Konsequenz fuer
+		analytics_win: bleibt ungefiltert - die Analytics-Engine liest Daten
+		direkt aus dem feature_store, indikator-unabhaengig).
+		"""
+		try:
+			all_sets = self.set_repo.list_sets()
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Set-Liste nicht ladbar: {e}")
+			return []
+		ind_id = str(getattr(self.indicator, "indicator_id", "") or "")
+		own_plugins = {
+			str(p) for p in (getattr(self.indicator, "service_plugin_ids", None) or [])
+		}
+		if not ind_id and not own_plugins:
+			return []  # Indikator ohne Service-Zuordnung -> keine Sets anbieten
+		out: List[Dict[str, Any]] = []
+		for s in all_sets:
+			if str(s.get("indicator_id") or "") == ind_id:
+				out.append(s)
+				continue
+			svcs = s.get("services") or {}
+			pids = [str((cfg or {}).get("plugin_id") or "")
+			        for cfg in svcs.values() if isinstance(cfg, dict)]
+			pids = [p for p in pids if p]
+			if pids and all(p in own_plugins for p in pids):
+				out.append(s)
+		return out
 
 	def _on_service_set_changed(self) -> None:
 		"""Lädt das gewählte Set in den Editor + baut die Service-Seiten neu."""

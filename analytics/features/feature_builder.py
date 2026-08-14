@@ -664,11 +664,11 @@ class FeatureBuilder:
         Clones in DuckDB getrennt und einzeln auswertbar sind (Multi-Clone-
         Vergleich, §4). feature_id bleibt plugin_id (Q1).
 
-        payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
+        payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}],
+                  "delete_bar_times": [epoch, ...] (optional)}
         """
         records = payload.get("records") or []
-        if not records:
-            return 0
+        delete_bar_times = payload.get("delete_bar_times") or []
 
         feature_id = payload.get("feature_id")
         plugin_version = payload.get("plugin_version", "1.0.0")
@@ -680,6 +680,18 @@ class FeatureBuilder:
             own_connection = True
 
         try:
+            # 22.01b (User-Anweisung 4a): Supersedierte SL-Punkte (Viewback)
+            # VOR dem Upsert loeschen - der Peak Finder meldet ueber
+            # delete_bar_times, welche bar_times nicht mehr "bestehend" sind.
+            if delete_bar_times:
+                self._delete_plugin_bar_times(
+                    con, symbol, timeframe, feature_id,
+                    delete_bar_times, instance_hash)
+            if not records:
+                if delete_bar_times:
+                    invalidate_feature_cache(symbol, timeframe)
+                return 0
+
             rows = []
             for rec in records:
                 if not isinstance(rec, dict) or "bar_time" not in rec:
@@ -749,6 +761,56 @@ class FeatureBuilder:
         finally:
             if own_connection:
                 con.close()
+
+    def _delete_plugin_bar_times(
+        self,
+        con,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str],
+        bar_times: List[int],
+        instance_hash: Optional[str] = None,
+    ) -> int:
+        """22.01b (User-Anweisung 4a): Loescht feature_store-Rows einer
+        Plugin-Instanz fuer konkrete bar_times (Viewback-Supersession des
+        Peak Finders). Scoped auf symbol/timeframe/feature_id + instance_hash
+        (falls gesetzt - identisch zum Write-Scope von store_plugin_payload).
+
+        NUR im Schreib-/Store-Kontext (FeatureBuilder) - der
+        FeatureStoreReader bleibt 100 % read-only (MVVM-Invariante).
+
+        Returns:
+            Anzahl der geloeschten Rows (0 bei leerem Input/keinem Treffer).
+        """
+        if not bar_times or not feature_id:
+            return 0
+        try:
+            dt_vals = [_to_utc_datetime(t) for t in bar_times]
+            df_del = pd.DataFrame({"bar_time": dt_vals})
+            con.register("df_del", df_del)
+            try:
+                if instance_hash:
+                    res = con.execute(
+                        "DELETE FROM feature_store "
+                        "WHERE symbol = ? AND timeframe = ? AND feature_id = ? "
+                        "AND instance_hash = ? "
+                        "AND bar_time IN (SELECT bar_time FROM df_del) "
+                        "RETURNING feature_id",
+                        [symbol, timeframe, feature_id, instance_hash])
+                else:
+                    res = con.execute(
+                        "DELETE FROM feature_store "
+                        "WHERE symbol = ? AND timeframe = ? AND feature_id = ? "
+                        "AND bar_time IN (SELECT bar_time FROM df_del) "
+                        "RETURNING feature_id",
+                        [symbol, timeframe, feature_id])
+                return len((res.fetchall() or []) if res is not None else [])
+            finally:
+                con.unregister("df_del")
+        except Exception as e:
+            # Defensiv: Loeschfehler duerfen den Upsert-Pfad nicht brechen.
+            print(f"WARN [FeatureBuilder] delete_bar_times fehlgeschlagen: {e}")
+            return 0
 
     def purge_instance_data(self, instance_hash: str, plugin_id: str = "",
                             params: Optional[Dict[str, Any]] = None,

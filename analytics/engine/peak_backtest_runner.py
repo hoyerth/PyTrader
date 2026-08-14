@@ -86,7 +86,12 @@ class PeakBacktestRunner:
                 "peak_1": {
                     "plugin_id": "srv_peak_finder",
                     "lookback": int(limit or len(df)),
-                    "params": {"sl_offset_pct": peak_cfg.sl_offset_pct},
+                    "params": {
+                        "sl_offset_pct": peak_cfg.sl_offset_pct,
+                        # 22.01b: Viewback-Fenster (Rolling-Window) - gehoert
+                        # in den PEAK FINDER (nicht in den Grabber).
+                        "viewback_bars": peak_cfg.viewback_bars,
+                    },
                 },
                 "grab_1": {
                     "plugin_id": "srv_peak_grabber",

@@ -42,6 +42,13 @@ class GrabberState(int, Enum):
 @dataclass(frozen=True)
 class PeakConfig:
     sl_offset_pct: float = 0.15  # SL-Puffer über/unter Peak (%)
+    # 22.01b (14.08.2026, User-Anweisung 4a): Viewback-Fenster des Peak
+    # Finders - wie viele Bars zurueckgeschaut wird, um ein lokales
+    # Hoch/Tief zu isolieren (Rolling-Window). Der SL-Punkt wandert dem
+    # Kurs entlang; Records aelterer Peaks innerhalb des Fensters werden
+    # entfernt (Supersession), Records aelter als viewback bleiben
+    # persistent. Vorgabe: 3 Bars.
+    viewback_bars: int = 3
 
     def sl_factor_high(self) -> float:
         return 1.0 + (self.sl_offset_pct / 100.0)

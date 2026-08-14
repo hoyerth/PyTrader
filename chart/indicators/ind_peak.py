@@ -1,4 +1,5 @@
 # chart/indicators/ind_peak.py (Teil 1: Live-State-Machine)
+from collections import deque
 import numpy as np
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -13,10 +14,21 @@ from analytics.engine.peak_models import (
 
 
 class PeakFinderLive:
-    """O(1) Live-Peak-Tracker (Scalar-State, Parität zu compute_batch)."""
+    """Live-Peak-Tracker mit Rolling-Window (viewback_bars).
+
+    22.01b (User-Anweisung 4a): Paritaet zum Batch-Service. cur_high/
+    cur_low sind die Extrema des gleitenden Fensters (letzte viewback_bars
+    Bars). update_scalar() meldet is_new_h/is_new_l genau dann, wenn sich
+    das Fenster-Extremum aendert (neuer Peak ODER Expiry des alten
+    Extremums) - der SL-Punkt wandert also dem Kurs entlang. Die
+    Richtungs-Flags h_dir/l_dir (+1/-1) unterscheiden beides, damit der
+    Grabber Expiry-Events unterdruecken kann (22.01b/4b Grabber-Rework).
+    """
 
     def __init__(self, cfg: PeakConfig) -> None:
         self.cfg = cfg
+        self._win_h: "deque" = deque()  # (bar_idx, high), vorn = Maximum
+        self._win_l: "deque" = deque()  # (bar_idx, low),  vorn = Minimum
         self.cur_high_price: float = np.nan
         self.cur_high_idx: int = -1
         self.cur_high_sl: float = np.nan
@@ -24,7 +36,12 @@ class PeakFinderLive:
         self.cur_low_idx: int = -1
         self.cur_low_sl: float = np.nan
 
+    def _viewback(self) -> int:
+        return max(1, int(getattr(self.cfg, "viewback_bars", 3) or 3))
+
     def reset(self) -> None:
+        self._win_h.clear()
+        self._win_l.clear()
         self.cur_high_price = np.nan
         self.cur_high_idx = -1
         self.cur_high_sl = np.nan
@@ -32,31 +49,78 @@ class PeakFinderLive:
         self.cur_low_idx = -1
         self.cur_low_sl = np.nan
 
+    def seed_window(self, entries) -> None:
+        """B4 (22.01b): befuellt das Fenster aus dem Batch-Window-Tail
+        ([(bar_idx, high, low), ...]) - Paritaet Batch -> Live."""
+        self._win_h.clear()
+        self._win_l.clear()
+        for (idx, h, l) in (entries or []):
+            idx = int(idx)
+            h = float(h)
+            l = float(l)
+            while self._win_h and self._win_h[-1][1] <= h:
+                self._win_h.pop()
+            self._win_h.append((idx, h))
+            while self._win_l and self._win_l[-1][1] >= l:
+                self._win_l.pop()
+            self._win_l.append((idx, l))
+        if self._win_h:
+            self.cur_high_price = float(self._win_h[0][1])
+            self.cur_high_idx = int(self._win_h[0][0])
+            self.cur_high_sl = self.cur_high_price * self.cfg.sl_factor_high()
+        if self._win_l:
+            self.cur_low_price = float(self._win_l[0][1])
+            self.cur_low_idx = int(self._win_l[0][0])
+            self.cur_low_sl = self.cur_low_price * self.cfg.sl_factor_low()
+
     def set_state(self, high: float, high_idx: int, low: float,
                   low_idx: int) -> None:
-        """B4: Übernahme der Batch-Endwerte (bootstrap_history)."""
-        self.cur_high_price = float(high)
-        self.cur_high_idx = int(high_idx)
-        self.cur_high_sl = float(high) * self.cfg.sl_factor_high()
-        self.cur_low_price = float(low)
-        self.cur_low_idx = int(low_idx)
-        self.cur_low_sl = float(low) * self.cfg.sl_factor_low()
+        """B4 (Fallback ohne Window-Tail): Einzelpunkt-Bootstrap aus den
+        Batch-Endwerten (der letzte Record ist dann das Fenster-Extremum)."""
+        self.seed_window([(high_idx, high, low)])
 
     def update_scalar(self, bar_idx: int, high: float,
-                      low: float) -> Tuple[bool, bool]:
-        is_new_h = False
-        is_new_l = False
-        if np.isnan(self.cur_high_price) or high > self.cur_high_price:
-            self.cur_high_price = high
-            self.cur_high_idx = bar_idx
-            self.cur_high_sl = high * self.cfg.sl_factor_high()
-            is_new_h = True
-        if np.isnan(self.cur_low_price) or low < self.cur_low_price:
-            self.cur_low_price = low
-            self.cur_low_idx = bar_idx
-            self.cur_low_sl = low * self.cfg.sl_factor_low()
-            is_new_l = True
-        return is_new_h, is_new_l
+                      low: float) -> Tuple[bool, bool, int, int]:
+        vb = self._viewback()
+        # Expiry: alte Fenster-Eintraege ausserhalb des Rolling-Windows
+        while self._win_h and self._win_h[0][0] <= bar_idx - vb:
+            self._win_h.popleft()
+        while self._win_l and self._win_l[0][0] <= bar_idx - vb:
+            self._win_l.popleft()
+        # Insert (monotone Deques)
+        while self._win_h and self._win_h[-1][1] <= high:
+            self._win_h.pop()
+        self._win_h.append((bar_idx, high))
+        while self._win_l and self._win_l[-1][1] >= low:
+            self._win_l.pop()
+        self._win_l.append((bar_idx, low))
+        new_h = float(self._win_h[0][1])
+        new_l = float(self._win_l[0][1])
+
+        prev_h = self.cur_high_price
+        prev_l = self.cur_low_price
+        is_new_h = np.isnan(prev_h) or new_h != prev_h
+        is_new_l = np.isnan(prev_l) or new_l != prev_l
+        # 22.01b/4b (Grabber-Rework): Richtungs-Flags unterscheiden einen
+        # ECHTEN neuen Peak (h_dir=+1 Hoch steigt / l_dir=-1 Tief faellt)
+        # von einer Expiry (h_dir=-1 / l_dir=+1: das alte Extremum verlaesst
+        # das Rolling-Fenster). Der Grabber loest nur bei echten neuen Peaks
+        # Events aus; Expiry aktualisiert die SL-Referenz stumm.
+        h_dir = 0
+        l_dir = 0
+        if is_new_h:
+            self.cur_high_price = new_h
+            self.cur_high_idx = int(self._win_h[0][0])
+            self.cur_high_sl = new_h * self.cfg.sl_factor_high()
+            if not np.isnan(prev_h):
+                h_dir = 1 if new_h > prev_h else -1
+        if is_new_l:
+            self.cur_low_price = new_l
+            self.cur_low_idx = int(self._win_l[0][0])
+            self.cur_low_sl = new_l * self.cfg.sl_factor_low()
+            if not np.isnan(prev_l):
+                l_dir = -1 if new_l < prev_l else 1
+        return is_new_h, is_new_l, h_dir, l_dir
 
 
 class PeakGrabberLiveState:
@@ -100,7 +164,8 @@ class PeakGrabberLiveState:
         prev_l_price = self.finder.cur_low_price
         prev_l_idx = self.finder.cur_low_idx
 
-        is_new_h, is_new_l = self.finder.update_scalar(bar_idx, high, low)
+        is_new_h, is_new_l, h_dir, l_dir = self.finder.update_scalar(
+            bar_idx, high, low)
 
         gate = self.is_btn_active and (
             is_yellow_window if self.cfg.require_proximity_window else True
@@ -108,8 +173,14 @@ class PeakGrabberLiveState:
         if not gate:
             return events
 
-        # --- Short Side (Peak = laufendes High) --------------------------
-        if is_new_h and not np.isnan(prev_h_price):
+        # --- Short Side (Peak = laufendes Hoch) --------------------------
+        # 22.01b/4b (Grabber-Rework): NUR ein ECHTER neuer Fenster-Peak
+        # (h_dir > 0: Fenster-Hoch steigt) loest die Arm-/Update-/
+        # Invalidate-Logik aus. Expiry (h_dir < 0: der alte Peak verlaesst
+        # das Rolling-Fenster, das Fenster-Hoch faellt) aktualisiert die
+        # SL-Referenz in update_scalar stumm - KEIN Event (Kernel-Paritaet,
+        # der kumulative Kernel kennt keine Expiry).
+        if h_dir > 0 and not np.isnan(prev_h_price):
             bars_h = bar_idx - prev_h_idx
             breach_pct = ((high - prev_h_price) / prev_h_price) * 100.0
             if bars_h <= self.cfg.invalidation_bars:
@@ -124,7 +195,7 @@ class PeakGrabberLiveState:
                     self.state_short = GrabberState.INVALIDATED
             else:
                 self.state_short = GrabberState.ARMED
-        elif self.state_short == GrabberState.ARMED:
+        if self.state_short == GrabberState.ARMED:
             bars_h = bar_idx - self.finder.cur_high_idx
             rev = (((self.finder.cur_high_price - close)
                     / self.finder.cur_high_price) * 100.0
@@ -136,8 +207,11 @@ class PeakGrabberLiveState:
                     self.finder.cur_high_sl, self.finder.cur_high_price,
                     bar_idx, False, rev, is_yellow_window, "GATE_TRIGGER"))
 
-        # --- Long Side (Peak = laufendes Low) ----------------------------
-        if is_new_l and not np.isnan(prev_l_price):
+        # --- Long Side (Peak = laufendes Tief) ---------------------------
+        # Analog: NUR ein ECHTER neuer Fenster-Peak (l_dir < 0: Fenster-Tief
+        # faellt) loest die Logik aus; Expiry (l_dir > 0: Fenster-Tief
+        # steigt) bleibt stumm.
+        if l_dir < 0 and not np.isnan(prev_l_price):
             bars_l = bar_idx - prev_l_idx
             breach_pct = ((prev_l_price - low) / prev_l_price) * 100.0
             if bars_l <= self.cfg.invalidation_bars:
@@ -152,7 +226,7 @@ class PeakGrabberLiveState:
                     self.state_long = GrabberState.INVALIDATED
             else:
                 self.state_long = GrabberState.ARMED
-        elif self.state_long == GrabberState.ARMED:
+        if self.state_long == GrabberState.ARMED:
             bars_l = bar_idx - self.finder.cur_low_idx
             rev = (((close - self.finder.cur_low_price)
                     / self.finder.cur_low_price) * 100.0
@@ -208,6 +282,10 @@ from analytics.engine.set_evaluator import ServiceSetEvaluator
 
 _PEAK_SCHEMA: Dict[str, Dict[str, Any]] = {
     "sl_offset_pct": {"type": "float", "default": 0.15, "min": 0.0, "max": 10.0, "step": 0.01, "description": "SL-Puffer über/unter Peak (%)"},
+    # 22.01b (User-Anweisung 4a): Viewback-Fenster des Peak Finders - der
+    # SL-Punkt wandert dem Kurs entlang; aeltere Signale innerhalb des
+    # Fensters werden entfernt, aeltere bleiben persistent.
+    "viewback_bars": {"type": "int", "default": 3, "min": 1, "max": 10000, "step": 1, "description": "Viewback: Bars zurueckschauen fuer lokales Hoch/Tief"},
     "reversal_pct": {"type": "float", "default": 0.30, "min": 0.01, "max": 10.0, "step": 0.01, "description": "Reversal % für Trigger (z)"},
     "min_hold_bars": {"type": "int", "default": 3, "min": 1, "max": 1000, "step": 1, "description": "Min. Bars Haltedauer des Peaks"},
     "invalidation_bars": {"type": "int", "default": 5, "min": 1, "max": 10000, "step": 1, "description": "Beobachtungsfenster x (Bars)"},
@@ -243,6 +321,12 @@ class IndPeak(BaseIndicator):
         self._buf_sl_low = np.full(self._buffer_size, np.nan, dtype=np.float64)
         self._filled: int = 0
         self._known_times: set = set()  # New-Candle-Erkennung (gerundete Zeit)
+        # 22.01b: Live-Bar-Zaehler (Rolling-Window-Expiry pro BAR statt pro
+        # Tick). Basis = letzter Batch-Bar-Index; wird bei jeder neuen
+        # Live-Candle (gerundete Zeit wechselt) um 1 erhoeht.
+        self._live_bar_base: int = 0
+        self._live_bar_idx: Optional[int] = None
+        self._last_live_rounded: Optional[int] = None
 
         self._live_state: Optional[PeakGrabberLiveState] = None
 
@@ -355,7 +439,12 @@ class IndPeak(BaseIndicator):
                 "peak_1": {
                     "plugin_id": "srv_peak_finder",
                     "lookback": int(params.get("lookback") or 1000),
-                    "params": {"sl_offset_pct": params.get("sl_offset_pct", 0.15)},
+                    "params": {
+                        "sl_offset_pct": params.get("sl_offset_pct", 0.15),
+                        # 22.01b: Viewback-Fenster (Rolling-Window) - gehoert
+                        # in den PEAK FINDER (nicht in den Grabber).
+                        "viewback_bars": params.get("viewback_bars", 3),
+                    },
                 },
                 "grab_1": {
                     "plugin_id": "srv_peak_grabber",
@@ -446,7 +535,12 @@ class IndPeak(BaseIndicator):
                         })
 
             # Bootstrap des Live-States (B4): Batch-Endwerte übernehmen.
-            self._bootstrap_live_state(finder_recs, p)
+            # 22.01b: Zusaetzlich das Rolling-Window-Tail aus dem
+            # shared_state des Finders (Paritaet Batch -> Live).
+            window_tail = ((context.shared_state or {}).get(
+                "peak_1") or {}).get("window_tail")
+            self._bootstrap_live_state(finder_recs, p,
+                                       window_tail=window_tail)
 
             return {
                 "lines": lines,
@@ -463,13 +557,22 @@ class IndPeak(BaseIndicator):
             return empty
 
     def _bootstrap_live_state(self, finder_recs: List[Dict[str, Any]],
-                              p: Dict[str, Any]) -> None:
-        """B4: übernimmt die letzten Batch-Peaks in den Live-Scalar-State."""
-        if not finder_recs:
+                              p: Dict[str, Any],
+                              window_tail: Optional[List] = None) -> None:
+        """B4: übernimmt die letzten Batch-Peaks in den Live-Rolling-State.
+
+        22.01b: Bevorzugt wird das Rolling-Window-Tail des Finders
+        (window_tail = [(bar_idx, high, low), ...] der letzten viewback
+        Bars) via seed_window() uebernommen - exakte Paritaet Batch -> Live.
+        Fallback (Alt/Tests): Einzelpunkt-Bootstrap aus dem letzten Record.
+        """
+        if not finder_recs and not window_tail:
             return
-        last = finder_recs[-1]
-        peak_cfg = PeakConfig(sl_offset_pct=float(
-            p.get("sl_offset_pct", 0.15)))
+        last = finder_recs[-1] if finder_recs else None
+        peak_cfg = PeakConfig(
+            sl_offset_pct=float(p.get("sl_offset_pct", 0.15)),
+            viewback_bars=int(p.get("viewback_bars", 3)),
+        )
         if self._live_state is None:
             finder_live = PeakFinderLive(peak_cfg)
             self._live_state = PeakGrabberLiveState(
@@ -486,17 +589,28 @@ class IndPeak(BaseIndicator):
                 self._symbol or "",
                 self._timeframe or "",
             )
+        if window_tail:
+            self._live_state.finder.seed_window(window_tail)
+            self._live_bar_base = int(window_tail[-1][0])
+        elif last is not None:
+            # Fallback: der letzte Record ist das aktuelle Fenster-Extremum.
+            self._live_state.finder.set_state(
+                float(last["peak_high"]), len(finder_recs) - 1,
+                float(last["peak_low"]), len(finder_recs) - 1)
+            self._live_bar_base = max(0, len(finder_recs) - 1)
+        # 22.01b: Live-Bar-Zaehler zuruecksetzen (naechste Live-Candle startet
+        # bei base+1 bzw. base, je nachdem ob die Batch-Endbar bereits die
+        # offene Bar enthaelt - selbsterklaerend nach wenigen Bars).
+        self._live_bar_idx = None
+        self._last_live_rounded = None
         # Ringpuffer mit History-SL füllen (nur die letzten buffer_size).
-        n = min(len(finder_recs), self._buffer_size)
-        self._filled = 0
-        self._head = 0
-        for r in finder_recs[-n:]:
-            self._push(int(r["bar_time"]),
-                       float(r["sl_high"]), float(r["sl_low"]))
-        last_high = float(last["peak_high"])
-        last_low = float(last["peak_low"])
-        self._live_state.finder.set_state(
-            last_high, len(finder_recs) - 1, last_low, len(finder_recs) - 1)
+        if finder_recs:
+            n = min(len(finder_recs), self._buffer_size)
+            self._filled = 0
+            self._head = 0
+            for r in finder_recs[-n:]:
+                self._push(int(r["bar_time"]),
+                           float(r["sl_high"]), float(r["sl_low"]))
 
     # ----------------------------------------------------- Live-Tick-Pfad
     def update_live_candle(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -518,6 +632,16 @@ class IndPeak(BaseIndicator):
         from db_service import TF_SECONDS_MAP
         t_sec = TF_SECONDS_MAP.get(str(self._timeframe or "").upper(), 60)
         rounded = ts - (ts % t_sec)
+        # 22.01b: Live-Bar-Zaehler - genau EINE Index-Erhoehung pro neuer
+        # Candle (Rolling-Window-Expiry des Finders muss BAR-basiert sein,
+        # nicht Tick-basiert; Ticks derselben Bar teilen sich den bar_idx).
+        if rounded != self._last_live_rounded:
+            if self._last_live_rounded is not None:
+                if self._live_bar_idx is None:
+                    self._live_bar_idx = self._live_bar_base + 1
+                else:
+                    self._live_bar_idx += 1
+            self._last_live_rounded = rounded
         if rounded not in self._known_times:
             self._known_times.add(rounded)
             if self._on_new_candle is not None:
@@ -526,7 +650,11 @@ class IndPeak(BaseIndicator):
                 except Exception:
                     pass
 
-        bar_idx = max(self._filled, self._live_state.finder.cur_high_idx + 1)
+        if self._live_bar_idx is None:
+            bar_idx = self._live_bar_base + 1
+            self._live_bar_idx = bar_idx
+        else:
+            bar_idx = self._live_bar_idx
         records = self._live_state.process_tick_or_bar(
             bar_idx, high, low, close,
             pd.Timestamp(ts, unit="s").to_pydatetime(),  # B7

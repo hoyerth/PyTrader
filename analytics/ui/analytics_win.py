@@ -367,16 +367,10 @@ class AnalyticsWindow(PersistentWindow):
             "color: #c62828; font-weight: bold;")
         self.label_missing_warning.setVisible(False)
         filt.addWidget(self.label_missing_warning)
-        # 22.01 (14.08.2026): Peak-Grabber (Frage 5) - Toggle-Button.
-        # Das ChartWindow schaltet ueber event_bus.grabber_toggle den
-        # ind_peak-Indikator (Trigger/Updates im Yellow Window).
-        self.btn_grabber_peak = QPushButton("🎯 Peak Grabber", self)
-        self.btn_grabber_peak.setCheckable(True)
-        self.btn_grabber_peak.setToolTip(
-            "Aktiviert den Peak-Grabber (Trigger/Updates im "
-            "Yellow Window). An/Aus wird an das ChartWindow "
-            "weitergeleitet (EventBus, IoC).")
-        filt.addWidget(self.btn_grabber_peak)
+        # 22.01b (14.08.2026, User-Anweisung 1): Der Peak-Grabber-Toggle
+        # wurde ENTFERNT - er gehoert ausschliesslich in das Chart-Fenster
+        # (btn_peak_grabber / ind_peak-Prop-Fenster). Analytics bleibt
+        # passiver Konsument von grabber_event (Order-Vorschau).
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -730,21 +724,11 @@ class AnalyticsWindow(PersistentWindow):
         # Filterleisten-Zustand aus den VM-Params initial synchronisieren
         # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
         self._sync_mtf_bar_from_params()
-        # 22.01 (14.08.2026): Peak-Grabber (Frage 5) - Toggle-Bindung
-        # und Grabber-Event (IoC via EventBus, kein Direct-Call).
-        self.btn_grabber_peak.toggled.connect(self._on_grabber_toggled)
+        # 22.01b (14.08.2026, User-Anweisung 1): Die Toggle-Bindung des
+        # entfernten btn_grabber_peak entfaellt - der Grabber wird nur noch
+        # ueber das ChartWindow aktiviert. grabber_event bleibt verbunden
+        # (Order-Vorschau fuer Live-Trigger, passiver Konsument).
         event_bus.grabber_event.connect(self._on_grabber_event)
-
-    # 22.01 (14.08.2026): Peak-Grabber - Button-Toggle -> EventBus.
-    # Das Payload traegt die REALEN Combo-Werte (combo_symbol/combo_tf),
-    # damit das ChartWindow den Indikator korrekt schalten kann.
-    def _on_grabber_toggled(self, checked: bool) -> None:
-        payload = {
-            "active": bool(checked),
-            "symbol": self.combo_symbol.currentText() or "SILVER",
-            "timeframe": self.combo_tf.currentText() or "M1",
-        }
-        event_bus.grabber_toggle.emit(payload)
 
     # 22.01 (14.08.2026): Ein GrabberResultRecord ist fertig - die
     # Order-Vorschau oeffnen (lazy Singleton, MVVM: keine SQL-Persistenz
