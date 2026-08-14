@@ -113,12 +113,13 @@ function updateLiveCandle(json) {
         lastClosePrice = c.close;
         updateCountdownDisplay();
 
-        // P14-03-E (D.3): GENERISCHES LIVE-OVERLAY RENDERING – Dispatcher routet
+                // P14-03-E (D.3): GENERISCHES LIVE-OVERLAY RENDERING – Dispatcher routet
         // je kind (Open/Closed), ohne kompletten Chart-Rebuild und ohne die
-        // historischen Overlays zu verwerfen.
-        if (c.overlays && Array.isArray(c.overlays) && c.overlays.length > 0) {
-            applyLiveOverlays(c.overlays);
-        }
+        // historischen Overlays zu verwerfen. 22.01c (Bugfix 1): IMMER aufrufen
+        // (auch mit leerem Satz), damit alte Live-Circles aus dem Cache fallen,
+        // sobald ein Overlay-Serie deaktiviert wird (z. B. Grabber-Button aus
+        // -> keine Peak-SL-Kreise mehr sichtbar).
+        applyLiveOverlays(c.overlays || []);
     } catch(e) {}
 }
 
@@ -127,25 +128,30 @@ function updateLiveCandle(json) {
 function applyLiveOverlays(overlays) {
     if (typeof renderGridCircles !== 'function') return;
     var circles = [];
-    for (var i = 0; i < overlays.length; i++) {
+    for (var i = 0; i < (overlays || []).length; i++) {
         var o = overlays[i];
         if (o && o.kind === 'circle' && typeof o.time === 'number' &&
             typeof o.price === 'number' && !isNaN(o.time) && !isNaN(o.price)) {
             circles.push(o);
         }
     }
-    if (circles.length === 0) return;
-
     // P14-03-E (Flacker-Fix): Change-Detection – wenn sich der Live-Circle-Satz
     // gegenüber dem letzten Tick NICHT geändert hat (gleiche Level-Hits, gleiche
     // Farben), wird kein Re-Render ausgelöst. Identische Sichtbarkeit, aber kein
     // Canvas-Rebuild -> behebt das Tick-Flackern bei erfüllter Proximity.
+    // 22.01c: Auch der LEERE Satz wird erfasst – der erste leere Aufruf nach
+    // aktiven Overlays räumt die alten Live-Circles auf, weitere bleiben stumm.
     var nowJson = JSON.stringify(circles);
     if (nowJson === _lastLiveCirclesJson) return;
     _lastLiveCirclesJson = nowJson;
 
     // Merged-Render: nur die Live-Zeit ersetzen, historische Circles behalten.
-    var liveTime = circles[0].time;
+    // 22.01c: Kein Live-Circle mehr -> alte Live-Zeit (falls bekannt) entfernen.
+    var liveTime = (circles.length > 0) ? circles[0].time : _lastLiveOverlayTime;
+    if (liveTime === null) {
+        renderGridCircles(_gridCirclesCache);
+        return;
+    }
     // P14-03-E: Bei neuer Live-Bar zusätzlich die Kreise der VORHERIGEN Live-Zeit
     // entfernen (sonst bleiben veraltete Live-Kreise der Vor-Bar im Cache hängen).
     if (_lastLiveOverlayTime !== null && _lastLiveOverlayTime !== liveTime) {

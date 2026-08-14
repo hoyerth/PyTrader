@@ -46,6 +46,13 @@ except ImportError:
     from indicators.ind_peak import IndPeak
     from indicator_dialog import IndicatorSettingsDialog
 
+# 22.01c (Bugfix 3): Order-Vorschau gehoert ins CHART-Fenster (Live-Kontext),
+# nicht ins Analytics. Der Dialog ist ein schlankes Modal ohne Order/SQL (MVVM).
+try:
+    from analytics.ui.order_preview_dialog import OrderPreviewDialog
+except ImportError:
+    OrderPreviewDialog = None
+
 # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
 # Die UI-Klasse haelt nur eine Referenz auf das Backend-Puffer-Objekt.
 try:
@@ -466,6 +473,11 @@ class PyTraderChartWindow(QMainWindow):
         # an alle Indikatoren mit set_button_active-Hook (IoC, kein
         # Indikator-Sonderfall, kein `if ind_id == ...`-Branch).
         event_bus.grabber_toggle.connect(self._on_grabber_toggle)
+        # 22.01c (Bugfix 3): grabber_event (Live-Trigger des Peak-Indikators)
+        # wird im CHART-Fenster konsumiert -> Order-Vorschau. Analytics ist
+        # kein Konsument mehr (dort fehlt der Live-Kontext).
+        if OrderPreviewDialog is not None:
+            event_bus.grabber_event.connect(self._on_grabber_event)
         self.update_indicator_button_style()
 
         self.web_view = QWebEngineView()
@@ -567,6 +579,22 @@ class PyTraderChartWindow(QMainWindow):
                     setter(active)
                 except Exception as e:
                     print(f"WARN [chart_win] set_button_active fehlgeschlagen: {e}")
+
+    # 22.01c (Bugfix 3): Live-Trigger (grabber_event, vom Peak-Indikator via
+    # ind_peak.update_live_candle emittiert) -> Order-Vorschau im CHART.
+    # Lazy Singleton: mehrere Trigger kurz nacheinander aktualisieren denselben
+    # Dialog (kein Doppel-Fenster, kein Crash - das erste Fenster bleibt offen).
+    # MVVM: keine Order-Platzierung und kein SQL hier (Persistenz uebernimmt der
+    # Grabber-Konsument vor dem Emit).
+    def _on_grabber_event(self, record: object) -> None:
+        if OrderPreviewDialog is None:
+            return
+        if not hasattr(self, "_order_preview") or self._order_preview is None:
+            self._order_preview = OrderPreviewDialog(self)
+        try:
+            self._order_preview.show_record(record)
+        except Exception as e:
+            print(f"WARN [chart_win] Order-Vorschau fehlgeschlagen: {e}")
 
     # 22.01 (§9.5 §2B): ChartButton -> EventBus. Gleicher Payload wie
     # AnalyticsWindow-Button (§9.2); chart_win subscribed selbst (§9.3)

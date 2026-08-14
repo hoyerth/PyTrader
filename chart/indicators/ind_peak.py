@@ -691,25 +691,38 @@ class IndPeak(BaseIndicator):
 
     # ---------------------------------------------------- Overlay-Hooks (P14-03)
     def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Live-SL-Punkte als generische Overlays (kind='circle')."""
+        """Live-SL-Punkte als generische Overlays (kind='circle').
+
+        22.01c (Bugfix 1): Gating - die Live-Kreise werden NUR gezeichnet,
+        wenn der Grabber-Modus aktiv ist (btn_peak_grabber / grabber_toggle
+        -> set_button_active) UND die jeweilige SL-Serie sichtbar ist
+        (show_sl_high / show_sl_low). Vorher wurden die Kreise unabhaengig
+        vom Toggle-Zustand bei jedem Tick gezeichnet, sobald cur_*_sl != NaN
+        war -> "Peak-Linien trotz deaktiviertem Grabber". Der Finder/die
+        State-Machine laeuft weiter (update_live_candle), nur das Zeichnen
+        wird gegated.
+        """
         self.update_live_candle(candle)
         if self._live_state is None:
             return []
+        if not self._live_state.is_btn_active:
+            return []
+        p = self._last_params
         overlays = []
-        if not np.isnan(self._live_state.finder.cur_high_sl):
+        if p.get("show_sl_high", True) and not np.isnan(self._live_state.finder.cur_high_sl):
             overlays.append({
                 "kind": "circle", "layer": self.indicator_id,
                 "time": int(candle.get("time", 0)),
                 "price": float(self._live_state.finder.cur_high_sl),
-                "color": self._last_params.get("sl_high_color", "#EF5350"),
+                "color": p.get("sl_high_color", "#EF5350"),
                 "priority": 10,
             })
-        if not np.isnan(self._live_state.finder.cur_low_sl):
+        if p.get("show_sl_low", True) and not np.isnan(self._live_state.finder.cur_low_sl):
             overlays.append({
                 "kind": "circle", "layer": self.indicator_id,
                 "time": int(candle.get("time", 0)),
                 "price": float(self._live_state.finder.cur_low_sl),
-                "color": self._last_params.get("sl_low_color", "#26A69A"),
+                "color": p.get("sl_low_color", "#26A69A"),
                 "priority": 10,
             })
         return overlays

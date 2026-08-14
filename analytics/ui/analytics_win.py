@@ -60,7 +60,6 @@ from analytics.ui.heatmap_page import HeatmapPage
 from analytics.ui.scatter_page import ScatterPage
 from analytics.ui.distribution_page import DistributionPage
 from analytics.ui.equity_page import EquityPage
-from analytics.ui.order_preview_dialog import OrderPreviewDialog
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
@@ -367,10 +366,10 @@ class AnalyticsWindow(PersistentWindow):
             "color: #c62828; font-weight: bold;")
         self.label_missing_warning.setVisible(False)
         filt.addWidget(self.label_missing_warning)
-        # 22.01b (14.08.2026, User-Anweisung 1): Der Peak-Grabber-Toggle
-        # wurde ENTFERNT - er gehoert ausschliesslich in das Chart-Fenster
-        # (btn_peak_grabber / ind_peak-Prop-Fenster). Analytics bleibt
-        # passiver Konsument von grabber_event (Order-Vorschau).
+        # 22.01c (14.08.2026, Bugfix 3): Der Peak-Grabber-Toggle und die
+        # Order-Vorschau gehoeren ausschliesslich in das Chart-Fenster
+        # (btn_peak_grabber / ind_peak-Prop-Fenster / chart_win-Handler).
+        # Analytics ist seit 22.01b KEIN Konsument von grabber_event mehr.
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -724,19 +723,10 @@ class AnalyticsWindow(PersistentWindow):
         # Filterleisten-Zustand aus den VM-Params initial synchronisieren
         # (data_tf='multi', agg_tf='auto', Range aus Profil/Workspace).
         self._sync_mtf_bar_from_params()
-        # 22.01b (14.08.2026, User-Anweisung 1): Die Toggle-Bindung des
-        # entfernten btn_grabber_peak entfaellt - der Grabber wird nur noch
-        # ueber das ChartWindow aktiviert. grabber_event bleibt verbunden
-        # (Order-Vorschau fuer Live-Trigger, passiver Konsument).
-        event_bus.grabber_event.connect(self._on_grabber_event)
-
-    # 22.01 (14.08.2026): Ein GrabberResultRecord ist fertig - die
-    # Order-Vorschau oeffnen (lazy Singleton, MVVM: keine SQL-Persistenz
-    # hier, die uebernimmt das ChartWindow/GrabberRepository vor dem Emit).
-    def _on_grabber_event(self, record: object) -> None:
-        if not hasattr(self, "_order_preview"):
-            self._order_preview = OrderPreviewDialog(self)
-        self._order_preview.show_record(record)
+        # 22.01c (14.08.2026, Bugfix 3): grabber_event wird NICHT mehr hier
+        # konsumiert - die Order-Vorschau zeigt ausschliesslich das
+        # ChartWindow (Live-Kontext; der Peak-Indikator emittiert dort via
+        # ind_peak.update_live_candle -> chart_win._on_grabber_event).
 
     @Slot()
     def _on_service_set_changed(self) -> None:
