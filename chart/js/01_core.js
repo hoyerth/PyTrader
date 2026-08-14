@@ -4,6 +4,11 @@
 window.onerror = function(m, s, l, c, e) {
     if (m === "Script error." && !s) return true;
     console.error(`[JS ERROR] ${m} | L${l}:${c}`);
+    // 22.01i: Stack mitloggen - zeigt beim Reproduzieren die exakte
+    // LWC-Call-Site (z. B. SeriesBarColorer vs. SeriesMarkersPaneView).
+    if (e && e.stack) {
+        console.error("[JS ERROR] Stack:", String(e.stack).split("\n").slice(0, 8).join("\n"));
+    }
     return true;
 };
 

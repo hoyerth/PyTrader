@@ -200,7 +200,35 @@ function applyOlderDataChunk(payload) {
         // D5: Render-Delta anwenden – Python sendet das VOLLSTÄNDIG neu
         // berechnete Fenster-Payload; JS ersetzt Linien/Marker nahtlos über
         // die bestehenden inkrementellen Serien-Registrys.
+        // 22.01i (Bugfix "Value is null"): Wie applyChartRenderPayload werden
+        // Overlay-Punkte ausserhalb des Kerzenbereichs VOR dem Rendering
+        // verworfen. Der Chunk-Pfad hatte diesen Guard bisher NICHT – Punkte
+        // mit ungemappten Roh-Epochs (bar_time nicht in der Zeit-Map) konnten
+        // als riesige Zeiten (~1.7e9) zwischen kont-Zeiten landen; LWC crasht
+        // dann in PlotList._bsearch mit "Value is null" (unsortierte Daten).
         var rp = payload.chartRenderPayloadDelta || {};
+        var _cb = _overlayTimeBounds();
+        if (_cb) {
+            if (Array.isArray(rp.lines)) {
+                var _keptLines = [];
+                for (var _li = 0; _li < rp.lines.length; _li++) {
+                    var _line = rp.lines[_li];
+                    if (!_line || !Array.isArray(_line.data)) continue;
+                    _line.data = _line.data.filter(function(pt) {
+                        return pt && typeof pt.time === 'number' &&
+                            pt.time >= _cb.min && pt.time <= _cb.max;
+                    });
+                    if (_line.data.length > 0) _keptLines.push(_line);
+                }
+                rp.lines = _keptLines;
+            }
+            if (Array.isArray(rp.hit_circles)) {
+                rp.hit_circles = rp.hit_circles.filter(function(c) {
+                    return c && typeof c.time === 'number' &&
+                        c.time >= _cb.min && c.time <= _cb.max;
+                });
+            }
+        }
         if (rp.lines) {
             try { renderLineSeries(rp.lines); } catch(e) {
                 console.warn('[TwoTier] lines fehlgeschlagen:', e.message || e);

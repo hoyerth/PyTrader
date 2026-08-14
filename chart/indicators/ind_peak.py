@@ -520,6 +520,16 @@ class IndPeak(BaseIndicator):
             # 22.01e (Performance-Fix): Records auf das df-Fenster begrenzen
             # (up_to_epoch = letzte df-Bar) - aeltere Records werden im
             # Render-Payload ohnehin verworfen, spart DB-Last/JSON-Parsing.
+            # 22.01h (Bugfix "Objekte vor vorhandenen Kerzen"): ZUSAETZLICH
+            # from_epoch = aelteste df-Bar. OHNE Untergrenze liest der
+            # Indikator ALLE historischen Records (z.B. 2013 auf H1/D1 aus
+            # frueheren Service-Laeufen mit vollem Historien-Scan; die
+            # Services persistieren den kompletten Lookback-Bereich ohne
+            # Range-Cleanup). Nur der df-Bereich ist darstellbar - Records
+            # davor wuerden als LWC-Phantom-Slots weit links der Kerzen
+            # erscheinen (Objekte vor 2024). Der Tier-1-Filter in
+            # _collect_render_payload faengt zwar auch, aber der db-seitige
+            # Zuschnitt reduziert zusaetzlich DB-Last/JSON-Parsing.
             try:
                 if self._reader is not None:
                     reader = self._reader
@@ -527,10 +537,13 @@ class IndPeak(BaseIndicator):
                     from analytics.engine.feature_store_reader import FeatureStoreReader
                     reader = FeatureStoreReader()
                 up_to = int(max(df["time"]))
+                from_epoch = int(min(df["time"]))
                 finder_recs = reader.fetch_plugin_records(
-                    symbol, timeframe, "srv_peak_finder", up_to_epoch=up_to)
+                    symbol, timeframe, "srv_peak_finder",
+                    up_to_epoch=up_to, from_epoch=from_epoch)
                 grabber_recs = reader.fetch_plugin_records(
-                    symbol, timeframe, "srv_peak_grabber", up_to_epoch=up_to)
+                    symbol, timeframe, "srv_peak_grabber",
+                    up_to_epoch=up_to, from_epoch=from_epoch)
             except Exception as e:
                 print(f"[IndPeak] Feature-Store-Lesen fehlgeschlagen: {e}")
                 return empty

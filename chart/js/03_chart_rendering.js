@@ -204,11 +204,36 @@ function renderLineSeries(linesArray) {
         }
     }
 
-    // 2) Upsert pro Linie.
+    // 22.01i (Bugfix "Value is null | L7:797"): LWC v5 `setData` verlangt NACH
+    // ZEIT SORTIERTE Serien-Daten - `PlotList.setData` speichert die Reihen in
+    // Input-Reihenfolge, aber `PlotList.valueAt()` (fuer den SeriesColorer)
+    // binärsucht nach dem sortierten row.index. Unsortierte Zeitpunkte (z. B.
+    // gemischte kont-Zeiten mit ungemappten Roh-Epochs aus dem Record-Bestand,
+    // oder Doppel-Zeitstempel) fuehren beim Rendern zu `ensureNotNull(null)` ->
+    // "Value is null"-Crash (L7:797). Hier defensiv sortieren (aufsteigend) und
+    // Duplikate entfernen (letzter Wert gewinnt - exakt LWC-Row-Overwrite).
     for (var m = 0; m < data.length; m++) {
         var line = data[m];
         if (!line || !line.id || !line.data) continue;
-        var series = _activeLineSeries[line.id];
+        var pts = line.data.filter(function(p) {
+        return p && typeof p.time === 'number' && isFinite(p.time);
+    }).sort(function(a, b) {
+        return a.time - b.time;
+    });
+    if (pts.length !== line.data.length) {
+        line.data = pts;
+    } else {
+        var dedup = [];
+        for (var di = 0; di < pts.length; di++) {
+            if (dedup.length > 0 && dedup[dedup.length - 1].time === pts[di].time) {
+                dedup[dedup.length - 1] = pts[di];
+            } else {
+                dedup.push(pts[di]);
+            }
+        }
+        line.data = dedup;
+    }
+    var series = _activeLineSeries[line.id];
         // 22.01g (Bugfix 2): lineType 'withGaps' – LWC-v5-Default 'Simple'
         // verbindet auch null-Punkte (verbindet zwei SL-Striche diagonal).
         // Mit WithGaps erzeugt ein {time, value: null}-Punkt eine ECHTE
@@ -257,9 +282,49 @@ function renderLineSeries(linesArray) {
 //   payload.hit_circles -> renderMarkers()    (Marker/Circles)
 // Keys werden nur geroutet, wenn sie im Payload vorhanden sind (leere Arrays
 // clearen den jeweiligen Layer). Kein Feld-Dispatch, kein kind-Feld (F1).
+// 22.01h (Bugfix "Objekte vor vorhandenen Kerzen"): Defensiver Bereichs-Guard.
+// Liefert den aktuellen Kerzen-Zeitbereich (kontinuierliche Zeiten) aus
+// rawCandleData - oder null, wenn noch keine Kerzen geladen sind.
+// Ursache des Bugs: Python-Filter (_collect_render_payload) haengt an JS-
+// Fenster-Bounds, die in manchen Pfaden fehlen koennen. Zusaetzlich verhindert
+// der Guard LWC-Phantom-Slots (leere Timescale-Slots links/rechts der Kerzen),
+// wenn ein Overlay-Punkt ausserhalb des Kerzenbereichs liegt (z.B. historische
+// Service-Records aus frueheren Laeufen mit vollem Historien-Scan).
+function _overlayTimeBounds() {
+    if (!rawCandleData || rawCandleData.length === 0) return null;
+    return {
+        min: rawCandleData[0].time,
+        max: rawCandleData[rawCandleData.length - 1].time
+    };
+}
+
 function applyChartRenderPayload(payload) {
     if (!chart || !candleSeries) return;
     var p = (typeof payload === 'string') ? JSON.parse(payload) : (payload || {});
+    // 22.01h: Overlay-Punkte ausserhalb des Kerzenbereichs verwerfen, BEVOR
+    // sie an die Render-Primitive gehen (Defense-in-Depth; s. Kommentar oben).
+    var bounds = _overlayTimeBounds();
+    if (bounds) {
+        if (Array.isArray(p.lines)) {
+            var keptLines = [];
+            for (var li = 0; li < p.lines.length; li++) {
+                var line = p.lines[li];
+                if (!line || !Array.isArray(line.data)) continue;
+                line.data = line.data.filter(function(pt) {
+                    return pt && typeof pt.time === 'number' &&
+                        pt.time >= bounds.min && pt.time <= bounds.max;
+                });
+                if (line.data.length > 0) keptLines.push(line);
+            }
+            p.lines = keptLines;
+        }
+        if (Array.isArray(p.hit_circles)) {
+            p.hit_circles = p.hit_circles.filter(function(c) {
+                return c && typeof c.time === 'number' &&
+                    c.time >= bounds.min && c.time <= bounds.max;
+            });
+        }
+    }
     if (Object.prototype.hasOwnProperty.call(p, 'price_lines')) {
         try { renderPriceLines(p.price_lines || []); } catch(e) {
             console.warn('[applyChartRenderPayload] price_lines fehlgeschlagen:', e.message || e);

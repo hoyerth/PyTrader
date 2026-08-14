@@ -981,6 +981,14 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is None or self.df_data.empty:
             return
 
+        # 22.01h (Bugfix "Objekte vor vorhandenen Kerzen"): Die Tier-1-Fenster-
+        # Bounds sind die Filter-Grenze gegen LWC-Phantom-Slots. Sind sie None
+        # (Toggle/Param-Aenderung VOR dem ersten vollstaendigen Refresh), geht
+        # der komplette historische Record-Bestand ungefiltert an JS (Objekte
+        # vor den aeltesten Kerzen). Defensiv aus dem Datenpuffer ableiten.
+        if (self._js_window_first_real is None
+                or self._js_window_last_real is None):
+            self._derive_js_window_bounds_from_buffer()
         payload = self._collect_render_payload(
             time_from=self._js_window_first_real,
             time_to=self._js_window_last_real)
@@ -992,6 +1000,30 @@ class PyTraderChartWindow(QMainWindow):
 
         # JSON-Encoding im Hintergrund (F4: Threading-Muster exakt beibehalten)
         self._serialize_and_render_grid(payload)
+
+    def _derive_js_window_bounds_from_buffer(self) -> None:
+        """22.01h (Bugfix "Objekte vor vorhandenen Kerzen"): Leitet die
+        Tier-1-Fenster-Bounds (reale Wanduhr-Epochs) defensiv aus dem
+        Datenpuffer ab - NUR wenn sie noch nicht gesetzt sind (idempotent).
+
+        Fallback, wenn die Bounds noch nicht aus einem vollstaendigen Refresh
+        gesetzt wurden (z. B. Indikator-Toggle / Parameter-Aenderung direkt
+        nach dem Start oder nach einem Symbol/TF-Wechsel). Ohne diese Bounds
+        haette der _collect_render_payload-Zeitfenster-Filter keine Grenze und
+        historische Records (z. B. 2013 auf H1/D1 aus Service-Laeufen mit
+        vollem Historien-Scan) wuerden als LWC-Phantom-Slots weit links der
+        sichtbaren Kerzen erscheinen (Objekte vor 2024).
+        """
+        if (self._js_window_first_real is not None
+                and self._js_window_last_real is not None):
+            return
+        n_win = min(self.chart_buffer.TIER1_WINDOW, len(self.chart_buffer.candles))
+        if n_win > 0:
+            if self._js_window_first_real is None:
+                self._js_window_first_real = int(
+                    self.chart_buffer.candles[-n_win]["time"])
+            if self._js_window_last_real is None:
+                self._js_window_last_real = self.chart_buffer.last_real
 
     def _reinject_live_bar_to_indicators(self) -> None:
         """P14-03-E (Flacker-Fix): Fügt die offene Live-Bar-Zeit generisch in
