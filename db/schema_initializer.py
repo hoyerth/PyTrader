@@ -158,6 +158,38 @@ def check_and_init_databases() -> None:
     except Exception as e:
         print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
               f"konnte nicht wiederhergestellt werden: {e}")
+    # 22.01 (14.08.2026): Peak-Grabber-Serientests. Die Outcome-Spalten
+    # (outcome_status/pnl_r_multiple/max_favorable_exc/max_adverse_exc)
+    # sind PENDING/NULL-Platzhalter (Frage 4) – die Exit-/Forward-Evaluation
+    # folgt als separates Modul in einem spaeteren Kapitel (peak_outcome.py).
+    # Schreibzugriff ausschliesslich ueber repositories/grabber_repository.py
+    # (DbPool-Muster, Praeambel 4/6). run_id-Konvention: "LIVE-<YYYYmmdd-HHMMSS>"
+    # fuer Live-Laeufe, "BT-<YYYYmmdd-HHMMSS>" fuer Serientests.
+    con_analytics.execute("""
+        CREATE TABLE IF NOT EXISTS grabber_test_results (
+            signal_id           VARCHAR PRIMARY KEY,
+            run_id              VARCHAR NOT NULL,
+            timestamp           TIMESTAMPTZ NOT NULL,   -- Wanduhr-Epochs (Praemabel 8)
+            symbol              VARCHAR NOT NULL,
+            timeframe           VARCHAR NOT NULL,
+            direction           VARCHAR NOT NULL,
+            entry_price         DOUBLE NOT NULL,
+            sl_price            DOUBLE NOT NULL,
+            peak_price          DOUBLE NOT NULL,
+            peak_bar_index      BIGINT NOT NULL,
+            is_update           BOOLEAN NOT NULL,
+            reversal_pct        FLOAT NOT NULL,
+            is_yellow_window    BOOLEAN NOT NULL,
+            gate_source         VARCHAR NOT NULL,
+            outcome_status      VARCHAR DEFAULT 'PENDING',
+            pnl_r_multiple      FLOAT,
+            max_favorable_exc   FLOAT,
+            max_adverse_exc     FLOAT
+        );
+    """)
+    con_analytics.execute(
+        "CREATE INDEX IF NOT EXISTS idx_grabber_run "
+        "ON grabber_test_results (run_id);")
 
     con_app = DbPool.get(DB_APP_DATA)
     con_app.execute("""
