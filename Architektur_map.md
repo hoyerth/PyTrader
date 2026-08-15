@@ -2,7 +2,7 @@
 
 > **Zweck:** Bugfixes & Erweiterungen auf das **minimale Set an Dateien** reduzieren.
 > **Anwendung (KI-Prompt):** Bei einem Bug/Feature IMMER zuerst diese Map lesen (einmalig, ~2k Tokens), dann NUR die in der Routing-Tabelle (Teil C) genannten Dateien öffnen. Nicht die ganze Codebasis durchsuchen.
-> **Stand:** 15.08.2026 (aktualisiert nach 23.05) – Generiert aus Docstrings + Import-Graphen (117 Py-Dateien / 44.105 Zeilen, 6 JS-Dateien / 1.684 Zeilen).
+> **Stand:** 15.08.2026 (aktualisiert nach 23.08) – Generiert aus Docstrings + Import-Graphen (159 Py-Dateien / 50.190 Zeilen, 6 JS-Dateien / 1.837 Zeilen).
 
 ---
 
@@ -70,7 +70,13 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 ### B4. Chart-Engine (Python-Seite)
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
-| `chart/chart_win.py` | 1630 | **PyTraderChartWindow**: WebEngine, `ChartBridge` (pyBridge), Serializer, `OlderDataWorker`, JS-Load, Live-Updates, Overlays, Peak-Grabber-Button ⚠️HOTSPOT |
+| `chart/chart_win.py` | 399 | **PyTraderChartWindow** (Kern): `__init__`, aggregiert 6 Mixins ⚠️HOTSPOT |
+| `chart/chart_win_workers.py` | 153 | `ChartBridge`/`ChartDataSerializer`/`GridDataSerializer`/`OlderDataWorker`/`WebEngineConsolePage` |
+| `chart/chart_win_indicators.py` | 330 | `ChartIndicatorMixin` (17): Indikator-/Grabber-Methoden, Settings |
+| `chart/chart_win_refresh.py` | 233 | `ChartRefreshMixin` (8): Seiten-Load, Refresh |
+| `chart/chart_win_render.py` | 244 | `ChartRenderMixin` (6): Render-/Serializer-Payload |
+| `chart/chart_win_symboltf.py` | 298 | `ChartSymbolTfMixin` (12): Symbol/Timeframe/Live-Candle |
+| `chart/chart_win_twotier.py` | 263 | `ChartTwoTierMixin` (9): Two-Tier-Caching, Warmup |
 | `chart/chart_basics.py` | 81 | HTML-Template, `JS_FILES`-Ladereihenfolge |
 | `chart/indicators/base_indicator.py` | 56 | `BaseIndicator` (ABC) |
 | `chart/indicators/ind_moving_averages.py` | 446 | Multi-MA (8 MAs, selbstcontained) |
@@ -108,7 +114,14 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | `analytics/engine/feature_store_reader_ohlcv.py` | 637 | `FeatureStoreOhlcvMixin` (11): OHLCV-Snapshots, Execution-Dates/Hashes, TF-Status |
 | `analytics/engine/feature_store_reader_plugin.py` | 464 | `FeatureStorePluginMixin` (5): No-Data-Varianten, Proximity/Plugin-Records, exists |
 | `analytics/engine/analytics_repository.py` | 780 | High-Level-Lese-Datenmethoden für Analytics-UI |
-| `analytics/engine/analytics_view_model.py` | 1886 | **AnalyticsViewModel**: Vermittler Repository↔Worker↔UI-Pages, Profile/Presets, Heatmap-Config ⚠️GOD FILE |
+| `analytics/engine/analytics_view_model.py` | 225 | **AnalyticsViewModel** (Kern): `__init__` + 11 Signale, aggregiert 6 Mixins, Re-Export der Konstanten |
+| `analytics/engine/analytics_view_model_constants.py` | 30 | Konstanten (DEBOUNCE_MS, DEFAULT_BINS, DEFAULT_LIMIT, _ALL_QUERIES) |
+| `analytics/engine/analytics_view_model_query.py` | 253 | `AnalyticsViewModelQueryMixin` (18): Tabellen-/Daten-Abfragen |
+| `analytics/engine/analytics_view_model_setters.py` | 180 | `AnalyticsViewModelSetterMixin` (9): Setter/State-Sync |
+| `analytics/engine/analytics_view_model_fields.py` | 244 | `AnalyticsViewModelFieldMixin` (9): Feld-Auswahl/Sortierung |
+| `analytics/engine/analytics_view_model_heatmap.py` | 296 | `AnalyticsViewModelHeatmapMixin` (17): Heatmap-Config/Metriken |
+| `analytics/engine/analytics_view_model_profile.py` | 427 | `AnalyticsViewModelProfileMixin` (13): Profile/Presets/Workspace |
+| `analytics/engine/analytics_view_model_resolve.py` | 586 | `AnalyticsViewModelResolveMixin` (20): Auflösung/Normalisierung |
 | `analytics/engine/analytics_worker.py` | 263 | `AnalyticsAsyncWorker` (QThread-Query) |
 | `analytics/engine/service_models.py` | 143 | `ServiceSetDefinition` TypedDicts (JSON-persistiert) |
 | `analytics/engine/service_set_repository.py` | 433 | `service_sets`-Tabelle (Laden/Speichern) |
@@ -133,7 +146,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 |---|---|---|
 | `analytics/ui/analytics_win.py` | 1500 | **AnalyticsWindow**: Hauptfenster, Profil-Verwaltung, Jump-to-Chart ⚠️HOTSPOT (3× importiert `serviceui`) |
 | `analytics/ui/common.py` | 225 | `format_wanduhr_time`, Overlay-Stack-Helfer |
-| `analytics/ui/heatmap_widget.py` | 2483 | **Generische 2D-Heatmap-Engine** (Confluence-Matrix, Candle-Overlay, Dual-Axis-Zoom) ⚠️GOD FILE |
+| `analytics/ui/heatmap_widget.py` | 2656 | **Generische 2D-Heatmap-Engine** (Confluence-Matrix, Candle-Overlay, Dual-Axis-Zoom) ⚠️GOD FILE |
 | `analytics/ui/heatmap_page.py` | 288 | Heatmap-Seite (Dow×Stunde) |
 | `analytics/ui/table_page.py` | 732 | Tabellen-Seite (Doppelklick → Jump-to-Chart) |
 | `analytics/ui/scatter_page.py` | 151 | Scatter-Seite |
@@ -144,9 +157,29 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 ### B8. Service-UI
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
-| `serviceui/service_win.py` | 3264 | **ServiceWindow**: Orchestrator (Set-Verwaltung, Parameter-Editor, Runner, Tree-Integration) ⚠️GOD FILE (94 Methoden) ⚠️HOTSPOT |
-| `serviceui/master_tree.py` | 2511 | 2-Spalten-MasterTree (Sets/Services/Kategorien, Kontextmenü) ⚠️GOD FILE |
-| `serviceui/service_selector_dialog.py` | 2414 | ServiceSelectorDialog (Multi-Select für AnalyticsWindow) ⚠️GOD FILE |
+| `serviceui/service_win.py` | 946 | **ServiceWindow** (Kern): `__init__` + Orchestrierung, aggregiert 5 Mixins ⚠️HOTSPOT |
+| `serviceui/service_win_editor.py` | 802 | `ServiceEditorMixin` (23): Parameter-/Set-Editor, Plugin-Config |
+| `serviceui/service_win_presets.py` | 791 | `ServicePresetMixin` (18): Presets/Varianten/Doc-Log, Purge |
+| `serviceui/service_win_run.py` | 516 | `ServiceRunMixin` (17): Run-Worker, Sync-Guard, Fortschritt |
+| `serviceui/service_win_sets.py` | 373 | `ServiceSetsMixin` (9): Set-Verwaltung (CRUD, Verschieben) |
+| `serviceui/service_win_tree.py` | 259 | `ServiceTreeMixin` (9): MasterTree-Handler (Selection, Ordner, Kategorien) |
+| `serviceui/master_tree.py` | 318 | **MasterTree** (Kern): `__init__`, aggregiert 6 Mixins, Re-Export der Konstanten |
+| `serviceui/master_tree_constants.py` | 167 | Konstanten (TYPE_*, ROLE_*, MIME_*) + `TreeItemIterator` |
+| `serviceui/master_tree_ui.py` | 298 | `MasterTreeUiMixin` (9): UI-Aufbau, Spalten, Badge-Zellen |
+| `serviceui/master_tree_selection.py` | 139 | `MasterTreeSelectionMixin` (8): Auswahl/Selection-Details |
+| `serviceui/master_tree_events.py` | 499 | `MasterTreeEventsMixin` (6): Kontextmenü-Signale, Klick-Events |
+| `serviceui/master_tree_dragdrop.py` | 275 | `MasterTreeDragDropMixin` (9): Drag&Drop, MIME-Handling |
+| `serviceui/master_tree_build.py` | 717 | `MasterTreeBuildMixin` (16): Baumaufbau, Checkbox-Tri-State |
+| `serviceui/master_tree_checks.py` | 524 | `MasterTreeChecksMixin` (10): Checkbox-Logik, checked_items |
+| `serviceui/service_selector_dialog.py` | 414 | **ServiceSelectorDialog** (Kern): `__init__` + 4 Signale, aggregiert 6 Mixins, Re-Export der 4 Konstanten + `_DialogParamHost` |
+| `serviceui/service_selector_dialog_constants.py` | 22 | Konstanten (DIALOG_GEOMETRY_KEY, PANEL_BUFFER, BODY_SPACING, TREE_DEFAULT_WIDTH) |
+| `serviceui/service_selector_dialog_host.py` | 217 | `_DialogParamHost` (8): Param-Panel-Host, Speichern-Button |
+| `serviceui/service_selector_dialog_selection.py` | 198 | `ServiceSelectorDialogSelectionMixin` (10): Filter/Apply, Info-Dialoge |
+| `serviceui/service_selector_dialog_presets.py` | 468 | `ServiceSelectorDialogPresetMixin` (12): Varianten/Presets, Duplizieren, Purge |
+| `serviceui/service_selector_dialog_sets.py` | 336 | `ServiceSelectorDialogSetMixin` (13): Set-/Ordner-CRUD, Move/Remove |
+| `serviceui/service_selector_dialog_run.py` | 529 | `ServiceSelectorDialogRunMixin` (18): Checkbox-Filter, Run-Worker, Fortschritt |
+| `serviceui/service_selector_dialog_badge.py` | 222 | `ServiceSelectorDialogBadgeMixin` (7): closeEvent, TF-Pills, Modell-Refresh |
+| `serviceui/service_selector_dialog_panel.py` | 388 | `ServiceSelectorDialogPanelMixin` (12): Param-Panel, Splitter, Geometrie |
 | `serviceui/service_selector_widget.py` | 198 | Generisches Auswahl-Widget (Modus A SELECT_ONLY / Modus B) |
 | `serviceui/param_columns.py` | 891 | `ServiceParamColumnsMixin` (dynamische Service-Spalten) |
 | `serviceui/run_worker.py` | 368 | `ServiceRunWorker` (gezielte Service-Ausführung) |
@@ -192,11 +225,11 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 
 | # | Symptom-Bereich | Dateien (Lese-Reihenfolge) | Validierung in `test` |
 |---|---|---|---|
-| 1 | Chart-Zeiten/Labels/Pause falsch | `chart/js/02_time_utils.js` → `chart/js/01_core.js` → `chart/js/04_live_updates.js` → `chart/chart_win.py` | `check_time_utils.js`, `check_resolve_realtime.js` |
-| 2 | Chart-Rendering/Overlays/Linien/Marker | `chart/js/03_chart_rendering.js` → `chart/js/04_live_updates.js` → `chart/chart_win.py` → betroffener `chart/indicators/ind_*.py` | `check_2201h_overlay_guard.js`, `check_2201c_overlay_clearing.js`, `check_mtf_axis.js` |
-| 3 | Chart-Crash „Value is null" / Phantom-Slots / Timescale | `chart/js/03_chart_rendering.js` → `chart/js/06_two_tier.js` (Overlay-Guard) → `chart/js/01_core.js` (Maps) | `diag_lwc_crash.js`, `diag_prod_repro.js`, `check_2201h_bounds.py` |
-| 4 | Live-Ticks / Live-Update / Bar-Close | `workers/live_tick_worker.py` → `main.py` (`on_ticks_ready`/`_dispatch_tick_map`) → `chart/chart_win.py` (`update_live_candle`) → `chart/js/04_live_updates.js` | `check_2201g_live_marker.py` |
-| 5 | Nachladen alter Daten (Two-Tier, Scroll nach links) | `chart/js/06_two_tier.js` → `chart/indicators/utils/chart_data_buffer.py` → `chart/chart_win.py` (OlderDataWorker) | `check_2201h_pipeline.py` |
+| 1 | Chart-Zeiten/Labels/Pause falsch | `chart/js/02_time_utils.js` → `chart/js/01_core.js` → `chart/js/04_live_updates.js` → `chart/chart_win.py` → `chart/chart_win_symboltf.py` (Live-Candle) | `check_time_utils.js`, `check_resolve_realtime.js` |
+| 2 | Chart-Rendering/Overlays/Linien/Marker | `chart/js/03_chart_rendering.js` → `chart/js/04_live_updates.js` → `chart/chart_win_render.py` (Render-Payload) → `chart/chart_win.py` → betroffener `chart/indicators/ind_*.py` | `check_2201h_overlay_guard.js`, `check_2201c_overlay_clearing.js`, `check_mtf_axis.js` |
+| 3 | Chart-Crash „Value is null" / Phantom-Slots / Timescale | `chart/js/03_chart_rendering.js` → `chart/js/06_two_tier.js` (Overlay-Guard) → `chart/js/01_core.js` (Maps) → `chart/chart_win_render.py` | `diag_lwc_crash.js`, `diag_prod_repro.js`, `check_2201h_bounds.py` |
+| 4 | Live-Ticks / Live-Update / Bar-Close | `workers/live_tick_worker.py` → `main.py` (`on_ticks_ready`/`_dispatch_tick_map`) → `chart/chart_win_symboltf.py` (`update_live_candle`) → `chart/js/04_live_updates.js` | `check_2201g_live_marker.py` |
+| 5 | Nachladen alter Daten (Two-Tier, Scroll nach links) | `chart/js/06_two_tier.js` → `chart/indicators/utils/chart_data_buffer.py` → `chart/chart_win_twotier.py` (Warmup/Feeds) → `chart/chart_win_workers.py` (OlderDataWorker) | `check_2201h_pipeline.py` |
 | 6 | MT5-Sync / Historie / M1-Konsistenz | `data_sync/mt5_sync_service.py` → `workers/data_sync_worker.py` → `db/schema_initializer.py` → `repositories/market_data_repository.py` | `check_m1_consistency.py`, `check_broker_tz.py`, `check_mt5_m1_boundary.py`, `check_21322_full_sync.py` |
 | 7 | Service-Ausführung / Set-Run / Fehler im Run | `serviceui/run_worker.py` → `analytics/engine/set_evaluator.py` → `analytics/features/feature_builder.py` (PluginExecutor) → `analytics/features/plugins/base_plugin.py` → betroffenes `srv_*.py` | `check_2201_runner.py` |
 | 8 | Service-Sets speichern/laden/löschen/Papierkorb | `analytics/engine/service_set_repository.py` → `analytics/engine/service_models.py` → `serviceui/service_set_utils.py` → `serviceui/trash_dialog.py` | `check_bugfix_2132*.py` |
@@ -216,6 +249,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | 22 | **NEUES Service-Plugin / Feature / Indikator** | NUR neue Datei in `analytics/features/definitions` bzw. `chart/indicators` + `parameter_schema` + `metadata["category"]`. Keine Kern-Datei anfassen. | `check_plugin_names.py` |
 | 23 | EventBus-Kommunikation (Event fehlt/doppelt) | `config/event_bus.py` (Signal-Definition) + per `.connect(`/`.emit(` im Code die Emitter/Subscriber finden | – |
 | 24 | App-Start / Exit (Worker stoppen, DB-Pflege) | `main.py` (kompletter Lifecycle) | `check_21322_full_sync.py` |
+| 25 | Datenquellen-Picker (Service-Auswahl, Varianten, Sets verwalten) | `serviceui/service_selector_dialog.py` → `serviceui/service_selector_dialog_selection.py` / `_presets.py` / `_sets.py` / `_run.py` / `_badge.py` / `_panel.py` → `serviceui/service_selector_dialog_host.py` → `analytics/ui/analytics_win.py` | – |
 
 ---
 
@@ -235,14 +269,14 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 ### D2. God-Files (Split-Kandidaten – Ziel Ø 150–400 Zeilen, 1 Verantwortlichkeit)
 | Datei | Zeilen | Vorschlag |
 |---|---|---|
-| `serviceui/service_win.py` | 3.264 | ~6 Dateien: Orchestrierung, Runner, Editor, Tree-Handler, Log, Symbol-Handler |
+| ~~`serviceui/service_win.py`~~ | ~~3.264~~ | ✅ GESPLITTET (23.04, 15.08.2026) → 5 Mixins (Teil B8) |
 | ~~`serviceui/master_tree.py`~~ | ~~2.511~~ | ✅ GESPLITTET (23.06, 15.08.2026) → 6 Mixins + constants (Teil B8) |
-| `serviceui/service_selector_dialog.py` | 2.414 | ~2–3: Dialog, Widget-Konfig, Selection-Logik |
-| `analytics/ui/heatmap_widget.py` | 2.483 | ~3: Widget, Renderer, Achsen |
+| ~~`serviceui/service_selector_dialog.py`~~ | ~~2.414~~ | ✅ GESPLITTET (23.08, 15.08.2026) → 6 Mixins + constants + host (Teil B8) |
+| `analytics/ui/heatmap_widget.py` | 2.656 | ~3: Widget, Renderer, Achsen |
 | ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
-| `chart/indicator_dialog.py` | 1.893 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
+| `chart/indicator_dialog.py` | 1.867 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
 | ~~`analytics/engine/analytics_view_model.py`~~ | ~~1.886~~ | ✅ GESPLITTET (23.07, 15.08.2026) → 6 Mixins + constants (Teil B6) |
-| `chart/chart_win.py` | 1.630 | ~3–4: Bridge, Serializer, Overlay-Handling, Window-Kern |
+| ~~`chart/chart_win.py`~~ | ~~1.630~~ | ✅ GESPLITTET (23.03, 15.08.2026) → 6 Mixins (Teil B4) |
 
 > **Split-Regel (inkrementell, kein Big-Bang):** Nur Dateien splitten, die für einen Bugfix ohnehin geöffnet werden. Mixins-Herausziehen folgt dem bestehenden Muster (`ServiceParamColumnsMixin`, `ContentScrollMixin`, `NamedItemActionsMixin`).
 
