@@ -2,7 +2,7 @@
 
 > **Zweck:** Bugfixes & Erweiterungen auf das **minimale Set an Dateien** reduzieren.
 > **Anwendung (KI-Prompt):** Bei einem Bug/Feature IMMER zuerst diese Map lesen (einmalig, ~2k Tokens), dann NUR die in der Routing-Tabelle (Teil C) genannten Dateien öffnen. Nicht die ganze Codebasis durchsuchen.
-> **Stand:** 15.08.2026 (aktualisiert nach 23.02) – Generiert aus Docstrings + Import-Graphen (117 Py-Dateien / 44.105 Zeilen, 6 JS-Dateien / 1.684 Zeilen).
+> **Stand:** 15.08.2026 (aktualisiert nach 23.05) – Generiert aus Docstrings + Import-Graphen (117 Py-Dateien / 44.105 Zeilen, 6 JS-Dateien / 1.684 Zeilen).
 
 ---
 
@@ -99,7 +99,14 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 ### B6. Analytics-Engine (Business-Logik / ViewModel)
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
-| `analytics/engine/feature_store_reader.py` | 2410 | **FeatureStoreReader**: reiner Lese-Zugriff auf `feature_store` ⚠️GOD FILE |
+| `analytics/engine/feature_store_reader.py` | 93 | **FeatureStoreReader** (Kern): `__init__`, aggregiert 6 Mixins, Re-Export aller 17 Konstanten + `canonical_tf_sort` |
+| `analytics/engine/feature_store_reader_constants.py` | 141 | Konstanten (BASE_DIR, DB_ANALYTICS, TF_SECONDS, DOW_LABELS, DIM_MAPPINGS, …) + `canonical_tf_sort` |
+| `analytics/engine/feature_store_reader_meta.py` | 207 | `FeatureStoreMetaMixin` (8): Meta-Cache, Connection, Epoch |
+| `analytics/engine/feature_store_reader_filter.py` | 305 | `FeatureStoreFilterMixin` (9): Normalisierung, Filter, Formatierung |
+| `analytics/engine/feature_store_reader_query.py` | 479 | `FeatureStoreQueryMixin` (8): Row-/Column-/Key-Fetch, Verfügbarkeitslisten |
+| `analytics/engine/feature_store_reader_heatmap.py` | 492 | `FeatureStoreHeatmapMixin` (4): Heatmap-Fetch (klassisch + generisch) |
+| `analytics/engine/feature_store_reader_ohlcv.py` | 637 | `FeatureStoreOhlcvMixin` (11): OHLCV-Snapshots, Execution-Dates/Hashes, TF-Status |
+| `analytics/engine/feature_store_reader_plugin.py` | 464 | `FeatureStorePluginMixin` (5): No-Data-Varianten, Proximity/Plugin-Records, exists |
 | `analytics/engine/analytics_repository.py` | 780 | High-Level-Lese-Datenmethoden für Analytics-UI |
 | `analytics/engine/analytics_view_model.py` | 1886 | **AnalyticsViewModel**: Vermittler Repository↔Worker↔UI-Pages, Profile/Presets, Heatmap-Config ⚠️GOD FILE |
 | `analytics/engine/analytics_worker.py` | 263 | `AnalyticsAsyncWorker` (QThread-Query) |
@@ -195,7 +202,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | 8 | Service-Sets speichern/laden/löschen/Papierkorb | `analytics/engine/service_set_repository.py` → `analytics/engine/service_models.py` → `serviceui/service_set_utils.py` → `serviceui/trash_dialog.py` | `check_bugfix_2132*.py` |
 | 9 | MasterTree (Anzeige, Kategorien, Modi, Kontextmenü) | `serviceui/master_tree.py` → `analytics/engine/service_selector_model.py` → `analytics/engine/tree_builder.py` → `srv_*.py` (`metadata["category"]`) | `check_tree_mode_fix.py`, `check_tree_mode_fix2.py`, `check_modes_registry.py` |
 | 10 | Parameter-Editor / Prop-Fenster / Expert-Modus | `chart/indicator_dialog.py` → `serviceui/param_columns.py` → `chart/widgets/named_item_actions.py` | `check_clone_*.py`, `check_plugin_names.py` |
-| 11 | Analytics-Daten falsch/leer (Heatmap/Table/Scatter/Distribution) | `analytics/engine/feature_store_reader.py` → `analytics/engine/analytics_repository.py` → `analytics/engine/analytics_view_model.py` → `analytics/engine/analytics_worker.py` → UI-Page | `check_heatmap_e2e.py`, `check_field_selection.py`, `check_field_pairs_db.py`, `check_mode_filter_*.py` |
+| 11 | Analytics-Daten falsch/leer (Heatmap/Table/Scatter/Distribution) | `analytics/engine/feature_store_reader.py` + Mixins (`feature_store_reader_query.py` / `_ohlcv.py` / `_heatmap.py` / `_filter.py`) → `analytics/engine/analytics_repository.py` → `analytics/engine/analytics_view_model.py` → `analytics/engine/analytics_worker.py` → UI-Page | `check_heatmap_e2e.py`, `check_field_selection.py`, `check_field_pairs_db.py`, `check_mode_filter_*.py` |
 | 12 | Analytics-Fenster (Layout, Profile, Buttons, Jump-to-Chart) | `analytics/ui/analytics_win.py` → `analytics/engine/analytics_view_model.py` (Profile) → `repositories/analytics_profile_repository.py` | `check_custom_range_sortmode.py`, `check_heatmap_page_stack.py` |
 | 13 | Heatmap-Widget (Zoom, Matrix, Overlay, Achsen) | `analytics/ui/heatmap_widget.py` → `analytics/ui/heatmap_page.py` → `analytics/engine/analytics_view_model.py` (Config) | `check_heatmap_render.py`, `check_heatmap_field_checks.py` |
 | 14 | MTF-FC (Filterleiste, Kaskade, Confluence, Sortierung) | `chart/widgets/mtf_filter_bar.py` → `analytics/engine/mtf_fc_state.py` → `analytics/engine/mtf_fc_provider.py` → `mtf_fc_guards.py` → `mtf_fc_cascade.py` → `mtf_fc_confluence.py` → `mtf_fc_boundary.py` → `mtf_fc_templates.py` → `mtf_fc_partition.py` | `check_analytics_mtffc.py`, `check_analytics_mtffc_win.py`, `check_mtf_sort_binding.py`, `check_filterbar_visible.py` |
@@ -232,7 +239,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | `serviceui/master_tree.py` | 2.511 | ~3–4: Tree-Model, Tree-UI, Kontextmenü, Folder-Logik |
 | `serviceui/service_selector_dialog.py` | 2.414 | ~2–3: Dialog, Widget-Konfig, Selection-Logik |
 | `analytics/ui/heatmap_widget.py` | 2.483 | ~3: Widget, Renderer, Achsen |
-| `analytics/engine/feature_store_reader.py` | 2.410 | ~2–3: Reader-Kern, Query-Builder, Result-Mapper |
+| ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
 | `chart/indicator_dialog.py` | 1.893 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
 | `analytics/engine/analytics_view_model.py` | 1.886 | ~3: Profile, Query-Orchestrierung, Preset/Heatmap-Config |
 | `chart/chart_win.py` | 1.630 | ~3–4: Bridge, Serializer, Overlay-Handling, Window-Kern |
@@ -241,10 +248,16 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 
 ---
 
-## Teil E – Wartung dieser Karte
+## Teil E – Wartung dieser Karte (HARTE REGEL)
 
-1. **Nach jeder Code-Änderung** (Split, neue Datei, Verschiebung): betroffene Zeile in Teil B + ggf. Routing-Zeile in Teil C aktualisieren.
-2. **Neue Datei:** In Teil B der passenden Domäne eintragen (Datei, Zeilen, 1-Zeilen-Verantwortlichkeit).
-3. **Neuer Bug-Bereich:** In Teil C neue Routing-Zeile ergänzen (Symptom → Dateien → Test-Validator).
-4. **Zeilenzahlen:** Nur bei Bedarf neu auszählen – Richtwerte, keine harte Pflicht.
-5. **Ziel:** Diese Map ersetzt das Volltext-Suchen. Ein Bugfix-Prompt beginnt IMMER mit: *„Lies Architektur_map.md (Projekt-Root, verschoben aus docs/ am 15.08.2026), dann nur die Dateien aus Zeile #X."*
+> **Pflicht, keine Empfehlung:** Bei JEDER der folgenden Aktionen MUSS die Map im selben Arbeitsschritt aktualisiert werden. Ein Split, eine neue Datei, eine Verschiebung oder eine Routing-Änderung OHNE Map-Update ist unvollständig und wird nicht committet.
+
+1. **Split einer God-File (Muss, VORHER + NACHHER):**
+   * VOR dem Split: betroffene Teil-B-Zeile notieren, alle Teil-C-Routing-Zeilen identifizieren, die diese Datei nennen, Zielgruppen/Dateinamen festlegen.
+   * NACH dem Split: Teil B aktualisieren (neue Mixin-/Support-Dateien mit Zeilen + 1-Zeilen-Verantwortlichkeit eintragen, Zeilenzahl der Hauptdatei korrigieren), Teil C (alle betroffenen Routing-Zeilen zeigen auf die neuen Dateien), Teil D2 (Kandidat als erledigt markieren/entfernen, Zeilenzahlen der verbleibenden Kandidaten neu auszählen).
+2. **Neue Datei** (Mixin, Worker, Repository, Plugin, Indikator, Utils): In Teil B der passenden Domäne eintragen (Datei, Zeilen, 1-Zeilen-Verantwortlichkeit). Plugins/Indikatoren zusätzlich in Teil B9 prüfen (Naming `srv_`/`ind_`).
+3. **Neuer Bug-Bereich / neues Routing:** In Teil C neue Routing-Zeile ergänzen (Symptom → Dateien in Lese-Reihenfolge → Test-Validator).
+4. **Datei-Verschiebung / -Umbenennung** (z. B. Root-Orphans): Teil-B-Pfade + ALLE betroffenen Routing-Zeilen in Teil C aktualisieren.
+5. **Zeilenzahlen:** Nach jedem Split/Update neu auszählen – sie steuern die Token-Erwartung der KI und müssen aktuell bleiben.
+6. **Commit-Regel:** Das Map-Update gehört in den Split-Commit (oder direkt in den unmittelbar folgenden Commit – nie erst später).
+7. **Ziel:** Diese Map ersetzt das Volltext-Suchen. Ein Bugfix-Prompt beginnt IMMER mit: *„Lies Architektur_map.md (Projekt-Root), dann nur die Dateien aus Zeile #X."*
