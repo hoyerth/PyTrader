@@ -21,6 +21,17 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
 - **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Current` ausnahmsweise herangezogen werden.
 
+### 0d. WICHTIG: `Architektur_map.md` = PFLICHT-LESEKARTE VOR JEDER ARBEIT (TOKEN-/ZEITSPAREN)
+- **`Architektur_map.md` ist die verbindliche Lese-Karte für ALLE Bugfixing- und Entwicklungsarbeiten.** Sie wird in jedem Fall GELESEN, BEVOR irgendeine andere Projektdatei geöffnet, durchsucht oder gelesen wird.
+- **Ziel: totale Reduktion von Token- und Zeitaufwand.** Statt das Projekt zu durchsuchen, werden aus der Map die EXAKT erforderlichen Dateien für die konkrete Aufgabe ermittelt – und NUR diese werden gelesen.
+- **Pflicht-Ablauf vor jeder Arbeit (Bugfixing-Modus wie normale Entwicklung):**
+  1. **Teil C – Bug-Routing-Tabelle zuerst:** Für die konkrete Aufgabe / Fehlermeldung die passende Routing-Zeile (Symptom → Dateien in Lese-Reihenfolge) suchen. Sie liefert die betroffenen Dateien bereits in Abhängigkeits-Reihenfolge inkl. zugehöriger Test-Skripte.
+  2. **Teil B – Domänen-Karte:** Für jede ermittelte Datei die Verantwortlichkeit + Zeilenzahl prüfen. Nur Dateien mit tatsächlichem Bezug zur Aufgabe einplanen. Bei gesplitteten Dateien (Kern + Mixins) gezielt NUR die relevanten Mixin-Dateien öffnen, nicht den Kern oder alle Mixins.
+  3. **Nur die ermittelten Dateien lesen.** Kein Repo-Durchsuchen, kein Lesen von Nachbar-/Kontext-Dateien, keine Exporte/Archive (siehe 0, 0b), keine Doku-Sammlungen.
+  4. **Traceback-Verortung:** Die Datei aus der Fehlermeldung in Teil B suchen → Zeilenzahl + Verantwortlichkeit → bei Quer-Kopplungen zusätzlich Teil D1 prüfen.
+- **Bei God-Files/Hotspots (⚠️, Teil D):** NIEMALS die ganze Datei einlesen. Zuerst per gezielter Suche (grep/`py_compile`/AST) die konkrete Methode/Funktion lokalisieren und NUR diesen Block lesen. Die Mixin-Aufteilung in Teil B zeigt, in welcher Datei eine Methode liegt.
+- **Ausnahme:** Nur wenn die Map für den Bereich keine Zeile enthält (z. B. brandneues Feature), darf gezielt und minimal recherchiert werden – die Map wird danach um die neue Routing-/B-Zeile ergänzt (Teil E).
+
 ---
 
 ### 1. ROLLE & ARCHITEKTUR-FOKUS
