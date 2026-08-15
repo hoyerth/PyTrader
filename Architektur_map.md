@@ -2,7 +2,7 @@
 
 > **Zweck:** Bugfixes & Erweiterungen auf das **minimale Set an Dateien** reduzieren.
 > **Anwendung (KI-Prompt):** Bei einem Bug/Feature IMMER zuerst diese Map lesen (einmalig, ~2k Tokens), dann NUR die in der Routing-Tabelle (Teil C) genannten Dateien öffnen. Nicht die ganze Codebasis durchsuchen.
-> **Stand:** 15.08.2026 – Generiert aus Docstrings + Import-Graphen (117 Py-Dateien / 44.105 Zeilen, 6 JS-Dateien / 1.684 Zeilen).
+> **Stand:** 15.08.2026 (aktualisiert nach 23.02) – Generiert aus Docstrings + Import-Graphen (117 Py-Dateien / 44.105 Zeilen, 6 JS-Dateien / 1.684 Zeilen).
 
 ---
 
@@ -11,22 +11,22 @@
 ```
 DuckDB (data/*.duckdb)
    ↑
-db/ + repositories/ + *_repository.py        (einzige SQL-Schicht)
+db/ + repositories/                          (einzige SQL-Schicht)
    ↑
 analytics/engine/ + analytics/features/      (Business-Logik, ViewModel, Evaluatoren)
    ↑
-serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
+serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 ```
 
 | Regel | Bedeutung |
 |---|---|
 | **Kein SQL in UI** | UI-Klassen rufen NUR Repositories/Reader/ViewModel auf (MVVM, Invariante 4). |
 | **Fenster-Kommunikation nur via EventBus** | `config/event_bus.py` – kein direktes Fenster-zu-Fenster-Wissen (Invariante 5). |
-| **DbPool statt Direkt-Connections** | `db/db_pool.py` (thread-local). `db_service.py` = Fassade/Re-Export ohne Logik. |
+| **DbPool statt Direkt-Connections** | `db/db_pool.py` (thread-local). Fassade liegt in `repositories/db_service.py`; Root-`db_service.py` = Shim/Re-Export ohne Logik. |
 | **Plugins sind Blätter** | `srv_*.py` / `ind_*.py` werden NIE importiert – Laden nur über Registry (`PluginRegistry`/`PluginLoader` in `feature_builder.py`). Neue Features = neue Datei, keine Kern-Datei anfassen (Open/Closed). |
 | **Wanduhr-Garantie** | MT5-Epochs sind Berlin-Wanduhr-encoded. Chart/JS formatiert DIREKT, kein +2h/+1h-Offset. SQL nutzt `bar_time AT TIME ZONE 'UTC'`. |
-| **Naming** | Services `srv_*` (in `analytics/features/definitions/`), Indikatoren `ind_*` (in `chart/indicators/`), `parameter_schema` am Dateianfang, `metadata["category"]` = Slash-Pfad. |
-| **Tests** | Nur `test/` (kein PyTest): `test/test.py`-Harness + `check_*.py`. Keine UI-/Regressionstests ohne ausdrückliche Anweisung. |
+| **Naming** | Services `srv_*` (in `analytics/features/definitions`), Indikatoren `ind_*` (in `chart/indicators`), `parameter_schema` am Dateianfang, `metadata["category"]` = Slash-Pfad. |
+| **Tests** | Nur `test` (kein PyTest): `test/test.py`-Harness + `check_*.py`. Keine UI-/Regressionstests ohne ausdrückliche Anweisung. |
 
 ---
 
@@ -43,20 +43,19 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 | `config/base_state_model.py` | 18 | `AbstractStateModel` (Serialisierung) |
 | `config/event_bus.py` | 74 | **EventBus-Singleton**: `favorites_changed`, `profile_changed(str)`, `service_set_changed`, `mtf_fc_sort_changed(str)`, `service_run_started/finished`, `grabber_toggle(dict)`, `grabber_event(object)`, `sync_pause_count` |
 | `scrollable_content.py` | 238 | `ContentScrollMixin` (Scroll/Größendynamik) |
-| `properties_win.py` | 123 | Properties-Fenster (App-Einstellungen + DB-Kompaktierung, Concurrency-Guard über `sync_pause_count`) |
-
+| `ui/properties_win.py` | 123 | Properties-Fenster (App-Einstellungen + DB-Kompaktierung, Concurrency-Guard über `sync_pause_count`) |
 ### B2. DB-Basisschicht & Repositories (einzige SQL-Schicht)
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
 | `db/db_pool.py` | 177 | `DbPool` (thread-local, eine Verbindung pro Thread/DB), DB-Pfad-Konstanten, `with_db_lock` |
 | `db/db_utils.py` | 112 | `_parse_json_field`, `_ensure_epoch` |
 | `db/schema_initializer.py` | 225 | `check_and_init_databases` (market_data/analytics/app_data), DDL, Migrationen |
-| `db_service.py` | 48 | Fassade/Re-Export-Wrapper (keine Logik mehr) |
+| `repositories/db_service.py` | 48 | Fassade/Re-Export-Wrapper (keine Logik mehr); Root-`db_service.py` = Shim |
 | `repositories/market_data_repository.py` | 165 | Lese-Zugriff `ohlcv_bars`, `get_symbol_precision` |
 | `repositories/grabber_repository.py` | 61 | Grabber-Ergebnis-Persistenz (18-Spalten-Batch-Upsert) |
-| `symbol_repository.py` | 224 | `broker_symbols` (Symbole + Favoriten, MT5-Start-Sync) |
-| `window_state_repository.py` | 272 | `window_instances`/`instance_state` (Fenster-Persistenz) |
-| `analytics_profile_repository.py` | 371 | `analytics_profiles` (Profile für Analytics-UI) |
+| `repositories/symbol_repository.py` | 224 | `broker_symbols` (Symbole + Favoriten, MT5-Start-Sync) |
+| `repositories/window_state_repository.py` | 272 | `window_instances`/`instance_state` (Fenster-Persistenz) |
+| `repositories/analytics_profile_repository.py` | 371 | `analytics_profiles` (Profile für Analytics-UI) |
 | `analytics/statistics_repository.py` | 192 | SQL-Aggregationen auf `feature_data` (srv_proximity) + Forward-Performance (legacy Statistik) |
 
 ### B3. MT5-Sync & Worker
@@ -85,7 +84,7 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 | `chart/widgets/style_picker_widget.py` | 558 | Style-Picker |
 | `chart/indicator_dialog.py` | 1893 | **Universal-Settings-Dialog** (Plugin-Prop, Expert-Modus, Service-Sets) ⚠️GOD FILE |
 
-### B5. Chart-Engine (JS-Seite – `chart/js/`, Laden in chart_basics.JS_FILES)
+### B5. Chart-Engine (JS-Seite – `chart/js`, Laden in chart_basics.JS_FILES)
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
 | `01_core.js` | 74 | Chart-Init, `window.onerror`, Zeit-Maps `_continuousTimeMap`/`_continuousKeys`, **`resolveRealTime(ts)`** (Binary-Search → nächster realer Zeitpunkt), `toCont`/`toReal` |
@@ -176,7 +175,7 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 ### B10. Legacy
 | Datei | Zeilen | Verantwortlichkeit |
 |---|---|---|
-| `statistic_win.py` | 279 | Statistik-Fenster (legacy, von AnalyticsWindow abgelöst) |
+| `ui/statistic_win.py` | 279 | Statistik-Fenster (legacy, von AnalyticsWindow abgelöst) |
 
 ---
 
@@ -184,7 +183,7 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 
 > **Regel:** Nur die genannten Dateien lesen. Steht die Datei nicht in der Zeile, ist sie für das Symptom irrelevant.
 
-| # | Symptom-Bereich | Dateien (Lese-Reihenfolge) | Validierung in `test/` |
+| # | Symptom-Bereich | Dateien (Lese-Reihenfolge) | Validierung in `test` |
 |---|---|---|---|
 | 1 | Chart-Zeiten/Labels/Pause falsch | `chart/js/02_time_utils.js` → `chart/js/01_core.js` → `chart/js/04_live_updates.js` → `chart/chart_win.py` | `check_time_utils.js`, `check_resolve_realtime.js` |
 | 2 | Chart-Rendering/Overlays/Linien/Marker | `chart/js/03_chart_rendering.js` → `chart/js/04_live_updates.js` → `chart/chart_win.py` → betroffener `chart/indicators/ind_*.py` | `check_2201h_overlay_guard.js`, `check_2201c_overlay_clearing.js`, `check_mtf_axis.js` |
@@ -197,17 +196,17 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 | 9 | MasterTree (Anzeige, Kategorien, Modi, Kontextmenü) | `serviceui/master_tree.py` → `analytics/engine/service_selector_model.py` → `analytics/engine/tree_builder.py` → `srv_*.py` (`metadata["category"]`) | `check_tree_mode_fix.py`, `check_tree_mode_fix2.py`, `check_modes_registry.py` |
 | 10 | Parameter-Editor / Prop-Fenster / Expert-Modus | `chart/indicator_dialog.py` → `serviceui/param_columns.py` → `chart/widgets/named_item_actions.py` | `check_clone_*.py`, `check_plugin_names.py` |
 | 11 | Analytics-Daten falsch/leer (Heatmap/Table/Scatter/Distribution) | `analytics/engine/feature_store_reader.py` → `analytics/engine/analytics_repository.py` → `analytics/engine/analytics_view_model.py` → `analytics/engine/analytics_worker.py` → UI-Page | `check_heatmap_e2e.py`, `check_field_selection.py`, `check_field_pairs_db.py`, `check_mode_filter_*.py` |
-| 12 | Analytics-Fenster (Layout, Profile, Buttons, Jump-to-Chart) | `analytics/ui/analytics_win.py` → `analytics/engine/analytics_view_model.py` (Profile) → `analytics_profile_repository.py` | `check_custom_range_sortmode.py`, `check_heatmap_page_stack.py` |
+| 12 | Analytics-Fenster (Layout, Profile, Buttons, Jump-to-Chart) | `analytics/ui/analytics_win.py` → `analytics/engine/analytics_view_model.py` (Profile) → `repositories/analytics_profile_repository.py` | `check_custom_range_sortmode.py`, `check_heatmap_page_stack.py` |
 | 13 | Heatmap-Widget (Zoom, Matrix, Overlay, Achsen) | `analytics/ui/heatmap_widget.py` → `analytics/ui/heatmap_page.py` → `analytics/engine/analytics_view_model.py` (Config) | `check_heatmap_render.py`, `check_heatmap_field_checks.py` |
 | 14 | MTF-FC (Filterleiste, Kaskade, Confluence, Sortierung) | `chart/widgets/mtf_filter_bar.py` → `analytics/engine/mtf_fc_state.py` → `analytics/engine/mtf_fc_provider.py` → `mtf_fc_guards.py` → `mtf_fc_cascade.py` → `mtf_fc_confluence.py` → `mtf_fc_boundary.py` → `mtf_fc_templates.py` → `mtf_fc_partition.py` | `check_analytics_mtffc.py`, `check_analytics_mtffc_win.py`, `check_mtf_sort_binding.py`, `check_filterbar_visible.py` |
 | 15 | Peak-Grabber (komplett) | `analytics/engine/peak_models.py` → `analytics/features/definitions/grabber_kernel.py` → `srv_peak_finder.py` → `srv_peak_grabber.py` → `chart/indicators/ind_peak.py` → `repositories/grabber_repository.py` → `analytics/engine/peak_backtest_runner.py` → `analytics/ui/order_preview_dialog.py` | `check_2201_peak_grabber.py`, `check_2201_runner.py`, `check_2201_reader.py`, `check_2201_schema.py`, `check_2201_viewback.py`, `check_2201_parity.py` |
-| 16 | Fenster-Persistenz (Geometrie/State verloren, Restore) | `persistent_win.py` → `window_state_repository.py` → `state_manager.py` → `ui/window_manager.py` | `check_app_state.py`, `check_splitter_persist.py`, `check_2201f_state_sync.py` |
-| 17 | App-Einstellungen / Properties-Fenster | `config/app_settings.py` → `properties_win.py` → `state_manager.py` | `check_app_state.py` |
-| 18 | Symbole / Favoriten | `symbol_repository.py` → `serviceui/symbols_win.py` → `main.py` (Start-Sync) | – |
-| 19 | Sync-Timer / Concurrency-Guard / DB-Kompaktierung | `main.py` (`sync_timer`, `_sync_pause_count`) → `config/event_bus.py` (`service_run_started/finished`, `sync_pause_count`) → `properties_win.py` | – |
-| 20 | DB-Bloat / Vacuum / Schema / Migration | `db/schema_initializer.py` → `db/db_pool.py` → `db/db_utils.py` → `main.py` (Exit-Vacuum) → `properties_win.py` (Button) | `check_2201_schema.py` |
-| 21 | Statistik-Fenster (legacy) | `statistic_win.py` → `analytics/statistics_repository.py` | – |
-| 22 | **NEUES Service-Plugin / Feature / Indikator** | NUR neue Datei in `analytics/features/definitions/` bzw. `chart/indicators/` + `parameter_schema` + `metadata["category"]`. Keine Kern-Datei anfassen. | `check_plugin_names.py` |
+| 16 | Fenster-Persistenz (Geometrie/State verloren, Restore) | `persistent_win.py` → `repositories/window_state_repository.py` → `state_manager.py` → `ui/window_manager.py` | `check_app_state.py`, `check_splitter_persist.py`, `check_2201f_state_sync.py` |
+| 17 | App-Einstellungen / Properties-Fenster | `config/app_settings.py` → `ui/properties_win.py` → `state_manager.py` | `check_app_state.py` |
+| 18 | Symbole / Favoriten | `repositories/symbol_repository.py` → `serviceui/symbols_win.py` → `main.py` (Start-Sync) | – |
+| 19 | Sync-Timer / Concurrency-Guard / DB-Kompaktierung | `main.py` (`sync_timer`, `_sync_pause_count`) → `config/event_bus.py` (`service_run_started/finished`, `sync_pause_count`) → `ui/properties_win.py` | – |
+| 20 | DB-Bloat / Vacuum / Schema / Migration | `db/schema_initializer.py` → `db/db_pool.py` → `db/db_utils.py` → `main.py` (Exit-Vacuum) → `ui/properties_win.py` (Button) | `check_2201_schema.py` |
+| 21 | Statistik-Fenster (legacy) | `ui/statistic_win.py` → `analytics/statistics_repository.py` | – |
+| 22 | **NEUES Service-Plugin / Feature / Indikator** | NUR neue Datei in `analytics/features/definitions` bzw. `chart/indicators` + `parameter_schema` + `metadata["category"]`. Keine Kern-Datei anfassen. | `check_plugin_names.py` |
 | 23 | EventBus-Kommunikation (Event fehlt/doppelt) | `config/event_bus.py` (Signal-Definition) + per `.connect(`/`.emit(` im Code die Emitter/Subscriber finden | – |
 | 24 | App-Start / Exit (Worker stoppen, DB-Pflege) | `main.py` (kompletter Lifecycle) | `check_21322_full_sync.py` |
 
@@ -223,7 +222,7 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 | `analytics/engine/service_selector_model.py` | → `chart.indicators.ind_fixed_grid_proximity`, `serviceui.service_set_utils` | Engine → UI/Chart (Layer-Verletzung, historisch gewachsen). |
 | `chart/indicators/ind_peak.py` | → `analytics.engine` (peak_models, feature_builder, set_evaluator, plugins.base_plugin) | Indikator nutzt Engine direkt (Grabber). |
 | `analytics/features/definitions/srv_trend_*.py`, `srv_swing_momentum.py` | → `chart` (ma_template) | Services importieren Chart-Utils. |
-| `serviceui/service_win.py` | → `chart`, `analytics`, `repositories`, `workers`, `scrollable_content`, `symbol_repository` | Der Orchestrator berührt alle Schichten. |
+| `serviceui/service_win.py` | → `chart`, `analytics`, `repositories`, `workers`, `scrollable_content`, `repositories.symbol_repository` | Der Orchestrator berührt alle Schichten. |
 | `analytics/features/feature_builder.py` | → `state_manager` | Feature-Layer → State-Layer. |
 
 ### D2. God-Files (Split-Kandidaten – Ziel Ø 150–400 Zeilen, 1 Verantwortlichkeit)
@@ -248,4 +247,4 @@ serviceui/ + analytics/ui/ + chart/ + main.py (UI-Fenster, Orchestratoren)
 2. **Neue Datei:** In Teil B der passenden Domäne eintragen (Datei, Zeilen, 1-Zeilen-Verantwortlichkeit).
 3. **Neuer Bug-Bereich:** In Teil C neue Routing-Zeile ergänzen (Symptom → Dateien → Test-Validator).
 4. **Zeilenzahlen:** Nur bei Bedarf neu auszählen – Richtwerte, keine harte Pflicht.
-5. **Ziel:** Diese Map ersetzt das Volltext-Suchen. Ein Bugfix-Prompt beginnt IMMER mit: *„Lies docs/ARCHITEKTUR_MAP.md, dann nur die Dateien aus Zeile #X."*
+5. **Ziel:** Diese Map ersetzt das Volltext-Suchen. Ein Bugfix-Prompt beginnt IMMER mit: *„Lies Architektur_map.md (Projekt-Root, verschoben aus docs/ am 15.08.2026), dann nur die Dateien aus Zeile #X."*

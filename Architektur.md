@@ -72,7 +72,7 @@ Um Rechenlast zu minimieren, werden Rohdaten (OHLCV) vorab transformiert:
 
 * DuckDB-Connections sind nicht thread-safe. PyTrader verwendet das Thread-Local Singleton `DbPool` (**`db/db_pool.py`**), bei dem jeder Thread seine eigene Verbindung je DB-Datei hält.
 * Dies verhindert File-Locking-Fehler unter Windows und erübrigt globale Threading-Locks auf Datenbankebene (lock-freier Zugriff; `with_db_lock` nur für wenige kritische Stellen).
-* `db_service.py` ist seit 18.01.02 eine **Fassade (Re-Export-Wrapper)** ohne eigene Logik – Bestands-Caller importieren unverändert aus `db_service`, die Implementierung liegt in `db/db_pool.py`, `db/db_utils.py`, `db/schema_initializer.py`, `data_sync/mt5_sync_service.py` und `repositories/market_data_repository.py`.
+* `db_service.py` ist seit 18.01.02 eine **Fassade (Re-Export-Wrapper)** ohne eigene Logik – Bestands-Caller importieren unverändert aus dem Root-Shim `db_service`, die Implementierung liegt in `db/db_pool.py`, `db/db_utils.py`, `db/schema_initializer.py`, `data_sync/mt5_sync_service.py`, `repositories/db_service.py` und `repositories/market_data_repository.py`.
 
 ---
 
@@ -109,23 +109,21 @@ PyTrader/
 ├── data/                           # DuckDB-Datenbanken (*.duckdb) + custom_plugins/
 ├── db/                             # DB-Schicht (db_pool.py, db_utils.py, schema_initializer.py) – Basis-Schicht, kein Projekt-Import
 ├── data_sync/                      # MT5-Sync-Service (mt5_sync_service.py: SYMBOLS, TF_SECONDS_MAP, get_timeframes, sync_market_data)
-├── repositories/                   # Repository-Schicht (market_data_repository.py)
+├── repositories/                   # Repository-Schicht (market_data_repository.py, db_service.py-Fassade,
+│   │                               #  grabber_repository.py, symbol_repository.py, window_state_repository.py,
+│   │                               #  analytics_profile_repository.py)
 ├── workers/                        # Threads (data_sync_worker.py, live_tick_worker.py)
 ├── serviceui/                      # Service-UI-Paket (Phase 15): service_win.py, service_selector_dialog.py,
 │   │                               #  service_selector_widget.py, master_tree.py, run_worker.py, common_widgets.py,
 │   │                               #  status_panel.py, new_set_dialog.py, param_columns.py, symbols_win.py,
 │   │                               #  trash_dialog.py, service_set_utils.py
-├── ui/                             # Qt-Designer-Dateien (*.ui) + Fenster-Orchestrator (window_manager.py)
-├── analytics_profile_repository.py # Analytics-Profil-Repository (app_data)
-├── db_service.py                   # FASSADE (Re-Export-Wrapper), MT5-Sync-CLI (python db_service.py)
+├── ui/                             # Qt-Designer-Dateien (*.ui) + Fenster (window_manager.py, statistic_win.py,
+│   │                               #  properties_win.py)
+├── db_service.py                   # SHIM (Re-Export aus repositories/db_service.py), MT5-Sync-CLI (python db_service.py)
 ├── main.py                         # Haupt-Orchestrator (MainWindow)
 ├── persistent_win.py               # Fenster-Persistence & Registry (@register_persistent_window)
-├── statistic_win.py                # Statistik-Fenster
-├── properties_win.py               # Properties-Fenster (Optionen, DB-Service/VACUUM)
 ├── scrollable_content.py           # Scrollbare Content-Mixin
 ├── state_manager.py                # UI-Status, Fenstergeometrien & Presets
-├── symbol_repository.py            # Symbol-Repository (App-Favoriten)
-├── window_state_repository.py      # Fenster-Zustands-Repository
 └── test/                           # Test-/Check-Skripte (headless; nicht produktiv, wird nicht exportiert)
 ```
 
