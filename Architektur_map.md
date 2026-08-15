@@ -236,7 +236,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | Datei | Zeilen | Vorschlag |
 |---|---|---|
 | `serviceui/service_win.py` | 3.264 | ~6 Dateien: Orchestrierung, Runner, Editor, Tree-Handler, Log, Symbol-Handler |
-| `serviceui/master_tree.py` | 2.511 | ~3–4: Tree-Model, Tree-UI, Kontextmenü, Folder-Logik |
+| ~~`serviceui/master_tree.py`~~ | ~~2.511~~ | ✅ GESPLITTET (23.06, 15.08.2026) → 6 Mixins + constants (Teil B8) |
 | `serviceui/service_selector_dialog.py` | 2.414 | ~2–3: Dialog, Widget-Konfig, Selection-Logik |
 | `analytics/ui/heatmap_widget.py` | 2.483 | ~3: Widget, Renderer, Achsen |
 | ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
