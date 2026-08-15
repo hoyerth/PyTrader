@@ -25,7 +25,7 @@ from state_manager import StateManager
 # (★-Button oeffnet das SymbolsWindow; Symbol-Filter-Dropdown zeigt
 # 'ALLE' + Favoriten, EventBus-Kopplung analog Chart-/ServiceWindow).
 from config.event_bus import event_bus
-from symbol_repository import SymbolRepository, get_symbol_repository
+from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from serviceui.symbols_win import SymbolsWindow
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,8 +46,8 @@ class StatisticWindow(PersistentWindow):
         self._current_page: int = 0
         self._total_pages: int = 0
 
-        # UI laden
-        ui_file = QFile(str(BASE_DIR / "ui" / "statistic_win.ui"))
+        # UI laden (seit 23.02 liegt statistic_win.py selbst unter ui/)
+        ui_file = QFile(str(BASE_DIR / "statistic_win.ui"))
         if ui_file.open(QIODevice.ReadOnly):
             loader = QUiLoader()
             self.ui = loader.load(ui_file)

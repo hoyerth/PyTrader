@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QApplication
 from analytics.ui.analytics_win import AnalyticsWindow
 from chart.chart_win import PyTraderChartWindow
 from persistent_win import PersistentWindow
-from properties_win import PropertiesWindow
+from ui.properties_win import PropertiesWindow
 from serviceui.service_win import ServiceWindow
 from state_manager import StateManager
 

@@ -134,7 +134,8 @@ class PropertiesWindow(PersistentWindow):
             print("⚠️ DB-Service gesperrt: Scans/Worker laufen aktuell.")
             return
         for _db_name in ("analytics", "market_data"):
-            db_path = str(BASE_DIR / "data" / f"{_db_name}.duckdb")
+            # Seit 23.02 liegt properties_win.py unter ui/ – Projekt-Root = parent.
+            db_path = str(BASE_DIR.parent / "data" / f"{_db_name}.duckdb")
             try:
                 info = compact_database(db_path)
                 print(f"✅ DB-Service: {_db_name}.duckdb kompaktiert "

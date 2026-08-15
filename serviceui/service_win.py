@@ -74,7 +74,7 @@ from serviceui.common_widgets import TfStatusBadgeBar
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
-from symbol_repository import SymbolRepository, get_symbol_repository
+from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
 
 # Phase 15 15.02: Service-UI Refactoring – MasterTree & generischer

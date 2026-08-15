@@ -28,9 +28,12 @@ from typing import Any, Dict, List, Optional
 import duckdb
 import pandas as pd
 
-from db_service import _parse_json_field, DbPool
+from db.db_pool import DbPool
+from db.db_utils import _parse_json_field
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Seit 23.02 (Root-Orphans sortieren) liegt dieses Repository unter
+# repositories/ – der Projekt-Root ist daher eine Ebene hoeher.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DB_PATH = os.path.join(BASE_DIR, "data", "app_data.duckdb")
 
 

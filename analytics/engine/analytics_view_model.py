@@ -40,7 +40,7 @@ from analytics.engine.analytics_worker import (
     MAX_LOOKBACK_LIMIT,
     AnalyticsAsyncWorker,
 )
-from analytics_profile_repository import (
+from repositories.analytics_profile_repository import (
     AnalyticsProfileRepository,
     get_analytics_profile_repository,
     SCHEMA_VERSION_DEFAULT,

@@ -70,7 +70,7 @@ from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung im Chart-Fenster
 # (★-Button oeffnet das SymbolsWindow; Favoriten-Dropdown via EventBus).
 from config.event_bus import event_bus
-from symbol_repository import SymbolRepository, get_symbol_repository
+from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from serviceui.symbols_win import SymbolsWindow
 
 

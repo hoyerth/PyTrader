@@ -53,7 +53,8 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional
 
-from db_service import DB_APP_DATA, DbPool, _parse_json_field
+from db.db_pool import DB_APP_DATA, DbPool
+from db.db_utils import _parse_json_field
 
 # Pflichtfeld im Profil-Payload (20.01-Spezifikation: `schema_version: 2`).
 SCHEMA_VERSION_DEFAULT: int = 2

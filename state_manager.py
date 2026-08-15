@@ -13,10 +13,11 @@ from db_service import _parse_json_field, DbPool
 from config.base_state_model import AbstractStateModel
 from config.app_settings import AppSettings
 # Phase 15.04: Instanz-/Fenster-SQL-Zugriffe sind in das
-# WindowStateRepository ausgelagert (window_state_repository.py). Der
-# StateManager ist seitdem eine additive Fassade – alle Bestands-Methoden
-# bleiben mit identischen Signaturen erhalten und delegieren intern.
-from window_state_repository import WindowStateRepository
+# WindowStateRepository ausgelagert (repositories/window_state_repository.py,
+# seit 23.02 unter repositories/). Der StateManager ist seitdem eine additive
+# Fassade – alle Bestands-Methoden bleiben mit identischen Signaturen erhalten
+# und delegieren intern.
+from repositories.window_state_repository import WindowStateRepository
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DB_PATH = os.path.join(BASE_DIR, "data", "app_data.duckdb")

@@ -62,7 +62,7 @@ from analytics.ui.distribution_page import DistributionPage
 from analytics.ui.equity_page import EquityPage
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
-from symbol_repository import SymbolRepository, get_symbol_repository
+from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
 from serviceui.common_widgets import TfStatusBadgeBar
 from serviceui.service_selector_dialog import ServiceSelectorDialog

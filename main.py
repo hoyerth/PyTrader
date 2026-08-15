@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from chart.chart_win import PyTraderChartWindow
 from state_manager import StateManager
 from persistent_win import PersistentWindow
-from symbol_repository import get_symbol_repository
+from repositories.symbol_repository import get_symbol_repository
 from config.app_settings import AppSettings
 from config.event_bus import event_bus
 from analytics.background_workers.live_analyzer import LiveAnalyzer

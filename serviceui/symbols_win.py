@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from config.event_bus import event_bus
 from persistent_win import PersistentWindow, register_persistent_window
-from symbol_repository import SymbolRepository, get_symbol_repository
+from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 
 # Sichtbare Darstellung: ausgefuellter Stern = Favorit, leerer Stern = nicht.
 STAR_FAVORITE = "★"

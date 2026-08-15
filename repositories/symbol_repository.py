@@ -25,7 +25,7 @@ Verhalten:
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from db_service import DB_APP_DATA, DbPool
+from db.db_pool import DB_APP_DATA, DbPool
 
 # Komfort-Konstante fuer UI-Fallback (Dropdown nie leer), identisch zu den
 # Defaults in db_service.check_and_init_databases().
