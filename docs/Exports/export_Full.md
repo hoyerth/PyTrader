@@ -28435,15 +28435,30 @@ class PyTraderChartWindow(QMainWindow):
             if self.df_data is not None and not self.df_data.empty:
                 self.render_indicators()
 
-    # 22.01c (Bugfix 3): Live-Trigger (grabber_event, vom Peak-Indikator via
+        # 22.01c (Bugfix 3): Live-Trigger (grabber_event, vom Peak-Indikator via
     # ind_peak.update_live_candle emittiert) -> Order-Vorschau im CHART.
     # Lazy Singleton: mehrere Trigger kurz nacheinander aktualisieren denselben
     # Dialog (kein Doppel-Fenster, kein Crash - das erste Fenster bleibt offen).
     # MVVM: keine Order-Platzierung und kein SQL hier (Persistenz uebernimmt der
     # Grabber-Konsument vor dem Emit).
+    # 22.01g (Bugfix 5): NUR EIN Orderfenster pro BAR - mehrere Trigger/
+    # Updates derselben Bar (Live-Ticks) werden unterdrueckt. Ohne das Gate
+    # oeffnete der Dialog bei jedem M5-Tick hintereinander (Orderfenster-
+    # Flut, Grafikeinfrieren durch Event-Storm).
     def _on_grabber_event(self, record: object) -> None:
         if OrderPreviewDialog is None:
             return
+        try:
+            ts = int(record.timestamp.timestamp())
+        except (AttributeError, TypeError, ValueError):
+            ts = 0
+        if ts:
+            from db_service import TF_SECONDS_MAP
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf or "").upper(), 60)
+            bar_key = ts - (ts % t_sec)
+            if getattr(self, "_last_grabber_bar_key", None) == bar_key:
+                return  # gleiche Bar -> kein weiteres Fenster
+            self._last_grabber_bar_key = bar_key
         if not hasattr(self, "_order_preview") or self._order_preview is None:
             self._order_preview = OrderPreviewDialog(self)
         try:
@@ -29461,9 +29476,9 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
-                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Phase 15 (U15-B4): Alt-'grid'-Eintraege beim Symbol/TF-
                     # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
-                    # Instanz mehr, erhält kein Set).
+                    # Instanz mehr, erhaelt kein Set).
                     self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
@@ -29483,6 +29498,8 @@ class PyTraderChartWindow(QMainWindow):
             # Symbol:TF synchronisieren - der Chart rendert ind_peak nur, wenn
             # Button UND State uebereinstimmen (Bugfix "Linien trotz aus").
             self._sync_peak_button_from_state()
+            # 22.01g (Bugfix 5): Bar-Gate zuruecksetzen (neuer Symbol-Kontext).
+            self._last_grabber_bar_key = None
             self.refresh_chart_data()
 
     def on_tf_changed(self, t):
@@ -29507,9 +29524,9 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
-                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Phase 15 (U15-B4): Alt-'grid'-Eintraege beim Symbol/TF-
                     # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
-                    # Instanz mehr, erhält kein Set).
+                    # Instanz mehr, erhaelt kein Set).
                     self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
@@ -29529,8 +29546,9 @@ class PyTraderChartWindow(QMainWindow):
             # Symbol:TF synchronisieren - der Chart rendert ind_peak nur, wenn
             # Button UND State uebereinstimmen (Bugfix "Linien trotz aus").
             self._sync_peak_button_from_state()
+            # 22.01g (Bugfix 5): Bar-Gate zuruecksetzen (neuer TF-Kontext).
+            self._last_grabber_bar_key = None
             self.refresh_chart_data()
-
     def fit_chart(self):
         try:
             self.visible_from = self.visible_to = None
@@ -33842,6 +33860,11 @@ class IndPeak(BaseIndicator):
                 return [{
                     "id": line_id, "data": data,
                     "width": 1, "style": "solid", "title": title,
+                    # 22.01g (Bugfix 1): SL-Serien nehmen NICHT an der
+                    # Preisskalen-Autoscale teil (no_autoscale -> JS setzt
+                    # autoscaleInfoProvider:null). Dadurch bleibt die Skala
+                    # beim On/Off-Toggle unveraendert (Indikator additiv).
+                    "no_autoscale": True,
                 }]
 
             if p.get("show_sl_high", True):
@@ -33856,14 +33879,51 @@ class IndPeak(BaseIndicator):
             # Trigger-Dreiecke aus srv_peak_grabber (hit_circles-Format, damit
             # die generische Render-Pipeline sie zeichnet - User-Anweisung 3:
             # KEINE Kreise, Orderpunkt = Dreieck ueber/unter der Bar).
+            # 22.01g (Bugfix 3+4): Der Orderpunkt sitzt ~0,15% ueber/unter
+            # der TRIGGER-BAR (nicht bei den Rolling-Fenster-Extrema
+            # peak_high/peak_low - die liegen bei SILVER oft >5$ daneben und
+            # auf M5 ausserhalb der sichtbaren Skala). Preis = Bar-High/Low
+            # der Trigger-Bar (aus df) * (1 ± sl_offset_pct/100).
             hit_circles: List[Dict[str, Any]] = []
+            # Bar-Preise (reale Epochs) fuer die Orderpunkt-Positionierung.
+            bar_ohlc: Dict[int, Tuple[float, float]] = {}
+            try:
+                for _t, _h, _l in zip(df["time"], df["high"], df["low"]):
+                    bar_ohlc[int(_t)] = (float(_h), float(_l))
+            except Exception:
+                pass
+            sl_off = float(p.get("sl_offset_pct", 0.15)) / 100.0
+
+            def _order_price(bt: int, side: str) -> float:
+                """Bar-basierter Orderpunkt: SELL ueber der Bar (High +
+                Offset), BUY unter der Bar (Low - Offset). Fallback auf die
+                persistierten Peak-Preise, falls die Bar nicht im df liegt."""
+                bar = bar_ohlc.get(bt)
+                if side == "SELL" and bar is not None:
+                    return bar[0] * (1.0 + sl_off)
+                if side == "BUY" and bar is not None:
+                    return bar[1] * (1.0 - sl_off)
+                if side == "SELL":
+                    return float(grabber_map.get(bt, {}).get(
+                        "peak_high") or 0.0)
+                return float(grabber_map.get(bt, {}).get(
+                    "peak_low") or 0.0)
+
+            grabber_map: Dict[int, Dict[str, Any]] = {}
+            for r in grabber_recs:
+                try:
+                    grabber_map[int(r["bar_time"])] = r
+                except (TypeError, ValueError, KeyError):
+                    continue
+
             if p.get("show_signals", True):
                 for r in grabber_recs:
                     sig = int(r.get("signal") or 0)
+                    bt = int(r["bar_time"])
                     if sig == 1:  # BUY_TRIGGER -> Dreieck unter der Bar
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_low") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, "BUY"),
                             "color": "#26A69A",
                             "shape": "arrowUp",
                             "size": 2,
@@ -33871,18 +33931,18 @@ class IndPeak(BaseIndicator):
                         })
                     elif sig == -1:  # SELL_TRIGGER -> Dreieck ueber der Bar
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_high") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, "SELL"),
                             "color": "#EF5350",
                             "shape": "arrowDown",
                             "size": 2,
                             "priority": 8,
                         })
                     elif p.get("show_updates", False):
+                        side = "SELL" if sig == -2 else "BUY"
                         hit_circles.append({
-                            "time": int(r["bar_time"]),
-                            "price": float(r.get("peak_high")
-                                           or r.get("peak_low") or 0.0),
+                            "time": bt,
+                            "price": _order_price(bt, side),
                             "color": "#90A4AE",
                             "shape": "circle",
                             "size": 1,
@@ -34083,6 +34143,11 @@ class IndPeak(BaseIndicator):
         Dreieck ueber/unter der aktuellen Bar (arrowDown=SELL / arrowUp=BUY).
         Proximity-Circles und Grid-Lines sind reine Berechnungshilfen und
         werden nie gezeichnet. Deaktivierter Grabber -> leere Overlays.
+
+        22.01g (Bugfix 3): Der Orderpunkt sitzt ~0,15% UEBER/UNTER der Bar
+        (entry_price der Trigger-Bar * (1 ± sl_offset_pct/100)) statt beim
+        Rolling-Fenster-Extremum trig.peak_price - das lag bei SILVER bis zu
+        30$ ueber der Bar und sprengte die sichtbare Skala.
         """
         records = self.update_live_candle(candle)
         if self._live_state is None or not self._live_state.is_btn_active:
@@ -34099,18 +34164,32 @@ class IndPeak(BaseIndicator):
         if trig is None:
             return []
         ts = self._last_live_trigger_ts or int(candle.get("time", 0))
+        try:
+            sl_off = float((self._last_params or {}).get(
+                "sl_offset_pct", 0.15)) / 100.0
+        except (TypeError, ValueError):
+            sl_off = 0.0015
+        # Bar-basierter Orderpunkt (Entry-Preis der Trigger-Bar + Offset).
+        try:
+            base = float(trig.entry_price or trig.peak_price)
+        except (TypeError, ValueError):
+            base = float(trig.peak_price or 0.0)
+        if trig.direction == SignalDirection.SELL:
+            price = base * (1.0 + sl_off)
+        else:
+            price = base * (1.0 - sl_off)
         if trig.direction == SignalDirection.SELL:
             return [{
                 "kind": "circle", "layer": self.indicator_id,
                 "time": ts,
-                "price": float(trig.peak_price),
+                "price": price,
                 "color": "#EF5350", "shape": "arrowDown",
                 "size": 2, "priority": 10,
             }]
         return [{
             "kind": "circle", "layer": self.indicator_id,
             "time": ts,
-            "price": float(trig.peak_price),
+            "price": price,
             "color": "#26A69A", "shape": "arrowUp",
             "size": 2, "priority": 10,
         }]
@@ -35475,17 +35554,29 @@ function renderLineSeries(linesArray) {
         var line = data[m];
         if (!line || !line.id || !line.data) continue;
         var series = _activeLineSeries[line.id];
+        // 22.01g (Bugfix 2): lineType 'withGaps' – LWC-v5-Default 'Simple'
+        // verbindet auch null-Punkte (verbindet zwei SL-Striche diagonal).
+        // Mit WithGaps erzeugt ein {time, value: null}-Punkt eine ECHTE
+        // Luecke: die SL-Striche bleiben isolierte waagerechte Segmente.
+        // 22.01g (Bugfix 1): no_autoscale=true (SL-Serien) nimmt die Serie
+        // aus der Preisskalen-Autoscale -> Toggle On/Off verschiebt die
+        // Skala nicht mehr (Indikator additiv, Grafik bleibt stehen).
+        var opts = {
+            lineWidth: (line.width && line.width > 0) ? line.width : 1,
+            lineStyle: _lwcLineStyle(line.style),
+            lineType: LightweightCharts.LineType.WithGaps,
+            color: line.color || '#26A69A',
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            priceScaleId: 'right'
+        };
+        if (line.no_autoscale) {
+            opts.autoscaleInfoProvider = function() { return null; };
+        }
         if (!series) {
             try {
-                series = chart.addSeries(LightweightCharts.LineSeries, {
-                    lineWidth: (line.width && line.width > 0) ? line.width : 1,
-                    lineStyle: _lwcLineStyle(line.style),
-                    color: line.color || '#26A69A',
-                    lastValueVisible: false,
-                    priceLineVisible: false,
-                    crosshairMarkerVisible: false,
-                    priceScaleId: 'right'
-                });
+                series = chart.addSeries(LightweightCharts.LineSeries, opts);
                 _activeLineSeries[line.id] = series;
             } catch(e) { continue; }
         }
@@ -35496,6 +35587,7 @@ function renderLineSeries(linesArray) {
             series.applyOptions({
                 lineWidth: (line.width && line.width > 0) ? line.width : 1,
                 lineStyle: _lwcLineStyle(line.style),
+                lineType: LightweightCharts.LineType.WithGaps,
                 color: line.color || '#26A69A'
             });
         } catch(e) {}
