@@ -2,7 +2,7 @@
 
 > **Zweck:** Bugfixes & Erweiterungen auf das **minimale Set an Dateien** reduzieren.
 > **Anwendung (KI-Prompt):** Bei einem Bug/Feature IMMER zuerst diese Map lesen (einmalig, ~2k Tokens), dann NUR die in der Routing-Tabelle (Teil C) genannten Dateien öffnen. Nicht die ganze Codebasis durchsuchen.
-> **Stand:** 15.08.2026 (aktualisiert nach 23.08) – Generiert aus Docstrings + Import-Graphen (159 Py-Dateien / 50.190 Zeilen, 6 JS-Dateien / 1.837 Zeilen).
+> **Stand:** 15.08.2026 (aktualisiert nach 23.09) – Generiert aus Docstrings + Import-Graphen (167 Py-Dateien / 50.410 Zeilen, 6 JS-Dateien / 1.837 Zeilen).
 
 ---
 
@@ -146,7 +146,15 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 |---|---|---|
 | `analytics/ui/analytics_win.py` | 1500 | **AnalyticsWindow**: Hauptfenster, Profil-Verwaltung, Jump-to-Chart ⚠️HOTSPOT (3× importiert `serviceui`) |
 | `analytics/ui/common.py` | 225 | `format_wanduhr_time`, Overlay-Stack-Helfer |
-| `analytics/ui/heatmap_widget.py` | 2656 | **Generische 2D-Heatmap-Engine** (Confluence-Matrix, Candle-Overlay, Dual-Axis-Zoom) ⚠️GOD FILE |
+| `analytics/ui/heatmap_widget.py` | 424 | **HeatmapWidget** (Kern): `__init__` + Signal `preset_clicked`, aggregiert 6 Mixins, Re-Export der 15 Konstanten + `_HeatmapAxis` |
+| `analytics/ui/heatmap_widget_constants.py` | 86 | Konstanten (_CONFLUENCE_*, _VIRIDIS, _VALUE_AGGS, _TF_SECONDS, _DIM_LABELS, _AGG_LABELS) |
+| `analytics/ui/heatmap_widget_axis.py` | 333 | `_HeatmapAxis` (9): dynamische Achse (LWC-v5-Ticks) + 3 Tick-Helper |
+| `analytics/ui/heatmap_widget_controls.py` | 344 | `HeatmapWidgetControlsMixin` (11): Config-Sync, Combos, Slider, Modus-Sync + `_is_price_like_key` |
+| `analytics/ui/heatmap_widget_fields.py` | 432 | `HeatmapWidgetFieldMixin` (10): Feld-Auswahl/Dropdown, Checked-Pairs, VM-Sync |
+| `analytics/ui/heatmap_widget_zoom.py` | 167 | `HeatmapWidgetZoomMixin` (10): Zoom-Slider X/Y, Range-Apply, Achsen-Bounds |
+| `analytics/ui/heatmap_widget_data.py` | 512 | `HeatmapWidgetDataMixin` (10): Daten-Anfrage/-Empfang, Render-Generic, No-Data |
+| `analytics/ui/heatmap_widget_overlay.py` | 273 | `HeatmapWidgetOverlayMixin` (6): Candle-Overlay, Preis-View, Grid-Linien |
+| `analytics/ui/heatmap_widget_info.py` | 305 | `HeatmapWidgetInfoMixin` (6): Info-Zeile, Maus-Tracking, Zell-Info, Legende + 2 Format-Helper |
 | `analytics/ui/heatmap_page.py` | 288 | Heatmap-Seite (Dow×Stunde) |
 | `analytics/ui/table_page.py` | 732 | Tabellen-Seite (Doppelklick → Jump-to-Chart) |
 | `analytics/ui/scatter_page.py` | 151 | Scatter-Seite |
@@ -237,7 +245,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | 10 | Parameter-Editor / Prop-Fenster / Expert-Modus | `chart/indicator_dialog.py` → `serviceui/param_columns.py` → `chart/widgets/named_item_actions.py` | `check_clone_*.py`, `check_plugin_names.py` |
 | 11 | Analytics-Daten falsch/leer (Heatmap/Table/Scatter/Distribution) | `analytics/engine/feature_store_reader.py` + Mixins (`feature_store_reader_query.py` / `_ohlcv.py` / `_heatmap.py` / `_filter.py`) → `analytics/engine/analytics_repository.py` → `analytics/engine/analytics_view_model.py` → `analytics/engine/analytics_worker.py` → UI-Page | `check_heatmap_e2e.py`, `check_field_selection.py`, `check_field_pairs_db.py`, `check_mode_filter_*.py` |
 | 12 | Analytics-Fenster (Layout, Profile, Buttons, Jump-to-Chart) | `analytics/ui/analytics_win.py` → `analytics/engine/analytics_view_model.py` (Profile) → `repositories/analytics_profile_repository.py` | `check_custom_range_sortmode.py`, `check_heatmap_page_stack.py` |
-| 13 | Heatmap-Widget (Zoom, Matrix, Overlay, Achsen) | `analytics/ui/heatmap_widget.py` → `analytics/ui/heatmap_page.py` → `analytics/engine/analytics_view_model.py` (Config) | `check_heatmap_render.py`, `check_heatmap_field_checks.py` |
+| 13 | Heatmap-Widget (Zoom, Matrix, Overlay, Achsen) | `analytics/ui/heatmap_widget.py` (Kern) → `analytics/ui/heatmap_widget_controls/fields/zoom/data/overlay/info.py` + `heatmap_widget_axis.py` → `analytics/ui/heatmap_page.py` → `analytics/engine/analytics_view_model.py` (Config) | `check_heatmap_render.py`, `check_heatmap_field_checks.py` |
 | 14 | MTF-FC (Filterleiste, Kaskade, Confluence, Sortierung) | `chart/widgets/mtf_filter_bar.py` → `analytics/engine/mtf_fc_state.py` → `analytics/engine/mtf_fc_provider.py` → `mtf_fc_guards.py` → `mtf_fc_cascade.py` → `mtf_fc_confluence.py` → `mtf_fc_boundary.py` → `mtf_fc_templates.py` → `mtf_fc_partition.py` | `check_analytics_mtffc.py`, `check_analytics_mtffc_win.py`, `check_mtf_sort_binding.py`, `check_filterbar_visible.py` |
 | 15 | Peak-Grabber (komplett) | `analytics/engine/peak_models.py` → `analytics/features/definitions/grabber_kernel.py` → `srv_peak_finder.py` → `srv_peak_grabber.py` → `chart/indicators/ind_peak.py` → `repositories/grabber_repository.py` → `analytics/engine/peak_backtest_runner.py` → `analytics/ui/order_preview_dialog.py` | `check_2201_peak_grabber.py`, `check_2201_runner.py`, `check_2201_reader.py`, `check_2201_schema.py`, `check_2201_viewback.py`, `check_2201_parity.py` |
 | 16 | Fenster-Persistenz (Geometrie/State verloren, Restore) | `persistent_win.py` → `repositories/window_state_repository.py` → `state_manager.py` → `ui/window_manager.py` | `check_app_state.py`, `check_splitter_persist.py`, `check_2201f_state_sync.py` |
@@ -272,7 +280,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | ~~`serviceui/service_win.py`~~ | ~~3.264~~ | ✅ GESPLITTET (23.04, 15.08.2026) → 5 Mixins (Teil B8) |
 | ~~`serviceui/master_tree.py`~~ | ~~2.511~~ | ✅ GESPLITTET (23.06, 15.08.2026) → 6 Mixins + constants (Teil B8) |
 | ~~`serviceui/service_selector_dialog.py`~~ | ~~2.414~~ | ✅ GESPLITTET (23.08, 15.08.2026) → 6 Mixins + constants + host (Teil B8) |
-| `analytics/ui/heatmap_widget.py` | 2.656 | ~3: Widget, Renderer, Achsen |
+| ~~`analytics/ui/heatmap_widget.py`~~ | ~~2.656~~ | ✅ GESPLITTET (23.09, 15.08.2026) → 6 Mixins + constants + axis (Teil B7) |
 | ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
 | `chart/indicator_dialog.py` | 1.867 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
 | ~~`analytics/engine/analytics_view_model.py`~~ | ~~1.886~~ | ✅ GESPLITTET (23.07, 15.08.2026) → 6 Mixins + constants (Teil B6) |
