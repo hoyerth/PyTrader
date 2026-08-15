@@ -3,10 +3,12 @@ chart/chart_win_workers.py - Worker-/Serializer-/Bridge-Klassen fuer das Chart-F
 
 23.03 God-File-Split (15.08.2026): Aus chart/chart_win.py extrahiert,
 KEINE Logik-Aenderung. Enthaelt WebEngineConsolePage, ChartBridge,
-ChartDataSerializer, GridDataSerializer und OlderDataWorker.
+ChartDataSerializer, GridDataSerializer, OlderDataWorker und
+die JSON-Helfer find_null_fields/_clean_nan (aus chart_win.py uebernommen).
 """
 
 import json
+import math
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWebEngineCore import QWebEnginePage
@@ -122,3 +124,30 @@ class OlderDataWorker(QThread):
         except Exception as e:
             print(f"⚠️ [OlderDataWorker] DB-Fetch-Fehler: {e}")
             self.done.emit(self.request_id, [], False)
+
+
+def find_null_fields(obj, path=""):
+    """Sucht rekursiv nach None/null in Dictionaries und Listen."""
+    nulls = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if v is None:
+                nulls.append(new_path)
+            else:
+                nulls.extend(find_null_fields(v, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            nulls.extend(find_null_fields(item, new_path))
+    return nulls
+
+
+def _clean_nan(obj):
+    """Entfernt rekursiv alle NaN/Inf-Werte aus Dicts/Listen, damit json.dumps(allow_nan=False) nicht fehlschlaegt."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items() if not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))}
+    elif isinstance(obj, list):
+        return [_clean_nan(item) for item in obj if not (isinstance(item, float) and (math.isnan(item) or math.isinf(item)))]
+    return obj
+
