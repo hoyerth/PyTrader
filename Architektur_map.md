@@ -241,7 +241,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | `analytics/ui/heatmap_widget.py` | 2.483 | ~3: Widget, Renderer, Achsen |
 | ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
 | `chart/indicator_dialog.py` | 1.893 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
-| `analytics/engine/analytics_view_model.py` | 1.886 | ~3: Profile, Query-Orchestrierung, Preset/Heatmap-Config |
+| ~~`analytics/engine/analytics_view_model.py`~~ | ~~1.886~~ | ✅ GESPLITTET (23.07, 15.08.2026) → 6 Mixins + constants (Teil B6) |
 | `chart/chart_win.py` | 1.630 | ~3–4: Bridge, Serializer, Overlay-Handling, Window-Kern |
 
 > **Split-Regel (inkrementell, kein Big-Bang):** Nur Dateien splitten, die für einen Bugfix ohnehin geöffnet werden. Mixins-Herausziehen folgt dem bestehenden Muster (`ServiceParamColumnsMixin`, `ContentScrollMixin`, `NamedItemActionsMixin`).
