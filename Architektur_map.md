@@ -2,7 +2,7 @@
 
 > **Zweck:** Bugfixes & Erweiterungen auf das **minimale Set an Dateien** reduzieren.
 > **Anwendung (KI-Prompt):** Bei einem Bug/Feature IMMER zuerst diese Map lesen (einmalig, ~2k Tokens), dann NUR die in der Routing-Tabelle (Teil C) genannten Dateien öffnen. Nicht die ganze Codebasis durchsuchen.
-> **Stand:** 15.08.2026 (aktualisiert nach 23.09) – Generiert aus Docstrings + Import-Graphen (167 Py-Dateien / 50.410 Zeilen, 6 JS-Dateien / 1.837 Zeilen).
+> **Stand:** 15.08.2026 (aktualisiert nach 23.10) – Generiert aus Docstrings + Import-Graphen (174 Py-Dateien / 50.623 Zeilen, 6 JS-Dateien / 1.837 Zeilen).
 
 ---
 
@@ -88,7 +88,14 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | `chart/widgets/mtf_filter_bar.py` | 376 | MTF-FC-Filterleiste (Source-TF, Overlay-TF, Agg-TF, Range-Picker, Tabellen-Sort) |
 | `chart/widgets/named_item_actions.py` | 163 | `NamedItemActionsMixin` (Preset/Service-Set Verwaltung) |
 | `chart/widgets/style_picker_widget.py` | 558 | Style-Picker |
-| `chart/indicator_dialog.py` | 1893 | **Universal-Settings-Dialog** (Plugin-Prop, Expert-Modus, Service-Sets) ⚠️GOD FILE |
+| `chart/indicator_dialog.py` | 181 | **IndicatorSettingsDialog** (Kern): `__init__` + Klassen-Konstante `DIALOG_GEOMETRY_KEY`, aggregiert 7 Mixins |
+| `chart/indicator_dialog_plugin.py` | 54 | `IndicatorSettingsDialogPluginMixin` (3): Plugin-/Engine-Zugriff (PluginRegistry, Repo, Evaluator) |
+| `chart/indicator_dialog_schema.py` | 249 | `IndicatorSettingsDialogSchemaMixin` (7): Schema-/Precision-Helper, `create_schema_control` |
+| `chart/indicator_dialog_ui.py` | 531 | `IndicatorSettingsDialogUiMixin` (7): UI-Aufbau (init_ui Legacy/Plugin/Params-only), Collapsible, Reflow, Control-Widget |
+| `chart/indicator_dialog_sets.py` | 380 | `IndicatorSettingsDialogSetsMixin` (10): Service-Set-Liste/-Auswahl, Tooltip, Stack-Rebuild |
+| `chart/indicator_dialog_run.py` | 364 | `IndicatorSettingsDialogRunMixin` (13): Set-Logik/Run, Set-CRUD, Run-Worker, Commit |
+| `chart/indicator_dialog_presets.py` | 262 | `IndicatorSettingsDialogPresetsMixin` (8): Preset-Verwaltung, Params aus/in UI |
+| `chart/indicator_dialog_geometry.py` | 66 | `IndicatorSettingsDialogGeometryMixin` (3): Geometrie-Restore/-Save, `done` |
 
 ### B5. Chart-Engine (JS-Seite – `chart/js`, Laden in chart_basics.JS_FILES)
 | Datei | Zeilen | Verantwortlichkeit |
@@ -242,7 +249,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | 7 | Service-Ausführung / Set-Run / Fehler im Run | `serviceui/run_worker.py` → `analytics/engine/set_evaluator.py` → `analytics/features/feature_builder.py` (PluginExecutor) → `analytics/features/plugins/base_plugin.py` → betroffenes `srv_*.py` | `check_2201_runner.py` |
 | 8 | Service-Sets speichern/laden/löschen/Papierkorb | `analytics/engine/service_set_repository.py` → `analytics/engine/service_models.py` → `serviceui/service_set_utils.py` → `serviceui/trash_dialog.py` | `check_bugfix_2132*.py` |
 | 9 | MasterTree (Anzeige, Kategorien, Modi, Kontextmenü) | `serviceui/master_tree.py` → `analytics/engine/service_selector_model.py` → `analytics/engine/tree_builder.py` → `srv_*.py` (`metadata["category"]`) | `check_tree_mode_fix.py`, `check_tree_mode_fix2.py`, `check_modes_registry.py` |
-| 10 | Parameter-Editor / Prop-Fenster / Expert-Modus | `chart/indicator_dialog.py` → `serviceui/param_columns.py` → `chart/widgets/named_item_actions.py` | `check_clone_*.py`, `check_plugin_names.py` |
+| 10 | Parameter-Editor / Prop-Fenster / Expert-Modus | `chart/indicator_dialog.py` (Kern) → `chart/indicator_dialog_plugin/schema/ui/sets/run/presets/geometry.py` → `serviceui/param_columns.py` → `chart/widgets/named_item_actions.py` | `check_clone_*.py`, `check_plugin_names.py` |
 | 11 | Analytics-Daten falsch/leer (Heatmap/Table/Scatter/Distribution) | `analytics/engine/feature_store_reader.py` + Mixins (`feature_store_reader_query.py` / `_ohlcv.py` / `_heatmap.py` / `_filter.py`) → `analytics/engine/analytics_repository.py` → `analytics/engine/analytics_view_model.py` → `analytics/engine/analytics_worker.py` → UI-Page | `check_heatmap_e2e.py`, `check_field_selection.py`, `check_field_pairs_db.py`, `check_mode_filter_*.py` |
 | 12 | Analytics-Fenster (Layout, Profile, Buttons, Jump-to-Chart) | `analytics/ui/analytics_win.py` → `analytics/engine/analytics_view_model.py` (Profile) → `repositories/analytics_profile_repository.py` | `check_custom_range_sortmode.py`, `check_heatmap_page_stack.py` |
 | 13 | Heatmap-Widget (Zoom, Matrix, Overlay, Achsen) | `analytics/ui/heatmap_widget.py` (Kern) → `analytics/ui/heatmap_widget_controls/fields/zoom/data/overlay/info.py` + `heatmap_widget_axis.py` → `analytics/ui/heatmap_page.py` → `analytics/engine/analytics_view_model.py` (Config) | `check_heatmap_render.py`, `check_heatmap_field_checks.py` |
@@ -282,7 +289,7 @@ serviceui/ + analytics/ui/ + chart/ + ui/ + main.py (UI-Fenster, Orchestratoren)
 | ~~`serviceui/service_selector_dialog.py`~~ | ~~2.414~~ | ✅ GESPLITTET (23.08, 15.08.2026) → 6 Mixins + constants + host (Teil B8) |
 | ~~`analytics/ui/heatmap_widget.py`~~ | ~~2.656~~ | ✅ GESPLITTET (23.09, 15.08.2026) → 6 Mixins + constants + axis (Teil B7) |
 | ~~`analytics/engine/feature_store_reader.py`~~ | ~~2.410~~ | ✅ GESPLITTET (23.05, 15.08.2026) → 6 Mixins + constants (Teil B6) |
-| `chart/indicator_dialog.py` | 1.867 | ~3: Dialog, Preset-Adapter, Typ-Validierung |
+| ~~`chart/indicator_dialog.py`~~ | ~~1.867~~ | ✅ GESPLITTET (23.10, 15.08.2026) → 7 Mixins (Teil B4) |
 | ~~`analytics/engine/analytics_view_model.py`~~ | ~~1.886~~ | ✅ GESPLITTET (23.07, 15.08.2026) → 6 Mixins + constants (Teil B6) |
 | ~~`chart/chart_win.py`~~ | ~~1.630~~ | ✅ GESPLITTET (23.03, 15.08.2026) → 6 Mixins (Teil B4) |
 
